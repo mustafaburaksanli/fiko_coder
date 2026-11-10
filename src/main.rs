@@ -572,6 +572,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => format!("ERROR: Bilinmeyen arac: {name}"),
                 };
 
+if name == "apply_patch" {
+    let status = output.lines().next().unwrap_or("");
+
+    println!("[PATCH RESULT] {status}");
+}
+
                 messages.push(json!({
                     "role": "tool",
                     "tool_name": name,
