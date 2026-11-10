@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::execution::{ExecutionState, TaskPhase};
+
 /// Hem onayli patch sayisi hem de gecici kopyadaki dogrulama denemeleri icin ust sinir.
 pub const MAX_PATCH_ATTEMPTS: usize = 3;
 
@@ -169,6 +171,8 @@ pub struct RepairController {
     verified: HashMap<Proposal, VerifiedCandidate>,
     /// Gorev icinde ulasilan en guclu dogrulama turu; apply icin alt sinir olur.
     required_mode: VerifyMode,
+    /// v0.9: gorevin yurutme asamasi. Yalnizca gercek arac sonuclariyla ilerler.
+    state: ExecutionState,
 }
 
 impl Default for RepairController {
@@ -179,11 +183,27 @@ impl Default for RepairController {
             proposals: HashMap::new(),
             verified: HashMap::new(),
             required_mode: VerifyMode::Check,
+            state: ExecutionState::new(),
         }
     }
 }
 
 impl RepairController {
+    /// Gorevin su anki asamasi.
+    pub fn phase(&self) -> TaskPhase {
+        self.state.phase()
+    }
+
+    /// Asama gecisi; yalnizca arac akislari cagirir (dogrulama, onay, yazma).
+    /// Izinsiz gecis uygulanmaz ve `false` doner; durum makinesi kaydini tutar.
+    pub fn enter(&mut self, phase: TaskPhase) -> bool {
+        self.state.enter(phase).is_ok()
+    }
+
+    pub fn execution(&self) -> &ExecutionState {
+        &self.state
+    }
+
     /// apply_patch icin on kayit: deneme siniri ve tekrar engeli. Dogrulanmis
     /// veya eskimis aday gecer; diger oneriler bu gorevde yalnizca bir kez kabul edilir.
     /// Kilidin kendisi `authorize_apply`dadir.

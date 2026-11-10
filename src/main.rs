@@ -1,9 +1,10 @@
-//! FIKO CODER v0.8 - VERIFIED PATCH LOCK
+//! FIKO CODER v0.9 - INTELLIGENT TOOL ORCHESTRATOR
 //!
 //! Moduller:
 //! - tools: dosya araclari, cargo, patch hazirlama, yedekleme / geri alma
 //! - verification: adaylarin gecici kopyada derlenmesi (verify_candidate), proje parmak izi
 //! - repair_controller: deneme sayaclari, tekrar engeli ve dogrulanmis patch kilidi
+//! - intent / execution / orchestrator: gorev niyeti, asama makinesi, arac denetimi
 //! - agent: Ollama dongusu, arac secimi, kullanici onayi
 
 use std::io::{self, Write};
@@ -27,12 +28,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut messages: Vec<Value> = vec![system.clone()];
 
     println!("=================================");
-    println!("  FIKO CODER v0.8 - VERIFIED PATCH LOCK");
+    println!("  FIKO CODER v0.9 - INTELLIGENT TOOL ORCHESTRATOR");
     println!("=================================");
     println!("Model: {model}");
     println!("Proje: {}", root.display());
     println!(
         "Araclar: read_file, list_files, read_lines, search_code, run_tests, verify_candidate, apply_patch"
+    );
+    println!(
+        "Niyet: gorev turu (Analyze/Explain/Modify/Test) Rust tarafinda belirlenir; yalnizca Modify gorevlerinde dosya degisir, belirsizse sorulur."
     );
     println!(
         "Akis: verify_candidate (gecici kopya) -> kullanici onayi -> apply_patch -> cargo check + cargo test"
