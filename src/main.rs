@@ -1,21 +1,17 @@
-//! FIKO CODER v0.7 - CODE VERIFICATION ENGINE
+//! FIKO CODER v0.8 - VERIFIED PATCH LOCK
 //!
 //! Moduller:
 //! - tools: dosya araclari, cargo, patch hazirlama, yedekleme / geri alma
-//! - verification: adaylarin gecici kopyada derlenmesi (verify_candidate)
-//! - repair_controller: deneme sayaclari ve tekrar engeli
+//! - verification: adaylarin gecici kopyada derlenmesi (verify_candidate), proje parmak izi
+//! - repair_controller: deneme sayaclari, tekrar engeli ve dogrulanmis patch kilidi
 //! - agent: Ollama dongusu, arac secimi, kullanici onayi
-
-mod agent;
-mod repair_controller;
-mod tools;
-mod verification;
 
 use std::io::{self, Write};
 
 use serde_json::{Value, json};
 
-use agent::{Prompter, Session, TerminalPrompter};
+use fiko_coder::agent::{self, Prompter, Session, TerminalPrompter};
+use fiko_coder::tools;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut messages: Vec<Value> = vec![system.clone()];
 
     println!("=================================");
-    println!("  FIKO CODER v0.7 - CODE VERIFICATION ENGINE");
+    println!("  FIKO CODER v0.8 - VERIFIED PATCH LOCK");
     println!("=================================");
     println!("Model: {model}");
     println!("Proje: {}", root.display());
@@ -40,6 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "Akis: verify_candidate (gecici kopya) -> kullanici onayi -> apply_patch -> cargo check + cargo test"
+    );
+    println!(
+        "Kilit: yalnizca dogrulanmis ve birebir ayni aday uygulanir; dosya/proje degisirse dogrulama eskir."
     );
     println!(
         "Not: Gecici kopya gercek bir sandbox degildir; cargo build script calistirabilir. Izin oturumda bir kez sorulur."

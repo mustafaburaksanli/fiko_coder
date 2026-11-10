@@ -570,7 +570,7 @@ pub fn tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "apply_patch",
-                "description": "Rust dosyasinda yalnizca TAM SATIR veya TAM SATIRLARDAN olusan kodu degistir. old_text satir sonundaki noktalama karakterlerini de icermeli; satir basi bosluklari istege bagli. Once verify_candidate ile dogrula. Dogrulanmamis aday once gecici kopyada derlenir; ardindan kullanici onayi, yedekleme, gercek projede cargo check + cargo test; hatada geri alma.",
+                "description": "Rust dosyasinda yalnizca TAM SATIR veya TAM SATIRLARDAN olusan kodu degistir. old_text satir sonundaki noktalama karakterlerini de icermeli; satir basi bosluklari istege bagli. KILIT: yalnizca verify_candidate ile dogrulanmis ve BIREBIR AYNI path/old_text/new_text uygulanabilir. Farkli, degistirilmis veya eskimis aday once gecici kopyada yeniden dogrulanir; izin yoksa reddedilir. Ardindan kullanici onayi, yedekleme, gercek projede cargo check + cargo test; hatada geri alma.",
                 "parameters": {
                     "type": "object", "properties": {
                         "path": {"type": "string"},

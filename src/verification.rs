@@ -166,26 +166,58 @@ impl Drop for TempWorkspace {
 }
 
 // ============================================================
-// PROJE KOPYALAMA
+// PROJE KOPYALAMA VE PARMAK IZI
 // ============================================================
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CopyStats {
     pub files: usize,
     pub bytes: u64,
+    /// Kopyalanan (ya da taranan) dosyalarin yol + icerik ozeti.
+    pub fingerprint: u64,
 }
 
-/// Proje kokunu gecici alana kopyalar. Gizli girdiler (.git, .env, .fiko_backups),
-/// `target` ve sembolik baglantilar atlanir.
+/// Metin iceriginin surec icinde kararli ozeti (dogrulama kaydi icin).
+pub fn content_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(text.as_bytes());
+    hasher.finish()
+}
+
+/// Proje kokunu gecici alana kopyalar ve ayni gecisle parmak izini cikarir.
+/// Gizli girdiler (.git, .env, .fiko_backups), `target` ve sembolik baglantilar atlanir.
 pub fn copy_project(root: &Path, dest: &Path) -> Result<CopyStats, String> {
+    walk_project(root, Some(dest))
+}
+
+/// Projenin su anki parmak izi: kopyalama ile ayni dosya kumesi ve ayni sira.
+/// Dogrulamadan sonra herhangi bir proje dosyasi degisirse bu deger degisir.
+pub fn project_fingerprint(root: &Path) -> Result<u64, String> {
+    walk_project(root, None).map(|stats| stats.fingerprint)
+}
+
+fn walk_project(root: &Path, dest: Option<&Path>) -> Result<CopyStats, String> {
     let mut stats = CopyStats::default();
-    copy_dir(root, dest, &mut stats)?;
+    let mut hasher = DefaultHasher::new();
+    walk_dir(root, "", dest, &mut stats, &mut hasher)?;
+    stats.fingerprint = hasher.finish();
     Ok(stats)
 }
 
-fn copy_dir(from: &Path, to: &Path, stats: &mut CopyStats) -> Result<(), String> {
-    let entries = fs::read_dir(from).map_err(|e| format!("{} okunamadi: {e}", from.display()))?;
+fn walk_dir(
+    from: &Path,
+    rel_prefix: &str,
+    dest: Option<&Path>,
+    stats: &mut CopyStats,
+    hasher: &mut DefaultHasher,
+) -> Result<(), String> {
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(from)
+        .map_err(|e| format!("{} okunamadi: {e}", from.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    // Parmak izi siraya bagli; dosya sistemi sirasina guvenme.
+    entries.sort_by_key(|entry| entry.file_name());
+
     for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
         let kind = entry.file_type().map_err(|e| e.to_string())?;
         if kind.is_symlink() {
             continue;
@@ -195,16 +227,25 @@ fn copy_dir(from: &Path, to: &Path, stats: &mut CopyStats) -> Result<(), String>
         if name_text.starts_with('.') || name_text == "target" {
             continue;
         }
+        let relative = if rel_prefix.is_empty() {
+            name_text.to_string()
+        } else {
+            format!("{rel_prefix}/{name_text}")
+        };
         let source = entry.path();
-        let target = to.join(&name);
+        let target = dest.map(|d| d.join(&name));
+
         if kind.is_dir() {
-            fs::create_dir(&target)
-                .map_err(|e| format!("{} olusturulamadi: {e}", target.display()))?;
-            copy_dir(&source, &target, stats)?;
+            if let Some(target) = &target {
+                fs::create_dir(target)
+                    .map_err(|e| format!("{} olusturulamadi: {e}", target.display()))?;
+            }
+            walk_dir(&source, &relative, target.as_deref(), stats, hasher)?;
         } else if kind.is_file() {
-            let len = entry.metadata().map_err(|e| e.to_string())?.len();
+            let bytes =
+                fs::read(&source).map_err(|e| format!("{} okunamadi: {e}", source.display()))?;
             stats.files += 1;
-            stats.bytes += len;
+            stats.bytes += bytes.len() as u64;
             if stats.files > MAX_COPY_FILES {
                 return Err(format!(
                     "Proje {MAX_COPY_FILES} dosya sinirini asiyor; gecici kopya alinamadi."
@@ -216,8 +257,13 @@ fn copy_dir(from: &Path, to: &Path, stats: &mut CopyStats) -> Result<(), String>
                     MAX_COPY_BYTES / (1024 * 1024)
                 ));
             }
-            fs::copy(&source, &target)
-                .map_err(|e| format!("{} kopyalanamadi: {e}", source.display()))?;
+            hasher.write(relative.as_bytes());
+            hasher.write_u64(bytes.len() as u64);
+            hasher.write(&bytes);
+            if let Some(target) = &target {
+                fs::write(target, &bytes)
+                    .map_err(|e| format!("{} kopyalanamadi: {e}", target.display()))?;
+            }
         }
     }
     Ok(())
@@ -374,6 +420,10 @@ pub struct VerificationReport {
     pub diagnostics: Vec<String>,
     pub summary: String,
     pub cleanup_error: Option<String>,
+    /// v0.8 kilidi icin: dogrulanan orijinal icerik, yeni icerik ve proje durumu ozetleri.
+    pub original_hash: u64,
+    pub updated_hash: u64,
+    pub project_fingerprint: u64,
 }
 
 impl VerificationReport {
@@ -503,6 +553,9 @@ pub async fn verify_candidate(
         diagnostics,
         summary,
         cleanup_error,
+        original_hash: content_hash(&plan.original),
+        updated_hash: content_hash(&plan.updated),
+        project_fingerprint: stats.fingerprint,
     })
 }
 
@@ -664,7 +717,35 @@ mod tests {
         assert!(dest.join("src/main.rs").is_file());
         assert!(!dest.join(".env").exists());
         assert!(!dest.join("target").exists());
+        // Kopyanin parmak izi, kaynagin dogrudan taramasiyla ayni olmali.
+        assert_eq!(stats.fingerprint, project_fingerprint(&root).unwrap());
         remove(&dest);
+        remove(&root);
+    }
+
+    #[test]
+    fn proje_parmak_izi_degisimi_yakalamali() {
+        let root = mini_crate("fingerprint");
+        let before = project_fingerprint(&root).unwrap();
+        assert_eq!(
+            before,
+            project_fingerprint(&root).unwrap(),
+            "kararli olmali"
+        );
+        // Hedef disindaki bir proje dosyasi degisince de parmak izi degisir.
+        let cargo = root.join("Cargo.toml");
+        let mut text = fs::read_to_string(&cargo).unwrap();
+        text.push_str("\n# degisti\n");
+        fs::write(&cargo, text).unwrap();
+        assert_ne!(before, project_fingerprint(&root).unwrap());
+        // target/ ve gizli dosyalar parmak izine girmez.
+        let after = project_fingerprint(&root).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/x.bin"), "x").unwrap();
+        fs::write(root.join(".env"), "SECRET=1").unwrap();
+        assert_eq!(after, project_fingerprint(&root).unwrap());
+        assert_ne!(content_hash("a"), content_hash("b"));
+        assert_eq!(content_hash("ayni"), content_hash("ayni"));
         remove(&root);
     }
 

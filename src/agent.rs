@@ -1,19 +1,25 @@
 //! Ajan dongusu: Ollama sohbeti, arac secimi, kullanici onayi ve
-//! v0.7 kontrollu onarim akisi (verify_candidate -> onay -> apply_patch).
+//! kontrollu onarim akisi (verify_candidate -> onay -> apply_patch).
+//!
+//! v0.8: apply_patch, Repair Controller'daki Verified Patch Lock'tan gecmeden
+//! gercek dosyaya yazamaz. Kilidi acan tek sey, birebir ayni aday icin hala
+//! gecerli bir dogrulama kaydidir; kural system prompt'ta degil Rust'tadir.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::repair_controller::{MAX_PATCH_ATTEMPTS, RepairController};
-use crate::tools::{self, PatchRecord, tool_definitions};
+use crate::repair_controller::{
+    ApplyRejection, MAX_PATCH_ATTEMPTS, RepairController, VerifiedCandidate, VerifyMode,
+};
+use crate::tools::{self, PatchPlan, PatchRecord, tool_definitions};
 use crate::verification::{self, VerificationReport};
 
 pub const MAX_AGENT_ROUNDS: usize = 12;
 pub const OLLAMA_CHAT_URL: &str = "http://localhost:11434/api/chat";
 
-const CHECK_CONSENT: &str = "verify_candidate gecici bir kopyada 'cargo check' calistiracak. Build script ve proc-macro'lar kod calistirabilir; bu gercek bir sandbox DEGILDIR. Bu projeye guveniyor ve bu oturum icin otomatik dogrulamaya izin veriyor musunuz?";
+const CHECK_CONSENT: &str = "verify_candidate gecici bir kopyada 'cargo check' calistiracak. Build script ve proc-macro'lar kod calistirabilir; bu gercek bir sandbox DEGILDIR. Reddederseniz bu oturumda hicbir patch gercek projeye uygulanamaz (Verified Patch Lock). Bu projeye guveniyor ve bu oturum icin otomatik dogrulamaya izin veriyor musunuz?";
 const TEST_CONSENT: &str = "Gecici kopyada 'cargo test' de calistirilsin mi? Testler rastgele kod calistirabilir; yalnizca guvendiginiz projede onaylayin. Bu oturum icin izin veriyor musunuz?";
 
 // ============================================================
@@ -43,8 +49,8 @@ pub struct VerifyConsent {
 }
 
 impl VerifyConsent {
-    pub fn allowed<P: Prompter>(&mut self, mode: &str, prompter: &mut P) -> io::Result<bool> {
-        if mode == "test" {
+    pub fn allowed<P: Prompter>(&mut self, mode: VerifyMode, prompter: &mut P) -> io::Result<bool> {
+        if mode == VerifyMode::Test {
             if self.check == Some(false) {
                 return Ok(false);
             }
@@ -120,14 +126,16 @@ impl ToolOutcome {
 // SISTEM ISTEMI
 // ============================================================
 pub fn system_prompt() -> &'static str {
-    "Sen FIKO CODER v0.7 adli yerel Rust kodlama ajanisin. Turkce yanit ver.\n\
+    "Sen FIKO CODER v0.8 adli yerel Rust kodlama ajanisin. Turkce yanit ver.\n\
 \n\
 CALISMA SIRASI (bir hatayi duzeltmek icin):\n\
 1) search_code ve read_lines ile ilgili kodu bul; gerekirse read_file. Ayni dosyayi tekrar tekrar okuma.\n\
 2) Duzeltmeyi hazirla. old_text TAM satir(lar) olmali; girinti haric hic karakter atlama, satir sonu noktalamayi koru.\n\
 3) verify_candidate ile adayi gecici kopyada derle. Bu adim ana projeyi degistirmez.\n\
-4) VERIFY_OK gelirse ayni path/old_text/new_text ile apply_patch cagir. Kullanici onayi, yedekleme ve gercek projede cargo check + cargo test Rust tarafinda yapilir.\n\
+4) VERIFY_OK gelirse BIREBIR AYNI path/old_text/new_text ile apply_patch cagir. Kullanici onayi, yedekleme ve gercek projede cargo check + cargo test Rust tarafinda yapilir.\n\
 5) VERIFY_FAILED gelirse derleyici hatasini oku ve FARKLI bir new_text ile verify_candidate'i tekrar cagir. Ayni basarisiz patch yasaktir. En fazla 3 dogrulama denemesi vardir; sayac ve durdurma karari Rust tarafindaki Repair Controller'a aittir.\n\
+\n\
+KILIT (Rust tarafinda uygulanir): apply_patch yalnizca dogrulanmis ve birebir ayni adayi kabul eder. Degistirilmis, dogrulanmamis veya eskimis aday otomatik olarak yeniden dogrulanir; izin yoksa APPLY_BLOCKED ile reddedilir ve ana proje degismez.\n\
 \n\
 KANIT KURALLARI:\n\
 - Sadece okudugun fonksiyon ve satirlar hakkinda konus. Gormedigin API, fonksiyon veya kutuphane davranisini uydurma; emin degilsen 'okumadim' de ve read_lines kullan.\n\
@@ -168,7 +176,20 @@ fn finish_verification(
     new_text: &str,
     report: &VerificationReport,
 ) -> ToolOutcome {
-    repair.record_verification(path, old_text, new_text, report.success);
+    let mode = VerifyMode::parse(&report.mode).unwrap_or(VerifyMode::Check);
+    if report.success {
+        repair.record_success(VerifiedCandidate {
+            path: path.to_string(),
+            old_text: old_text.to_string(),
+            new_text: new_text.to_string(),
+            original_hash: report.original_hash,
+            updated_hash: report.updated_hash,
+            project_fingerprint: report.project_fingerprint,
+            mode,
+        });
+    } else {
+        repair.record_failure(path, old_text, new_text);
+    }
     if let Some(err) = &report.cleanup_error {
         println!("[UYARI] Gecici klasor silinemedi: {err}");
     }
@@ -182,8 +203,15 @@ fn finish_verification(
             report.mode, report.files_copied
         );
         output.push_str(
-            "sonraki_adim: Ana proje DEGISMEDI. Ayni path/old_text/new_text ile apply_patch cagir; kullanici onayi istenecek.",
+            "sonraki_adim: Ana proje DEGISMEDI. BIREBIR AYNI path/old_text/new_text ile apply_patch cagir; kullanici onayi istenecek. Farkli gonderirsen yeniden dogrulama gerekir.",
         );
+        if mode < repair.required_mode() {
+            output.push_str(&format!(
+                "\nuyari: bu gorevde apply icin cargo {} seviyesi gerekiyor; apply_patch cagrildiginda aday once cargo {} ile yeniden dogrulanir.",
+                repair.required_mode().as_str(),
+                repair.required_mode().as_str()
+            ));
+        }
         return ToolOutcome::output(output);
     }
 
@@ -219,17 +247,18 @@ async fn verify_candidate_flow<P: Prompter>(
     new_text: &str,
     mode: &str,
 ) -> io::Result<ToolOutcome> {
-    if mode != "check" && mode != "test" {
+    let Some(mode) = VerifyMode::parse(mode) else {
         return Ok(ToolOutcome::output(
             "ERROR: Gecersiz mode. check veya test kullan.",
         ));
-    }
+    };
     if !session.consent.allowed(mode, prompter)? {
         return Ok(ToolOutcome::output(format!(
-            "VERIFY_REJECTED: Kullanici gecici kopyada cargo {mode} calistirmaya izin vermedi. Ana proje degismedi. Gerekirse apply_patch ile oneri yap; kullanici onayi istenecek."
+            "VERIFY_REJECTED: Kullanici gecici kopyada cargo {} calistirmaya izin vermedi. Ana proje degismedi. Bu oturumda dogrulanmamis patch uygulanamaz; kullaniciya durumu bildir.",
+            mode.as_str()
         )));
     }
-    if let Err(e) = repair.register_candidate(path, old_text, new_text) {
+    if let Err(e) = repair.register_candidate(path, old_text, new_text, mode) {
         let stop = repair.exhausted().then(exhausted_reason);
         return Ok(ToolOutcome {
             output: format!("ERROR: {e}"),
@@ -240,8 +269,11 @@ async fn verify_candidate_flow<P: Prompter>(
         Err(e) => return Ok(ToolOutcome::output(format!("ERROR: {e}"))),
         Ok(plan) => plan,
     };
-    println!("[VERIFY] Aday gecici kopyada derleniyor (cargo {mode})...");
-    let report = match verification::verify_candidate(&session.root, &plan, mode).await {
+    println!(
+        "[VERIFY] Aday gecici kopyada derleniyor (cargo {})...",
+        mode.as_str()
+    );
+    let report = match verification::verify_candidate(&session.root, &plan, mode.as_str()).await {
         Err(e) => {
             return Ok(ToolOutcome::output(format!(
                 "ERROR: Dogrulama baslatilamadi: {e}"
@@ -254,6 +286,34 @@ async fn verify_candidate_flow<P: Prompter>(
     ))
 }
 
+/// v0.8 kilidi: adayin su anki dosya icerigi ve proje parmak izi ile dogrulama kaydini karsilastirir.
+fn authorize(
+    repair: &mut RepairController,
+    root: &Path,
+    path: &str,
+    old_text: &str,
+    new_text: &str,
+    plan: &PatchPlan,
+) -> Result<Result<VerifiedCandidate, ApplyRejection>, String> {
+    let fingerprint = verification::project_fingerprint(root)?;
+    Ok(repair.authorize_apply(
+        path,
+        old_text,
+        new_text,
+        verification::content_hash(&plan.original),
+        verification::content_hash(&plan.updated),
+        fingerprint,
+    ))
+}
+
+fn blocked(rejection: &ApplyRejection, detail: &str, reason: &str) -> ToolOutcome {
+    println!("[LOCK] {rejection} {detail}");
+    ToolOutcome::stop(
+        format!("APPLY_BLOCKED: {rejection} {detail} Ana proje DEGISMEDI."),
+        reason,
+    )
+}
+
 async fn apply_patch_flow<P: Prompter>(
     session: &mut Session,
     repair: &mut RepairController,
@@ -262,46 +322,103 @@ async fn apply_patch_flow<P: Prompter>(
     old_text: &str,
     new_text: &str,
 ) -> io::Result<ToolOutcome> {
-    let verified_before = repair.is_verified(path, old_text, new_text);
     if let Err(e) = repair.register(path, old_text, new_text) {
         return Ok(ToolOutcome::stop(
             format!("ERROR: {e}"),
             "Ayni veya siniri asan patch reddedildi; gorev durduruldu.",
         ));
     }
-    let plan = match tools::prepare_patch(&session.root, path, old_text, new_text) {
+    let mut plan = match tools::prepare_patch(&session.root, path, old_text, new_text) {
         Err(e) => return Ok(ToolOutcome::output(format!("ERROR: {e}"))),
         Ok(plan) => plan,
     };
 
-    // v0.7 guvenlik agi: dogrulanmamis aday, kullanici izin verdiyse once
-    // gecici kopyada derlenir. Boylece bozuk kod icin onay istenmez.
-    if !verified_before && session.consent.allowed("check", prompter)? {
-        println!("[AUTO-VERIFY] Dogrulanmamis aday once gecici kopyada derleniyor...");
-        match verification::verify_candidate(&session.root, &plan, "check").await {
-            Err(e) => println!("[AUTO-VERIFY] Baslatilamadi ({e}); onay akisina geciliyor."),
-            Ok(report) => {
-                let outcome = finish_verification(repair, path, old_text, new_text, &report);
-                if !report.success {
-                    return Ok(outcome);
-                }
-            }
+    let mut authorization = match authorize(repair, &session.root, path, old_text, new_text, &plan)
+    {
+        Err(e) => {
+            return Ok(ToolOutcome::output(format!(
+                "ERROR: Proje durumu okunamadi, kilit acilamadi: {e}. Ana proje DEGISMEDI."
+            )));
         }
+        Ok(result) => result,
+    };
+
+    if let Err(rejection) = &authorization {
+        if !rejection.needs_verification() {
+            return Ok(blocked(
+                rejection,
+                "",
+                "Patch kilidi: aday reddedildi; gorev durduruldu.",
+            ));
+        }
+        // Kilit kapali: yeniden dogrulama zorunlu. Izin yoksa gercek dosyaya yazilmaz.
+        let mode = repair.required_mode();
+        println!("[LOCK] {rejection}");
+        if !session.consent.allowed(mode, prompter)? {
+            return Ok(blocked(
+                rejection,
+                "Kullanici gecici dogrulama iznini vermedi; Verified Patch Lock dogrulanmamis patch'in gercek projeye yazilmasina izin vermez.",
+                "Dogrulama izni yok; dogrulanmamis patch uygulanamaz. Gorev durduruldu.",
+            ));
+        }
+        if repair.exhausted() {
+            return Ok(blocked(
+                rejection,
+                "Dogrulama deneme siniri doldu; yeniden dogrulama yapilamaz.",
+                exhausted_reason().as_str(),
+            ));
+        }
+        println!(
+            "[AUTO-VERIFY] Aday gecici kopyada yeniden dogrulaniyor (cargo {})...",
+            mode.as_str()
+        );
+        let report = match verification::verify_candidate(&session.root, &plan, mode.as_str()).await
+        {
+            Err(e) => {
+                return Ok(ToolOutcome::output(format!(
+                    "ERROR: Dogrulama baslatilamadi: {e}. Dogrulanmamis patch uygulanamaz; ana proje DEGISMEDI."
+                )));
+            }
+            Ok(report) => report,
+        };
+        let outcome = finish_verification(repair, path, old_text, new_text, &report);
+        if !report.success {
+            return Ok(outcome);
+        }
+        // Dosya dogrulama sirasinda degismis olabilir: plani ve kilidi yenile.
+        plan = match tools::prepare_patch(&session.root, path, old_text, new_text) {
+            Err(e) => return Ok(ToolOutcome::output(format!("ERROR: {e}"))),
+            Ok(plan) => plan,
+        };
+        authorization = match authorize(repair, &session.root, path, old_text, new_text, &plan) {
+            Err(e) => {
+                return Ok(ToolOutcome::output(format!(
+                    "ERROR: Proje durumu okunamadi, kilit acilamadi: {e}. Ana proje DEGISMEDI."
+                )));
+            }
+            Ok(result) => result,
+        };
     }
 
-    let verified_now = repair.is_verified(path, old_text, new_text);
+    let verified = match authorization {
+        Ok(verified) => verified,
+        Err(rejection) => {
+            return Ok(blocked(
+                &rejection,
+                "Yeniden dogrulamaya ragmen kilit acilamadi.",
+                "Dogrulama kilidi acilamadi; gorev durduruldu.",
+            ));
+        }
+    };
+
     println!("\n========== PATCH ONIZLEME ==========");
     println!("Dosya: {}", plan.path.display());
     println!("--- ESKI ---\n{old_text}");
     println!("+++ YENI +++\n{new_text}");
     println!("===================================");
     println!(
-        "Dogrulama: {}",
-        if verified_now {
-            "aday gecici kopyada cargo check'ten GECTI"
-        } else {
-            "aday gecici kopyada DOGRULANMADI"
-        }
+        "Dogrulama: aday gecici kopyada cargo {} ile DOGRULANDI; dosya ve proje o zamandan beri degismedi (kilit acik).",
+        verified.mode.as_str()
     );
     println!("Onay: yedekleme + gercek projede cargo check + cargo test.");
     println!("Hatada dosya onceki haline geri alinacak.");
@@ -572,10 +689,31 @@ mod tests {
         })
     }
 
+    fn patch_args_mode(new_text: &str, mode: &str) -> Value {
+        json!({
+            "path": "src/main.rs",
+            "old_text": MINI_OLD,
+            "new_text": new_text,
+            "mode": mode
+        })
+    }
+
     fn trusted_session(root: &std::path::Path) -> Session {
         let mut session = Session::new(root.to_path_buf());
         session.consent = VerifyConsent::granted();
         session
+    }
+
+    async fn call(
+        session: &mut Session,
+        repair: &mut RepairController,
+        prompter: &mut ScriptedPrompter,
+        name: &str,
+        args: &Value,
+    ) -> ToolOutcome {
+        handle_tool_call(session, repair, prompter, name, args)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -917,6 +1055,326 @@ mod tests {
             MINI_MAIN
         );
         assert!(!root.join(".fiko_backups").exists());
+        remove(&root);
+    }
+
+    // ---------------- v0.8 Verified Patch Lock ----------------
+
+    #[tokio::test]
+    async fn izin_reddedilince_apply_patch_dogrulamayi_atlayamamali() {
+        let root = mini_crate("lock_noconsent");
+        let mut session = Session::new(root.clone());
+        let mut repair = RepairController::default();
+        // Tek cevap: sandbox iznine "h". Onay sorusu hic gelmemeli.
+        let mut prompter = ScriptedPrompter::with(&[false]);
+
+        let outcome = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        assert!(
+            outcome.output.starts_with("APPLY_BLOCKED"),
+            "{}",
+            outcome.output
+        );
+        assert!(outcome.stop.is_some(), "izin yoksa gorev durmali");
+        assert_eq!(
+            prompter.asked.len(),
+            1,
+            "yalnizca izin sorusu: {:?}",
+            prompter.asked
+        );
+        assert!(prompter.asked[0].contains("cargo check"));
+        assert_eq!(repair.verify_attempts(), 0);
+        assert!(session.last_patch.is_none());
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            MINI_MAIN
+        );
+        assert!(!root.join(".fiko_backups").exists());
+
+        // Ikinci deneme de izin sorusu tekrarlamadan kilitli kalir.
+        let again = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args("let value: i32 = 3;"),
+        )
+        .await;
+        assert!(
+            again.output.starts_with("APPLY_BLOCKED"),
+            "{}",
+            again.output
+        );
+        assert_eq!(prompter.asked.len(), 1);
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn degistirilmis_aday_apply_oncesi_yeniden_dogrulanmali() {
+        let root = mini_crate("lock_modified");
+        let mut session = trusted_session(&root);
+        let mut repair = RepairController::default();
+        let mut prompter = ScriptedPrompter::with(&[true]);
+
+        let verify = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "verify_candidate",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        assert!(verify.output.starts_with("VERIFY_OK"), "{}", verify.output);
+
+        // Model farkli bir new_text ile apply_patch cagiriyor.
+        let changed = "let value: i32 = 3;";
+        let apply = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(changed),
+        )
+        .await;
+        assert!(
+            apply.output.starts_with("PATCH_VERIFIED"),
+            "{}",
+            apply.output
+        );
+        assert_eq!(
+            repair.verify_attempts(),
+            2,
+            "degistirilmis aday yeniden dogrulanmali"
+        );
+        assert_eq!(
+            prompter.asked.len(),
+            1,
+            "onay yeniden dogrulamadan sonra bir kez"
+        );
+        assert!(prompter.asked[0].contains("Patch uygulansin"));
+        let content = fs::read_to_string(root.join("src/main.rs")).unwrap();
+        assert!(content.contains(changed), "{content}");
+        assert!(!content.contains(MINI_GOOD));
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn degistirilmis_bozuk_aday_onay_istememeli() {
+        let root = mini_crate("lock_modified_bad");
+        let mut session = trusted_session(&root);
+        let mut repair = RepairController::default();
+        let mut prompter = ScriptedPrompter::with(&[true]);
+
+        call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "verify_candidate",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        // Dogrulanan iyi aday yerine bozuk bir aday gonderiliyor.
+        let apply = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(MINI_BAD),
+        )
+        .await;
+        assert!(
+            apply.output.starts_with("VERIFY_FAILED"),
+            "{}",
+            apply.output
+        );
+        assert!(
+            prompter.asked.is_empty(),
+            "onay istenmemeli: {:?}",
+            prompter.asked
+        );
+        assert_eq!(repair.verify_attempts(), 2);
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            MINI_MAIN
+        );
+        // Dogrulanan orijinal aday hala uygulanabilir.
+        let apply_ok = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        assert!(
+            apply_ok.output.starts_with("PATCH_VERIFIED"),
+            "{}",
+            apply_ok.output
+        );
+        assert_eq!(
+            repair.verify_attempts(),
+            2,
+            "kayitli dogrulama yeniden derleme gerektirmez"
+        );
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn dogrulama_sonrasi_dosya_degisirse_yeniden_dogrulanmali() {
+        let root = mini_crate("lock_stale");
+        let mut session = trusted_session(&root);
+        let mut repair = RepairController::default();
+        let mut prompter = ScriptedPrompter::with(&[true]);
+
+        let verify = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "verify_candidate",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        assert!(verify.output.starts_with("VERIFY_OK"), "{}", verify.output);
+
+        // Kullanici (ya da baska bir arac) hedef dosyayi dogrulamadan sonra degistiriyor;
+        // old_text hala eslesiyor ama icerik surumu farkli.
+        let main_rs = root.join("src/main.rs");
+        let mut edited = fs::read_to_string(&main_rs).unwrap();
+        edited.push_str("// sonradan eklendi\n");
+        fs::write(&main_rs, &edited).unwrap();
+
+        let apply = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        assert!(
+            apply.output.starts_with("PATCH_VERIFIED"),
+            "{}",
+            apply.output
+        );
+        assert_eq!(
+            repair.verify_attempts(),
+            2,
+            "eski dogrulama gecersiz; yeniden dogrulanmali"
+        );
+        assert_eq!(prompter.asked.len(), 1);
+        let content = fs::read_to_string(&main_rs).unwrap();
+        assert!(content.contains(MINI_GOOD) && content.contains("sonradan eklendi"));
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn proje_degisirse_eski_dogrulama_gecersiz_olmali() {
+        let root = mini_crate("lock_stale_project");
+        let mut session = trusted_session(&root);
+        let mut repair = RepairController::default();
+        let mut prompter = ScriptedPrompter::with(&[false]);
+
+        call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "verify_candidate",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        // Hedef dosya ayni kaliyor; baska bir proje dosyasi degisiyor.
+        let cargo = root.join("Cargo.toml");
+        let mut text = fs::read_to_string(&cargo).unwrap();
+        text.push_str("\n# bagimlilik notu\n");
+        fs::write(&cargo, text).unwrap();
+
+        let apply = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(MINI_GOOD),
+        )
+        .await;
+        // Yeniden dogrulama yapildi (deneme 2), sonra onay soruldu ve reddedildi.
+        assert_eq!(repair.verify_attempts(), 2, "{}", apply.output);
+        assert!(
+            apply.output.starts_with("PATCH_REJECTED"),
+            "{}",
+            apply.output
+        );
+        assert_eq!(prompter.asked.len(), 1);
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            MINI_MAIN
+        );
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn check_ile_dogrulanan_aday_test_gereken_gorevde_yukseltilmeli() {
+        let root = mini_crate("lock_mode");
+        let mut session = trusted_session(&root);
+        let mut repair = RepairController::default();
+        let mut prompter = ScriptedPrompter::with(&[true]);
+
+        let strong = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "verify_candidate",
+            &patch_args_mode(MINI_GOOD, "test"),
+        )
+        .await;
+        assert!(strong.output.starts_with("VERIFY_OK"), "{}", strong.output);
+        assert_eq!(repair.required_mode(), VerifyMode::Test);
+
+        let weak_text = "let value: i32 = 3;";
+        let weak = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "verify_candidate",
+            &patch_args_mode(weak_text, "check"),
+        )
+        .await;
+        assert!(weak.output.starts_with("VERIFY_OK"), "{}", weak.output);
+        assert!(
+            weak.output.contains("cargo test seviyesi"),
+            "{}",
+            weak.output
+        );
+
+        // Yalnizca check ile dogrulanan aday, test seviyesine yukseltilmeden uygulanmaz.
+        let apply = call(
+            &mut session,
+            &mut repair,
+            &mut prompter,
+            "apply_patch",
+            &patch_args(weak_text),
+        )
+        .await;
+        assert!(
+            apply.output.starts_with("PATCH_VERIFIED"),
+            "{}",
+            apply.output
+        );
+        assert_eq!(
+            repair.verify_attempts(),
+            3,
+            "cargo test ile yeniden dogrulanmali"
+        );
+        assert_eq!(
+            repair.verified_mode("src/main.rs", MINI_OLD, weak_text),
+            Some(VerifyMode::Test)
+        );
+        assert_eq!(prompter.asked.len(), 1);
         remove(&root);
     }
 
