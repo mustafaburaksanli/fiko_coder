@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::tools::{PatchPlan, TestResult, check_relative_path, run_cargo};
+use crate::tools::{ExecutionStatus, PatchPlan, TestResult, check_relative_path, run_cargo};
 
 /// Ilk dogrulama bagimliliklari sifirdan derleyebilir; bu yuzden run_tests'ten uzun.
 pub const VERIFY_TIMEOUT_SECS: u64 = 300;
@@ -464,6 +464,17 @@ impl VerificationReport {
 // ============================================================
 // ADAY DOGRULAMA
 // ============================================================
+/// Baslatilamayan veya tamamlanmayan komut, adayin derlenmedigi/testten
+/// kaldigi anlami tasimaz. Eski hata yolunu ve asil surec kanitini koru.
+fn completed_result(result: TestResult) -> Result<TestResult, String> {
+    match result.status {
+        ExecutionStatus::Succeeded | ExecutionStatus::Failed => Ok(result),
+        ExecutionStatus::ExecutionError
+        | ExecutionStatus::TimedOut
+        | ExecutionStatus::Interrupted => Err(result.report),
+    }
+}
+
 async fn run_in_workspace(
     root: &Path,
     workspace: &Path,
@@ -487,7 +498,7 @@ async fn run_in_workspace(
         Duration::from_secs(VERIFY_TIMEOUT_SECS),
     )
     .await?;
-    Ok((result, stats))
+    Ok((completed_result(result)?, stats))
 }
 
 /// `plan` prepare_patch'ten gecmis olmali. Ana projedeki dosya hic degistirilmez;
@@ -604,6 +615,17 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::tools::prepare_patch;
+
+    #[test]
+    fn tamamlanmamis_komut_aday_hatasi_sayilmamali_ve_kanit_korunmali() {
+        for result in [
+            TestResult::execution_error("cargo test".into(), "OS hatasi: dosya bulunamadi".into()),
+            TestResult::timed_out("cargo test".into()),
+        ] {
+            let evidence = result.report.clone();
+            assert_eq!(completed_result(result).unwrap_err(), evidence);
+        }
+    }
 
     #[tokio::test]
     async fn gecerli_aday_patch_dogrulanmali() {

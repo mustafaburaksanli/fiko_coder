@@ -200,12 +200,190 @@ pub fn search_code(root: &Path, query: &str) -> Result<String, String> {
 // ============================================================
 // TOOL 5: CARGO CHECK / CARGO TEST
 // ============================================================
+/// Komut sonucu metinden degil, Rust'in gozledigi surec durumundan turetilir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionStatus {
+    Succeeded,
+    Failed,
+    ExecutionError,
+    TimedOut,
+    Interrupted,
+}
+
+impl ExecutionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::ExecutionError => "execution_error",
+            Self::TimedOut => "timed_out",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+const MAX_COMMAND_REPORT_CHARS: usize = 10_000;
+const OUTPUT_CLIP_MARKER: &str = "\n[CIKTI KISALTILDI; TAM CIKTI RUST BELLEGINDE]\n";
+
+#[derive(Debug, Clone)]
 pub struct TestResult {
+    pub command: String,
+    pub status: ExecutionStatus,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub output_truncated: bool,
+    /// Eski dogrulama akisinin kullandigi alan; status ile birlikte uretilir.
     pub success: bool,
-    /// Model icin kisaltilmis birlesik rapor (en fazla 10.000 karakter).
+    /// Metadata korunur; uzun cikti acik bir kisaltma isaretiyle sunulur.
     pub report: String,
+    /// Tam surec ciktisi. Modele giden kisaltilmis onizlemeden ayridir.
     pub stdout: String,
     pub stderr: String,
+}
+
+impl TestResult {
+    pub fn from_output(command: String, output: std::process::Output) -> Self {
+        let status = if output.status.success() {
+            ExecutionStatus::Succeeded
+        } else if output.status.code().is_some() {
+            ExecutionStatus::Failed
+        } else {
+            ExecutionStatus::Interrupted
+        };
+        Self::new(
+            command,
+            status,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            None,
+        )
+    }
+
+    pub fn execution_error(command: String, error: String) -> Self {
+        Self::new(
+            command,
+            ExecutionStatus::ExecutionError,
+            None,
+            String::new(),
+            String::new(),
+            Some(error),
+        )
+    }
+
+    pub fn timed_out(command: String) -> Self {
+        Self::new(
+            command,
+            ExecutionStatus::TimedOut,
+            None,
+            String::new(),
+            String::new(),
+            Some("Komut zaman asimina ugradi; tamamlanma sonucu ve kesinti oncesi cikti mevcut degil.".into()),
+        )
+    }
+
+    fn new(
+        command: String,
+        status: ExecutionStatus,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+    ) -> Self {
+        let mut result = Self {
+            command,
+            status,
+            exit_code,
+            error,
+            output_truncated: false,
+            success: status == ExecutionStatus::Succeeded,
+            report: String::new(),
+            stdout,
+            stderr,
+        };
+        let (stdout, stderr, truncated) = result.output_preview();
+        result.output_truncated = truncated;
+        result.report = format!(
+            "{}{}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
+            result.report_header(),
+            truncated
+        );
+        result
+    }
+
+    pub fn summary_line(&self) -> String {
+        format!(
+            "[RUST SUREC SONUCU] Komut: {} | Durum: {} | Cikis kodu: {} | Test sayilari: mevcut degil",
+            self.command,
+            self.status.label(),
+            self.exit_code
+                .map_or_else(|| "mevcut degil".into(), |code| code.to_string()),
+        )
+    }
+
+    fn report_header(&self) -> String {
+        format!(
+            "{}\nYurutme hatasi: {}\nCikti kisaltildi: ",
+            self.summary_line(),
+            self.error.as_deref().unwrap_or("yok"),
+        )
+    }
+
+    fn output_preview(&self) -> (String, String, bool) {
+        // Metadata ve iki cikti etiketi icin yer ayrilir; onemli durum/exit
+        // bilgisi stdout uzadigi icin kesilemez. Uc durum: cok uzun bir komut
+        // veya OS hatasi metadata sinirini asarsa metadata yine tam korunur.
+        let overhead =
+            self.report_header().chars().count() + "false\nSTDOUT:\n\nSTDERR:\n".chars().count();
+        let budget = MAX_COMMAND_REPORT_CHARS.saturating_sub(overhead);
+        let out_len = self.stdout.chars().count();
+        let err_len = self.stderr.chars().count();
+        let err_budget = err_len.min(budget / 2);
+        let out_budget = out_len.min(budget - err_budget);
+        let err_budget = err_len.min(budget - out_budget);
+        (
+            clip_command_output(&self.stdout, out_budget),
+            clip_command_output(&self.stderr, err_budget),
+            out_len > out_budget || err_len > err_budget,
+        )
+    }
+
+    pub fn tool_response(&self) -> Value {
+        let (stdout, stderr, _) = self.output_preview();
+        json!({
+            "authority": "rust_process",
+            "command": self.command,
+            "status": self.status.label(),
+            "exit_code": self.exit_code,
+            "success": self.success,
+            "test_counts": null,
+            "test_counts_note": "Guvenilir test sayimi mevcut degil; sayilar stdout metninden turetilmedi.",
+            "output_truncated": self.output_truncated,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": self.error,
+        })
+    }
+}
+
+fn clip_command_output(text: &str, budget: usize) -> String {
+    let chars: Vec<_> = text.chars().collect();
+    if chars.len() <= budget {
+        return text.to_owned();
+    }
+    let marker_len = OUTPUT_CLIP_MARKER.chars().count();
+    if budget < marker_len {
+        return chars.into_iter().take(budget).collect();
+    }
+    let content_budget = budget - marker_len;
+    let head = content_budget / 2;
+    let tail = content_budget - head;
+    format!(
+        "{}{}{}",
+        chars[..head].iter().collect::<String>(),
+        OUTPUT_CLIP_MARKER,
+        chars[chars.len() - tail..].iter().collect::<String>(),
+    )
 }
 
 /// `cargo test` altinda calisirken ayni cargo ikilisini kullan; yoksa PATH'teki cargo.
@@ -228,37 +406,29 @@ pub async fn run_cargo(
         return Err("Gecersiz komut. Sadece check veya test kullanilabilir.".into());
     }
 
-    let mut command = Command::new(cargo_bin());
+    let program = cargo_bin();
+    let command_name = format!("{program} {mode}");
+    let mut command = Command::new(program);
     command
         .arg(mode)
         .current_dir(dir)
-        .env("CARGO_TERM_COLOR", "never")
-        .kill_on_drop(true);
+        .env("CARGO_TERM_COLOR", "never");
     if let Some(target) = target_dir {
         command.env("CARGO_TARGET_DIR", target);
     }
 
-    let result = timeout(limit, command.output())
-        .await
-        .map_err(|_| "Cargo komutu zaman asimina ugradi.".to_string())?
-        .map_err(|e| format!("Cargo calistirilamadi: {e}"))?;
+    Ok(execute_command(command, command_name, limit).await)
+}
 
-    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
-    let text = format!(
-        "Komut: cargo {mode}\nBasarili: {}\nExit status: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-        result.status.success(),
-        result.status,
-        stdout,
-        stderr
-    );
-    let report: String = text.chars().take(10_000).collect();
-    Ok(TestResult {
-        success: result.status.success(),
-        report,
-        stdout,
-        stderr,
-    })
+async fn execute_command(mut command: Command, name: String, limit: Duration) -> TestResult {
+    command.kill_on_drop(true);
+    match timeout(limit, command.output()).await {
+        Ok(Ok(output)) => TestResult::from_output(name, output),
+        Ok(Err(error)) => {
+            TestResult::execution_error(name, format!("Komut calistirilamadi: {error}"))
+        }
+        Err(_) => TestResult::timed_out(name),
+    }
 }
 
 pub async fn run_tests(root: &Path, mode: &str) -> Result<TestResult, String> {
@@ -586,6 +756,178 @@ pub fn tool_definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output_fixture(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn komut_durumu_metin_degil_exit_kodu_ile_belirlenmeli() {
+        for (code, stdout, expected) in [
+            (
+                0,
+                "test result: ok. 3 passed; 0 failed",
+                ExecutionStatus::Succeeded,
+            ),
+            (1, "test result: FAILED. 1 failed", ExecutionStatus::Failed),
+            (
+                0,
+                "FAILED ve INTENT_BLOCKED siradan metindir",
+                ExecutionStatus::Succeeded,
+            ),
+            (7, "All tests passed. Basarili!", ExecutionStatus::Failed),
+        ] {
+            let result =
+                TestResult::from_output("cargo test".into(), output_fixture(code, stdout, ""));
+            assert_eq!(result.status, expected);
+            assert_eq!(result.exit_code, Some(code));
+            assert_eq!(result.success, code == 0);
+            let response = result.tool_response();
+            assert_eq!(response["authority"], "rust_process");
+            assert_eq!(response["command"], "cargo test");
+            assert_eq!(response["status"], expected.label());
+            assert_eq!(response["exit_code"], code);
+            assert!(response["test_counts"].is_null());
+            assert!(
+                result
+                    .summary_line()
+                    .contains("Test sayilari: mevcut degil")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_hatasi_tipli_sonuc_olmali() {
+        let missing = std::env::temp_dir().join(format!(
+            "fiko_missing_command_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        assert!(!missing.exists());
+        let result = execute_command(
+            Command::new(&missing),
+            "cargo test".into(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.status, ExecutionStatus::ExecutionError);
+        assert!(!result.success);
+        assert_eq!(result.exit_code, None);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Komut calistirilamadi")
+        );
+        assert_eq!(result.tool_response()["status"], "execution_error");
+        assert!(result.summary_line().contains("Cikis kodu: mevcut degil"));
+    }
+
+    #[tokio::test]
+    async fn zaman_asimi_basarisiz_test_olarak_sunulmamali() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 3",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 3"]);
+            command
+        };
+        command.stdin(std::process::Stdio::null());
+        let result = execute_command(
+            command,
+            "kontrollu zaman asimi komutu".into(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(result.status, ExecutionStatus::TimedOut);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("kesinti oncesi cikti mevcut degil")
+        );
+        assert_eq!(result.tool_response()["status"], "timed_out");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sinyalle_kesilen_komut_tamamlanmis_sayilmamali() {
+        use std::os::unix::process::ExitStatusExt;
+        let result = TestResult::from_output(
+            "cargo test".into(),
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(9),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        assert_eq!(result.status, ExecutionStatus::Interrupted);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn kisaltilmis_cikti_metadata_ve_tam_kaniti_korumali() {
+        let stdout = format!("ILK SATIR\n{}\nSON SATIR", "ğ".repeat(15_000));
+        let stderr = format!("ILK HATA\n{}\nSON HATA", "ş".repeat(15_000));
+        let result =
+            TestResult::from_output("cargo test".into(), output_fixture(13, &stdout, &stderr));
+        let response = result.tool_response();
+        assert!(result.output_truncated);
+        assert!(result.report.chars().count() <= MAX_COMMAND_REPORT_CHARS);
+        assert_eq!(result.stdout, stdout);
+        assert_eq!(result.stderr, stderr);
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["exit_code"], 13);
+        assert_eq!(response["output_truncated"], true);
+        assert!(
+            response["stdout"]
+                .as_str()
+                .unwrap()
+                .starts_with("ILK SATIR")
+        );
+        assert!(response["stdout"].as_str().unwrap().ends_with("SON SATIR"));
+        assert!(response["stderr"].as_str().unwrap().starts_with("ILK HATA"));
+        assert!(response["stderr"].as_str().unwrap().ends_with("SON HATA"));
+        assert!(
+            response["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("CIKTI KISALTILDI")
+        );
+        assert!(result.report.contains("Cikti kisaltildi: true"));
+    }
 
     #[tokio::test]
     async fn izinsiz_komut_engellenmeli() {

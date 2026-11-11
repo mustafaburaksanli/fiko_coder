@@ -1,11 +1,17 @@
-//! v0.9 Task Intent Engine.
+//! v0.9.1 Intelligent Intent Engine.
 //!
-//! Kullanicinin istegini bes gorev turunden birine ayirir. Siniflandirma tek
+//! Kullanicinin istegini alti gorev turunden birine ayirir. Siniflandirma tek
 //! bir anahtar kelime listesine degil, birlikte degerlendirilen sinyallere
 //! dayanir: Turkce/Ingilizce fiil kokleri (olumsuz ve edilgen cekimler haric),
 //! soru bicimi, salt-okunur koruma kaliplari ("degistirme", "sadece incele")
 //! ve kod tanimlayicilarinin ayiklanmasi (`add_user`, `fix()` fiil sayilmaz).
-//! Sinyaller celisirse sonuc `Unknown`dur.
+//! Oncelik: acik yazmama talimati tum yazma sinyallerini gecersiz kilar;
+//! acik dosya degisikligi `Modify` olarak testten once gelir; yanitta kod
+//! uretimi `Generate`, gercek calistirma istegi `Test`, ardindan Analyze ve
+//! Explain gelir. Sadece bir eylemden bahsetmek o eylemi istemek degildir.
+//! Incele/acikla ile baslayan eylem cumlesinde anlatilan fiiller yetki vermez;
+//! "nasil/how" degisiklik sorusu, soru isareti olmasa da belirsizdir.
+//! Belirsiz dosya olusturma/yazmama celiskisi `Unknown` ve yazma yasagidir.
 //!
 //! Dosya degistirme yetkisi buradan turetilir ve Rust tarafinda uygulanir
 //! (bkz. orchestrator): yalnizca `Modify` yetki verir; `Unknown` icin karar
@@ -19,6 +25,8 @@ pub enum TaskIntent {
     Analyze,
     /// Kodun davranisini acikla.
     Explain,
+    /// Kodu yalnizca yanitta uret; arac, dosya yazimi ve dogrulama yok.
+    Generate,
     /// Kod degisikligi acikca istendi.
     Modify,
     /// Mevcut kodu derle / test et.
@@ -41,6 +49,7 @@ impl TaskIntent {
         match self {
             TaskIntent::Analyze => "Analyze",
             TaskIntent::Explain => "Explain",
+            TaskIntent::Generate => "Generate",
             TaskIntent::Modify => "Modify",
             TaskIntent::Test => "Test",
             TaskIntent::Unknown => "Unknown",
@@ -51,7 +60,9 @@ impl TaskIntent {
         match self {
             TaskIntent::Modify => WriteAuthority::Granted,
             TaskIntent::Unknown => WriteAuthority::Undecided,
-            TaskIntent::Analyze | TaskIntent::Explain | TaskIntent::Test => WriteAuthority::Denied,
+            TaskIntent::Analyze | TaskIntent::Explain | TaskIntent::Generate | TaskIntent::Test => {
+                WriteAuthority::Denied
+            }
         }
     }
 
@@ -63,6 +74,9 @@ impl TaskIntent {
             }
             TaskIntent::Explain => {
                 "Bu gorev aciklama: dosya DEGISTIRILMEZ; verify_candidate ve apply_patch bu gorevde kullanilamaz. Ilgili kodu oku ve davranisini yalnizca okudugun satirlara dayanarak acikla."
+            }
+            TaskIntent::Generate => {
+                "Bu gorev yalnizca yanitta kod uretimidir. HICBIR arac cagirma; dosya olusturma/degistirme, derleme/test, verify_candidate ve apply_patch kullanma, patch onayi isteme. Istenen eksiksiz kodu istenen yanit biciminde sun. Kod metni uretmek dosya yazimi veya dogrulama degildir; dosya olusturuldugunu, kodun calistirildigini ya da testlerin gectigini iddia etme."
             }
             TaskIntent::Test => {
                 "Bu gorev derleme/test: dosya DEGISTIRILMEZ. run_tests ile gercek projede cargo check/test calistir (kullanici onayi istenir) ve ciktiyi oldugu gibi raporla."
@@ -102,6 +116,7 @@ impl Confidence {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Scores {
+    pub generate: u32,
     pub analyze: u32,
     pub explain: u32,
     pub modify: u32,
@@ -115,6 +130,8 @@ pub struct IntentDecision {
     /// Karari dogruran sinyaller (insan okunur, console ve testler icin).
     pub evidence: Vec<String>,
     pub scores: Scores,
+    /// Acik yazmama talimati: Unknown olsa bile model yeniden izin isteyemez.
+    pub write_forbidden: bool,
 }
 
 impl IntentDecision {
@@ -125,6 +142,7 @@ impl IntentDecision {
             confidence: Confidence::High,
             evidence: vec!["sabit".into()],
             scores: Scores::default(),
+            write_forbidden: false,
         }
     }
 
@@ -141,6 +159,7 @@ impl IntentDecision {
 // SINYAL TABLOLARI
 // ============================================================
 const W_MODIFY: u32 = 3;
+const W_GENERATE: u32 = 3;
 const W_TEST: u32 = 3;
 const W_ANALYZE: u32 = 2;
 const W_EXPLAIN: u32 = 2;
@@ -165,6 +184,7 @@ const MODIFY_TR: &[&str] = &[
     "adlandir",
     "donustur",
     "tasi",
+    "kaydet",
 ];
 /// "yaz" koku cok anlamli (yaziyor, yazilim); yalnizca emir/istek bicimleri sayilir.
 const WRITE_TR_EXACT: &[&str] = &[
@@ -175,6 +195,9 @@ const WRITE_TR_EXACT: &[&str] = &[
     "yazin",
     "yaziniz",
     "yazar",
+    "yazmani",
+    "yazmanizi",
+    "yazmami",
 ];
 const MODIFY_EN: &[&str] = &[
     "fix",
@@ -196,6 +219,7 @@ const MODIFY_EN: &[&str] = &[
     "convert",
     "rewrite",
     "edit",
+    "save",
 ];
 const ANALYZE_TR: &[&str] = &[
     "incele",
@@ -243,19 +267,43 @@ const EXPLAIN_TR: &[&str] = &[
 const EXPLAIN_EN: &[&str] = &[
     "explain", "why", "how", "what", "describe", "clarify", "meaning",
 ];
-const TEST_TR: &[&str] = &["test", "derle", "calistir"];
-const TEST_EN: &[&str] = &[
-    "test",
-    "tests",
-    "compile",
-    "build",
-    "run",
-    "cargo",
-    "clippy",
-    "benchmark",
+const GENERATE_TR: &[&str] = &["uret", "tasarla", "olustur", "hazirla", "goster", "sun"];
+const GENERATE_EN: &[&str] = &[
+    "generate", "create", "write", "design", "show", "provide", "produce",
+];
+const CODE_TARGETS: &[&str] = &[
+    "html",
+    "html5",
+    "css",
+    "css3",
+    "javascript",
+    "typescript",
+    "rust",
+    "python",
+    "sql",
+    "code",
+    "kod",
+    "snippet",
+    "function",
+    "fonksiyon",
+    "component",
+    "bilesen",
+    "layout",
+    "landing",
+    "page",
+    "sayfa",
+    "script",
+    "query",
+    "sorgu",
+    "configuration",
+    "config",
+    "yapilandirma",
+    "example",
+    "ornek",
 ];
 /// Soru kaliplari (iki kelime): acik aciklama istegi.
 const EXPLAIN_PHRASES: &[&str] = &[
+    "ne demek",
     "ne yapar",
     "ne yapiyor",
     "ne ise yarar",
@@ -272,7 +320,20 @@ const ANALYZE_PHRASES: &[&str] = &[
     "any issues",
 ];
 /// Salt-okunur koruma: tek kelimeler tam eslesir, kaliplar metin icinde aranir.
-const GUARD_TOKENS: &[&str] = &["degistirme", "degistirmeden", "dokunma", "dokunmadan"];
+const GUARD_TOKENS: &[&str] = &[
+    "degistirme",
+    "degistirmeden",
+    "dokunma",
+    "dokunmadan",
+    "olusturma",
+    "olusturmadan",
+    "yazma",
+    "yazmadan",
+    "kaydetme",
+    "kaydetmeden",
+    "silme",
+    "guncelleme",
+];
 const GUARD_PHRASES: &[&str] = &[
     "degisiklik yapma",
     "degisiklik yapmadan",
@@ -306,6 +367,23 @@ const GUARD_PHRASES: &[&str] = &[
     "just analyze",
     "no changes",
     "no modifications",
+    "do not create",
+    "do not write",
+    "do not save",
+    "do not edit",
+    "do not update",
+    "do not delete",
+    "without writing",
+    "without saving",
+    "without creating",
+    "no filesystem modifications",
+    "no file changes",
+    "no writes",
+    "write nothing to disk",
+    "avoid changing",
+    "avoid modifying",
+    "avoid writing",
+    "avoid creating",
 ];
 
 // ============================================================
@@ -350,7 +428,7 @@ fn tokens(folded: &str) -> Vec<String> {
         .filter_map(|word| {
             let word = word.trim_matches(|c: char| matches!(c, ',' | ';' | '!' | '?'));
             // Cumle sonu noktasi tanimlayici sayilmasin; "main.rs" gibi ic nokta sayilsin.
-            let word = word.strip_suffix('.').unwrap_or(word);
+            let word = word.trim_end_matches(['.', ':']);
             if word.is_empty() || is_identifier(word) {
                 None
             } else {
@@ -372,19 +450,41 @@ fn turkish_stem_match(token: &str, stem: &str) -> bool {
     if rest.starts_with("meli") || rest.starts_with("mali") {
         return true;
     }
-    let negative = rest == "me"
-        || rest == "ma"
-        || ["mey", "may", "mez", "maz", "med", "mad", "mes", "mas"]
-            .iter()
-            .any(|suffix| rest.starts_with(suffix));
     let passive = ["il", "in", "en", "n"]
         .iter()
         .any(|suffix| rest.starts_with(suffix));
-    !(negative || passive)
+    !(turkish_negative_suffix(rest) || passive)
+}
+
+fn turkish_negative_suffix(rest: &str) -> bool {
+    rest == "me"
+        || rest == "ma"
+        || [
+            "mey", "may", "mez", "maz", "med", "mad", "mes", "mas", "meme", "mama",
+        ]
+        .iter()
+        .any(|suffix| rest.starts_with(suffix))
 }
 
 fn english_match(token: &str, word: &str) -> bool {
     token == word || token.strip_suffix('s') == Some(word)
+}
+
+fn english_in(token: &str, group: &[&str]) -> bool {
+    group.iter().any(|word| english_match(token, word))
+}
+
+fn modification_word(word: &str) -> bool {
+    english_in(word, MODIFY_EN)
+        || MODIFY_TR.iter().any(|stem| turkish_stem_match(word, stem))
+        || WRITE_TR_EXACT.contains(&word)
+}
+
+/// "Guncelleme yap"ta -me isim-fiildir; tek basina "guncelleme" yasaktir.
+fn noun_action(words: &[String], index: usize) -> bool {
+    words
+        .get(index + 1)
+        .is_some_and(|word| turkish_stem_match(word, "yap"))
 }
 
 fn score_group(
@@ -395,10 +495,16 @@ fn score_group(
     evidence: &mut Vec<String>,
 ) -> u32 {
     let mut score = 0;
-    for token in tokens {
+    for (index, token) in tokens.iter().enumerate() {
         let hit = turkish
             .iter()
-            .find(|stem| turkish_stem_match(token, stem))
+            .find(|stem| {
+                turkish_stem_match(token, stem)
+                    || noun_action(tokens, index)
+                        && token
+                            .strip_prefix(**stem)
+                            .is_some_and(|rest| rest == "ma" || rest == "me")
+            })
             .or_else(|| english.iter().find(|word| english_match(token, word)));
         if let Some(stem) = hit {
             score += weight;
@@ -409,37 +515,535 @@ fn score_group(
 }
 
 fn guard(folded: &str, tokens: &[String]) -> Option<String> {
-    if let Some(token) = tokens
-        .iter()
-        .find(|token| GUARD_TOKENS.contains(&token.as_str()))
-    {
+    if let Some((_, token)) = tokens.iter().enumerate().find(|(index, token)| {
+        GUARD_TOKENS.contains(&token.as_str()) && !noun_action(tokens, *index)
+    }) {
         return Some(token.clone());
     }
     GUARD_PHRASES
         .iter()
-        .find(|phrase| folded.contains(*phrase))
+        .find(|phrase| phrase_match(folded, phrase))
         .map(|phrase| (*phrase).to_string())
+        .or_else(|| {
+            clauses(folded).into_iter().find_map(|clause| {
+                let words = self::tokens(&clause);
+                let refused = words
+                    .iter()
+                    .any(|word| ["istemiyorum", "istemem", "istemiyoruz"].contains(&word.as_str()));
+                let denied_english = english_negation(&words)
+                    && words.iter().any(|word| english_in(word, MODIFY_EN));
+                let denied_turkish = words.iter().enumerate().any(|(index, word)| {
+                    if noun_action(&words, index) {
+                        return false;
+                    }
+                    MODIFY_TR.iter().chain(["yaz", "dokun"].iter()).any(|stem| {
+                        word.strip_prefix(stem).is_some_and(turkish_negative_suffix)
+                            || (refused && turkish_stem_match(word, stem))
+                    })
+                });
+                (denied_english || denied_turkish).then_some(clause)
+            })
+        })
+}
+
+/// Kaliplar tam sozcuk sinirinda eslesir: "kod yazma" bir yasaktir,
+/// "kod yazmani istiyorum" ise olumlu istektir.
+fn phrase_match(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + phrase.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// Cumle/eylem sinirlari olumsuzlugun komsu olumlu istege yayilmasini onler.
+/// Dosya adlarinin icindeki noktalara dokunulmaz.
+fn clauses(folded: &str) -> Vec<String> {
+    let mut text = folded.replace(". ", "; ");
+    for boundary in [" but ", " ama ", " ancak "] {
+        text = text.replace(boundary, "; ");
+    }
+    for boundary in [" without ", " only ", " just ", " sadece ", " yalnizca "] {
+        text = text.replace(boundary, &format!("; {} ", boundary.trim()));
+    }
+    let mut result = Vec::new();
+    for sentence in text.split([';', '!', '?']) {
+        // Inceleme nesnesindeki "create and update functions" isimleri emir
+        // degildir. Ayiklama baglaclardan once yapilir; Turkce fiil sonda olabilir.
+        let sentence = mask_function_names(sentence);
+        for segment in sentence.split(',').flat_map(|part| part.split(" ve ")) {
+            let mut negative = false;
+            for clause in segment
+                .split(" and ")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                // "Do not test and modify files" belirsizliginde ikinci eylemi
+                // olumlu yetkiye cevirmeyiz. Yeni cumle veya "but" kapsami bitirir.
+                let denied = english_negation(&tokens(clause));
+                result.push(if negative {
+                    format!("do not {clause}")
+                } else {
+                    clause.to_owned()
+                });
+                negative |= denied;
+            }
+        }
+    }
+    result
+}
+
+fn english_negation(words: &[String]) -> bool {
+    let action = words.iter().position(|word| {
+        english_in(word, MODIFY_EN)
+            || english_in(word, GENERATE_EN)
+            || english_in(word, ANALYZE_EN)
+            || english_in(
+                word,
+                &[
+                    "explain", "describe", "clarify", "run", "execute", "test", "compile", "build",
+                ],
+            )
+    });
+    action.is_some_and(|action| english_negation_at(words, action))
+}
+
+fn english_negation_at(words: &[String], action: usize) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        ["not", "never", "without", "no", "cannot"].contains(&word.as_str()) && index <= action + 1
+    })
+}
+
+/// Acik inceleme/aciklama cumlesinde fonksiyon adlarini kod tanimlayicisi
+/// gibi isaretler. Ayri bir dosya emri korunur; yalnizca fonksiyon adinin
+/// hemen onundeki ad/listesi ayiklanir.
+fn mask_function_names(sentence: &str) -> String {
+    let has_read = tokens(sentence).iter().any(|word| {
+        english_in(word, ANALYZE_EN)
+            || english_in(word, EXPLAIN_EN)
+            || ANALYZE_TR
+                .iter()
+                .chain(EXPLAIN_TR)
+                .any(|stem| turkish_stem_match(word, stem))
+    });
+    if !has_read {
+        return sentence.to_owned();
+    }
+    let mut words: Vec<_> = sentence.split_whitespace().map(str::to_owned).collect();
+    for index in 1..words.len() {
+        let noun = words[index].trim_matches(|c: char| !c.is_alphanumeric());
+        if !["function", "functions", "method", "methods"].contains(&noun)
+            && !["fonksiyon", "metot", "islev"]
+                .iter()
+                .any(|stem| noun.starts_with(stem))
+        {
+            continue;
+        }
+        let mut name = index - 1;
+        loop {
+            let word = words[name].trim_matches(|c: char| !c.is_alphanumeric());
+            if !modification_word(word) {
+                break;
+            }
+            words[name] = format!("`{}`", words[name]);
+            if name > 0 && words[name - 1].ends_with(',') {
+                name -= 1;
+            } else if name >= 2 && ["and", "ve"].contains(&words[name - 1].as_str()) {
+                name -= 2;
+            } else {
+                break;
+            }
+        }
+    }
+    words.join(" ")
+}
+
+fn code_target(words: &[String], clause: &str) -> bool {
+    words.iter().any(|word| {
+        CODE_TARGETS.iter().any(|target| {
+            word == target
+                || (["kod", "fonksiyon", "sayfa", "ornek", "sorgu"].contains(target)
+                    && word.starts_with(target))
+        })
+    }) || [".html", ".css", ".js", ".sql"]
+        .iter()
+        .any(|ext| clause.contains(ext))
+}
+
+fn response_only(clause: &str) -> bool {
+    [
+        "code block",
+        "kod blog",
+        "show me the code",
+        "show the code",
+        "as a response",
+        "in your response",
+        "yanitinda",
+        "yanitta",
+        "kodu goster",
+        "ornek kod",
+    ]
+    .iter()
+    .any(|phrase| clause.contains(phrase))
+}
+
+fn filesystem_target(words: &[String], clause: &str) -> bool {
+    words.iter().any(|word| {
+        ["file", "files", "workspace", "project", "disk"].contains(&word.as_str())
+            || ["dosya", "proje", "klasor", "dizin"]
+                .iter()
+                .any(|stem| word.starts_with(stem))
+    }) || clause.split_whitespace().any(|word| {
+        word.contains(['/', '\\'])
+            || [".rs", ".html", ".css", ".js", ".toml", ".json"]
+                .iter()
+                .any(|ext| word.contains(ext))
+    })
+}
+
+/// Inceleme/aciklama emrinden sonra gelen "create/update" gibi sozcukler
+/// anlatilan kodun parcasi olabilir. Yalnizca once gelen gercek eylem sayilir.
+fn read_only_lead(words: &[String], existing_code: bool) -> bool {
+    let read = words.iter().position(|word| {
+        ["explain", "describe", "clarify"].contains(&word.as_str())
+            || ["acikla", "anlat", "yorumla"]
+                .iter()
+                .any(|stem| turkish_stem_match(word, stem))
+            || ((word != "show" && !turkish_stem_match(word, "goster")) || existing_code)
+                && ((english_in(word, ANALYZE_EN)
+                    && !(word == "check" && words.iter().any(|word| word == "cargo")))
+                    || ANALYZE_TR.iter().any(|stem| turkish_stem_match(word, stem)))
+    });
+    let action = words.iter().position(|word| {
+        modification_word(word)
+            || ([
+                "generate", "produce", "design", "run", "execute", "compile", "build",
+            ]
+            .contains(&word.as_str()))
+            || ["uret", "tasarla", "calistir", "derle"]
+                .iter()
+                .any(|stem| turkish_stem_match(word, stem))
+    });
+    read.is_some_and(|read| action.is_none_or(|action| read < action))
+}
+
+/// "test" isim olarak puan getirmez. Calistirma/derleme fiili veya acik
+/// Ingilizce test emri gerekir. "calistirma" olumsuz; "calistirmani istiyorum"
+/// olumlu isim-fiil istegidir ve ayni kok kontrolunde ayrilir.
+fn execution_requested(words: &[String], clause: &str) -> bool {
+    if words
+        .iter()
+        .any(|word| ["istemiyorum", "istemem", "istemiyoruz"].contains(&word.as_str()))
+    {
+        return false;
+    }
+    // Inceleme/aciklama cumlesindeki eylem bir konu olabilir ("build script",
+    // "how we run tests"). Gercek run + aciklama bilesimi ayri eylem cumleleridir.
+    if read_only_lead(words, true) || phrase_match(clause, "ne demek") {
+        return false;
+    }
+    if response_only(clause) && code_target(words, clause) {
+        return false;
+    }
+    let test_subject = words.iter().any(|word| {
+        word.starts_with("test") || ["cargo", "clippy", "benchmark"].contains(&word.as_str())
+    });
+    let run = words
+        .iter()
+        .any(|word| turkish_stem_match(word, "calistir") || word == "run" || word == "execute");
+    let compile = words.iter().any(|word| {
+        turkish_stem_match(word, "derle") || ["compile", "build"].contains(&word.as_str())
+    });
+    let imperative_test = words
+        .iter()
+        .position(|word| word == "test")
+        .is_some_and(|index| {
+            words[..index].iter().all(|word| {
+                ["please", "can", "could", "you", "would", "kindly"].contains(&word.as_str())
+            }) && words.get(index + 1).is_some_and(|word| {
+                [
+                    "the",
+                    "this",
+                    "my",
+                    "our",
+                    "project",
+                    "it",
+                    "all",
+                    "application",
+                ]
+                .contains(&word.as_str())
+            }) && !clause.contains("test code")
+                && !clause.contains("test results")
+        });
+    (run && test_subject) || compile || imperative_test
 }
 
 // ============================================================
 // SINIFLANDIRMA
 // ============================================================
-pub fn classify(request: &str) -> IntentDecision {
-    let folded = fold(request);
-    let tokens = tokens(&folded);
-    let mut evidence = Vec::new();
-    let mut scores = Scores {
-        modify: score_group(&tokens, MODIFY_TR, MODIFY_EN, W_MODIFY, &mut evidence),
-        analyze: score_group(&tokens, ANALYZE_TR, ANALYZE_EN, W_ANALYZE, &mut evidence),
-        explain: score_group(&tokens, EXPLAIN_TR, EXPLAIN_EN, W_EXPLAIN, &mut evidence),
-        test: score_group(&tokens, TEST_TR, TEST_EN, W_TEST, &mut evidence),
-    };
-    if let Some(word) = tokens
-        .iter()
-        .find(|token| WRITE_TR_EXACT.contains(&token.as_str()))
+/// Model arac cagirmadiginda yalniz kullanicinin acik ve desteklenen komutunu
+/// yeniden onaya sunmak icin kullanilir; kendisi komut calistirmaz.
+pub(crate) fn test_execution_plan(request: &str) -> Vec<crate::repair_controller::VerifyMode> {
+    use crate::repair_controller::VerifyMode;
+
+    fn generic_execution_forbidden(words: &[String]) -> bool {
+        if !words.iter().any(|word| {
+            english_in(word, &["tool", "command"])
+                || word.starts_with("arac")
+                || word.starts_with("komut")
+        }) {
+            return false;
+        }
+        let operation = words
+            .iter()
+            .position(|word| english_in(word, &["use", "call", "run", "execute"]));
+        let refused = words
+            .iter()
+            .any(|word| ["istemiyorum", "istemem", "istemiyoruz"].contains(&word.as_str()));
+        operation.is_some_and(|action| english_negation_at(words, action))
+            || words
+                .first()
+                .is_some_and(|word| ["no", "without"].contains(&word.as_str()))
+            || words.iter().any(|word| {
+                ["cagir", "kullan", "calistir"].iter().any(|stem| {
+                    word.strip_prefix(stem).is_some_and(turkish_negative_suffix)
+                        || (refused && turkish_stem_match(word, stem))
+                })
+            })
+    }
+
+    fn mode_for(words: &[String]) -> Option<VerifyMode> {
+        if let Some(index) = words.iter().position(|word| word == "cargo") {
+            match words.get(index + 1).map(String::as_str) {
+                Some("test") => Some(VerifyMode::Test),
+                Some("check") => Some(VerifyMode::Check),
+                _ => None,
+            }
+        } else if words.iter().any(|word| {
+            turkish_stem_match(word, "derle") || ["compile", "build"].contains(&word.as_str())
+        }) {
+            Some(VerifyMode::Check)
+        } else if words.iter().any(|word| word.starts_with("test")) {
+            Some(VerifyMode::Test)
+        } else {
+            None
+        }
+    }
+
+    if classify(request).intent != TaskIntent::Test {
+        return Vec::new();
+    }
+    let folded = fold(request)
+        .replace(['’', '‘'], "'")
+        .replace("n't", " not");
+    // Bu yol yalniz iki sabit argumani temsil edebilir. Shell sozdizimi,
+    // secenekler ve alintilar kirpilip farkli bir komuta donusturulmez.
+    if folded.contains(['`', '"', '\'', '|', '&', '>', '<', ';', '$'])
+        || folded.split_whitespace().any(|word| word.starts_with('-'))
     {
-        scores.modify += W_MODIFY;
-        evidence.push(word.clone());
+        return Vec::new();
+    }
+
+    let execution_clauses = clauses(&folded);
+    if execution_clauses.iter().any(|clause| {
+        !phrase_match(clause, "iddia etme")
+            && !phrase_match(clause, "do not claim")
+            && generic_execution_forbidden(&tokens(clause))
+    }) {
+        return Vec::new();
+    }
+
+    let mut plan = Vec::new();
+    let mut denied = Vec::new();
+    for clause in execution_clauses {
+        let words = tokens(&clause);
+        if phrase_match(&clause, "iddia etme") || phrase_match(&clause, "do not claim") {
+            continue;
+        }
+        let execution_stem = |word: &str| {
+            ["calistir", "derle"]
+                .into_iter()
+                .find(|stem| word.strip_prefix(stem).is_some_and(turkish_negative_suffix))
+        };
+        let refused = words
+            .iter()
+            .any(|word| ["istemiyorum", "istemem", "istemiyoruz"].contains(&word.as_str()));
+        let negative = english_negation(&words)
+            || refused
+            || words.iter().any(|word| execution_stem(word).is_some());
+        if negative {
+            // Yalniz olumsuz calistirma eyleminin modunu yasakla. Ornegin
+            // "do not modify files" test calistirmayi yasaklamaz. Bu olumlu
+            // bicim yalniz negasyon analizidir, hicbir zaman yurutulmez.
+            let affirmed: Vec<String> = words
+                .iter()
+                .filter_map(|word| {
+                    if [
+                        "not",
+                        "never",
+                        "without",
+                        "no",
+                        "cannot",
+                        "istemiyorum",
+                        "istemem",
+                        "istemiyoruz",
+                    ]
+                    .contains(&word.as_str())
+                    {
+                        None
+                    } else {
+                        Some(execution_stem(word).unwrap_or(word).to_string())
+                    }
+                })
+                .collect();
+            if execution_requested(&affirmed, &clause)
+                && let Some(mode) = mode_for(&affirmed)
+                && !denied.contains(&mode)
+            {
+                denied.push(mode);
+            }
+            continue;
+        }
+        if clause
+            .split_whitespace()
+            .any(|word| is_identifier(word.trim_end_matches(['.', ':'])))
+        {
+            continue;
+        }
+        // "Run cargo check and cargo test"te ikinci acik komut, ilk
+        // calistirma emrinin devamidir. Tek basina konu/sonuc ifadesi degildir.
+        let bare_cargo = words.first().is_some_and(|word| word == "cargo") && !plan.is_empty();
+        if !bare_cargo && !execution_requested(&words, &clause) {
+            continue;
+        }
+        if let Some(index) = words.iter().position(|word| word == "cargo") {
+            // Ek hedef/filter argumani ya da ayrilmamis ikinci komut, bu
+            // iki-modlu aracla ayni komut degildir. Yalniz dogal amac/istek
+            // devamini kabul et; argumanlari sessizce atlama.
+            if words[index + 1..].iter().any(|word| word == "cargo")
+                || words
+                    .get(index + 2)
+                    .is_some_and(|word| word != "to" && !turkish_stem_match(word, "calistir"))
+            {
+                continue;
+            }
+        }
+        if let Some(mode) = mode_for(&words)
+            && !plan.contains(&mode)
+        {
+            plan.push(mode);
+        }
+    }
+    plan.retain(|mode| !denied.contains(mode));
+    plan
+}
+
+pub fn classify(request: &str) -> IntentDecision {
+    let folded = fold(request)
+        .replace(['’', '‘'], "'")
+        .replace("n't", " not");
+    let all_tokens = tokens(&folded);
+    let mut evidence = Vec::new();
+    let mut scores = Scores::default();
+    let mut explicit_file_write = false;
+    let mut located_file_write = false;
+    let mut explicit_response = false;
+    let mut question_change = false;
+    let mut direct_change = false;
+    for clause in clauses(&folded) {
+        let words = tokens(&clause);
+        // Kanitsiz sonuc iddiasini yasaklamak bir calistirma istegi degildir.
+        // Negasyon komsu cumle/eyleme tasinmaz.
+        if english_negation(&words)
+            || phrase_match(&clause, "iddia etme")
+            || phrase_match(&clause, "do not claim")
+            || words
+                .iter()
+                .any(|word| ["istemiyorum", "istemem", "istemiyoruz"].contains(&word.as_str()))
+        {
+            continue;
+        }
+        explicit_response |= response_only(&clause);
+        let existing_code = filesystem_target(&words, &clause)
+            || words.iter().any(|word| {
+                ["existing", "mevcut", "this", "that", "bu", "su"].contains(&word.as_str())
+            });
+        let read_only = read_only_lead(&words, existing_code);
+        let mut modify = if read_only {
+            0
+        } else {
+            score_group(&words, MODIFY_TR, MODIFY_EN, W_MODIFY, &mut evidence)
+        };
+        let write = !read_only
+            && words
+                .iter()
+                .any(|word| WRITE_TR_EXACT.contains(&word.as_str()));
+        if write {
+            modify += W_MODIFY;
+            evidence.push("yaz".into());
+        }
+        if modify > 0 {
+            let question = words.iter().position(|word| {
+                ["how", "why", "nasil", "neden", "niye", "nicin"].contains(&word.as_str())
+            });
+            let change = words.iter().position(|word| modification_word(word));
+            if question.is_some_and(|question| change.is_some_and(|change| question < change)) {
+                question_change = true;
+            } else {
+                direct_change = true;
+            }
+        }
+        let generation_action = !read_only
+            && (write
+                || (words.iter().any(|word| word == "build")
+                    && (response_only(&clause)
+                        || words.iter().any(|word| {
+                            ["html", "css", "layout", "page", "component"].contains(&word.as_str())
+                        })))
+                || words.iter().any(|word| {
+                    if existing_code && (word == "show" || turkish_stem_match(word, "goster")) {
+                        return false;
+                    }
+                    GENERATE_TR
+                        .iter()
+                        .any(|stem| turkish_stem_match(word, stem))
+                        || english_in(word, GENERATE_EN)
+                        || (word == "ver" && code_target(&words, &clause))
+                }));
+        if generation_action && code_target(&words, &clause) {
+            scores.generate += W_GENERATE;
+            evidence.push("yanitta kod/artifact uretimi".into());
+        }
+        if modify > 0 && filesystem_target(&words, &clause) && !response_only(&clause) {
+            let located = words.iter().any(|word| {
+                ["workspace", "project", "disk"].contains(&word.as_str())
+                    || ["proje", "klasor", "dizin"]
+                        .iter()
+                        .any(|stem| word.starts_with(stem))
+                    || modification_word(word)
+                        && !english_in(word, GENERATE_EN)
+                        && !GENERATE_TR
+                            .iter()
+                            .any(|stem| turkish_stem_match(word, stem))
+                        && !WRITE_TR_EXACT.contains(&word.as_str())
+            }) || clause.contains(['/', '\\'])
+                && [" into ", " to ", " in "]
+                    .iter()
+                    .any(|relation| clause.contains(relation));
+            located_file_write |= located;
+            let code_reference = generation_action
+                && !located
+                && (clause.contains(" for ") || clause.contains(" icin "));
+            explicit_file_write |= !code_reference;
+        }
+        scores.modify += modify;
+        scores.analyze += score_group(&words, ANALYZE_TR, ANALYZE_EN, W_ANALYZE, &mut evidence);
+        scores.explain += score_group(&words, EXPLAIN_TR, EXPLAIN_EN, W_EXPLAIN, &mut evidence);
+        if execution_requested(&words, &clause) {
+            scores.test += W_TEST;
+            evidence.push("acik derleme/test calistirma istegi".into());
+        }
     }
 
     for phrase in EXPLAIN_PHRASES {
@@ -458,15 +1062,30 @@ pub fn classify(request: &str) -> IntentDecision {
         scores.explain += W_QUESTION_MARK;
         evidence.push("soru isareti".into());
     }
+    if scores.generate > 0 && explicit_response && !located_file_write {
+        explicit_file_write = false;
+    }
 
-    if let Some(found) = guard(&folded, &tokens) {
+    let write_guard = guard(&folded, &all_tokens);
+    if let Some(found) = &write_guard {
         // Kullanici acikca degisiklik istemiyor: yazma sinyalleri gecersiz.
         scores.modify = 0;
+        explicit_file_write = false;
         evidence.push(format!("salt-okunur koruma: '{found}'"));
     }
 
     let read_only_top = scores.test.max(scores.analyze).max(scores.explain);
-    let (intent, top, runner_up) = if scores.modify > 0 {
+    let (intent, top, runner_up) = if scores.modify > 0 && question_change && !direct_change
+        || explicit_file_write && scores.explain >= scores.modify
+    {
+        evidence.push("celisen sinyal: dosya degisikligi hakkinda soru".into());
+        (TaskIntent::Unknown, scores.modify, scores.explain)
+    } else if explicit_file_write {
+        (TaskIntent::Modify, scores.modify, scores.explain)
+    } else if scores.generate > 0 {
+        // Uretilen kod icindeki "ekle" gibi fiiller dosya yetkisi vermez.
+        (TaskIntent::Generate, scores.generate, scores.explain)
+    } else if scores.modify > 0 {
         if scores.modify > scores.explain {
             // Inceleme/test fiilleri degisiklik icin hazirlik sayilir; yalnizca
             // soru bicimi (aciklama istegi) yazma niyetiyle celisir.
@@ -499,7 +1118,7 @@ pub fn classify(request: &str) -> IntentDecision {
 
     let confidence = if intent == TaskIntent::Unknown {
         Confidence::Low
-    } else if top >= 3 && top - runner_up >= 2 {
+    } else if top >= 3 && top.saturating_sub(runner_up) >= 2 {
         Confidence::High
     } else {
         Confidence::Medium
@@ -510,6 +1129,7 @@ pub fn classify(request: &str) -> IntentDecision {
         confidence,
         evidence,
         scores,
+        write_forbidden: write_guard.is_some(),
     }
 }
 
@@ -648,7 +1268,12 @@ mod tests {
             TaskIntent::Unknown.write_authority(),
             WriteAuthority::Undecided
         );
-        for intent in [TaskIntent::Analyze, TaskIntent::Explain, TaskIntent::Test] {
+        for intent in [
+            TaskIntent::Analyze,
+            TaskIntent::Explain,
+            TaskIntent::Generate,
+            TaskIntent::Test,
+        ] {
             assert_eq!(intent.write_authority(), WriteAuthority::Denied);
         }
     }
@@ -657,5 +1282,524 @@ mod tests {
     fn turkce_karakterler_katlanmali() {
         assert_eq!(fold("Düzelt  ŞİMDİ, Çabuk"), "duzelt simdi, cabuk");
         assert_eq!(fold("Işık"), "isik");
+    }
+
+    #[test]
+    fn zorunlu_turkce_ingilizce_regresyon_tablosu() {
+        for (request, expected) in [
+            (
+                "Create an HTML landing page and show me the code.",
+                TaskIntent::Generate,
+            ),
+            (
+                "Write a Rust function but do not modify my project.",
+                TaskIntent::Generate,
+            ),
+            (
+                "Generate a responsive CSS layout in one code block.",
+                TaskIntent::Generate,
+            ),
+            (
+                "Create an index.html file inside the workspace.",
+                TaskIntent::Modify,
+            ),
+            ("Update src/main.rs and run cargo test.", TaskIntent::Modify),
+            ("Run cargo test and report the results.", TaskIntent::Test),
+            (
+                "Review this JavaScript and explain the bugs.",
+                TaskIntent::Analyze,
+            ),
+            ("Explain how Rust ownership works.", TaskIntent::Explain),
+            (
+                "Do not run any tests. Only generate HTML.",
+                TaskIntent::Generate,
+            ),
+            (
+                "Bana bir HTML sayfası kodu üret, dosyalara dokunma.",
+                TaskIntent::Generate,
+            ),
+            (
+                "Sadece Rust fonksiyonu yaz, projeyi değiştirme.",
+                TaskIntent::Generate,
+            ),
+            (
+                "src/main.rs dosyasını incele ve hataları raporla.",
+                TaskIntent::Analyze,
+            ),
+            ("cargo test çalıştır ve sonuçları bildir.", TaskIntent::Test),
+            (
+                "src/main.rs dosyasındaki başlığı değiştir.",
+                TaskIntent::Modify,
+            ),
+            (
+                "index.html dosyasını proje klasöründe oluştur.",
+                TaskIntent::Modify,
+            ),
+            ("Kodu yaz ama dosyayı kaydetme.", TaskIntent::Generate),
+            (
+                "Test çalıştırma, yalnızca örnek kod göster.",
+                TaskIntent::Generate,
+            ),
+        ] {
+            assert_eq!(intent_of(request), expected, "{request}");
+        }
+    }
+
+    #[test]
+    fn orijinal_landing_page_istegi_generate_olmali() {
+        let decision = classify(include_str!("../tests/fixtures/landing_page_request.txt"));
+        assert_eq!(decision.intent, TaskIntent::Generate);
+        assert_eq!(decision.scores.test, 0);
+        assert_eq!(decision.scores.modify, 0);
+        assert!(decision.write_forbidden);
+    }
+
+    #[test]
+    fn olumsuz_eylem_olumlu_talimat_olmamali() {
+        for request in [
+            "Do not test.",
+            "Do not modify.",
+            "Do not create any files.",
+            "No tool calls.",
+            "Without changing the project.",
+            "Test ettiğini iddia etme.",
+            "Test edildiğini iddia etme.",
+            "Dosyaları değiştirme.",
+            "Dosya oluşturma.",
+            "Test çalıştırma.",
+            "Araç çağırma.",
+            "Projeye dokunma.",
+            "Herhangi bir dosyaya yazma.",
+            "Never modify src/main.rs.",
+            "Dosyayı silmemeni istiyorum.",
+            "Dosyayı değiştirmemeni istiyorum.",
+            "Dosyayı değiştirmeni istemiyorum.",
+            "Test çalıştırmamanı istiyorum.",
+            "Test çalıştırmanı istemiyorum.",
+        ] {
+            let decision = classify(request);
+            assert_ne!(
+                decision.intent,
+                TaskIntent::Modify,
+                "{request}: {decision:?}"
+            );
+            assert_ne!(decision.intent, TaskIntent::Test, "{request}: {decision:?}");
+            assert_eq!(decision.scores.test, 0, "{request}");
+            assert_eq!(decision.scores.modify, 0, "{request}");
+        }
+        for request in ["Yalnızca kod üret.", "Sadece kodu göster."] {
+            assert_eq!(intent_of(request), TaskIntent::Generate);
+        }
+    }
+
+    #[test]
+    fn olumsuzluk_komsu_olumlu_teste_yayilmamali() {
+        for request in [
+            "Test çalıştırmanı istiyorum.",
+            "Testleri çalıştır.",
+            "Please test the project.",
+            "Do not modify files. Run cargo test.",
+            "Test çalıştırma. Derle.",
+        ] {
+            assert_eq!(intent_of(request), TaskIntent::Test, "{request}");
+        }
+        for request in [
+            "Test çalıştırmak istemiyorum, yalnızca HTML üret.",
+            "Do not test. Generate a SQL query.",
+            "Generate HTML with no external libraries.",
+            "Write an HTML file and show me the code.",
+        ] {
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Generate,
+                "{request}: {decision:?}"
+            );
+            assert_eq!(decision.scores.test, 0);
+        }
+    }
+
+    #[test]
+    fn karisik_istekler_yazma_sinirini_zayiflatmamali() {
+        assert_eq!(
+            intent_of("Explain this code and generate an improved example without changing files."),
+            TaskIntent::Generate
+        );
+        for request in [
+            "Update src/main.rs and run cargo test.",
+            "Generate an HTML example and save it to src/index.html.",
+            "src/main.rs dosyasını güncelle ve testleri çalıştır.",
+        ] {
+            assert_eq!(intent_of(request), TaskIntent::Modify, "{request}");
+        }
+        for request in [
+            "Create a file, but don't write anything to disk.",
+            "Never modify src/main.rs.",
+            "Dosyayı değiştirmemeni istiyorum.",
+        ] {
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Unknown,
+                "{request}: {decision:?}"
+            );
+            assert!(decision.write_forbidden, "{request}");
+        }
+        for request in [
+            "How do I modify src/main.rs?",
+            "How do I modify src/main.rs.",
+            "src/main.rs dosyasını nasıl değiştiririm?",
+            "How do I create an index.html file?",
+            "How do I create an index.html file.",
+            "nasıl düzeltirim",
+        ] {
+            assert_eq!(intent_of(request), TaskIntent::Unknown, "{request}");
+        }
+    }
+
+    #[test]
+    fn mevcut_kodu_gostermek_ve_testlerden_bahsetmek_uretim_veya_calistirma_degildir() {
+        for request in [
+            "Review the test results.",
+            "Show the code in src/main.rs.",
+            "Show me the Rust function in src/main.rs.",
+            "src/main.rs dosyasındaki kodu göster.",
+            "Show me the Rust code already present in src/main.rs.",
+        ] {
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Analyze,
+                "{request}: {decision:?}"
+            );
+            assert_eq!(decision.scores.test, 0);
+        }
+        for request in [
+            "Write a Python script.",
+            "Generate a configuration example.",
+            "Create a JavaScript component in one code block.",
+            "Generate a SQL query.",
+        ] {
+            assert_eq!(intent_of(request), TaskIntent::Generate, "{request}");
+        }
+    }
+
+    #[test]
+    fn eylemi_aciklamak_calistirma_yetkisi_vermemeli() {
+        for (request, expected) in [
+            ("Explain the build configuration.", TaskIntent::Explain),
+            ("Review the build script.", TaskIntent::Analyze),
+            ("Review how we run the tests.", TaskIntent::Analyze),
+            ("Test çalıştırmak ne demek?", TaskIntent::Explain),
+            (
+                "Build a responsive CSS layout in one code block.",
+                TaskIntent::Generate,
+            ),
+            ("Sadece örnek kod yazmanı istiyorum.", TaskIntent::Generate),
+            (
+                "Kod yazmanı istiyorum, dosyaları değiştirmeden.",
+                TaskIntent::Generate,
+            ),
+        ] {
+            let decision = classify(request);
+            assert_eq!(decision.intent, expected, "{request}: {decision:?}");
+            assert_eq!(decision.scores.test, 0, "{request}");
+        }
+        assert!(!classify("Sadece örnek kod yazmanı istiyorum.").write_forbidden);
+        assert_eq!(intent_of("Run cargo check."), TaskIntent::Test);
+        assert_eq!(intent_of("cargo check çalıştır."), TaskIntent::Test);
+    }
+
+    #[test]
+    fn acik_inceleme_talimatindaki_fiiller_yetki_vermemeli() {
+        for (request, expected) in [
+            (
+                "Only show me how to update src/main.rs.",
+                TaskIntent::Analyze,
+            ),
+            (
+                "Review the create function in src/main.rs.",
+                TaskIntent::Analyze,
+            ),
+            (
+                "Explain this Rust code: create a file.",
+                TaskIntent::Explain,
+            ),
+            ("Explain how to modify src/main.rs.", TaskIntent::Explain),
+            (
+                "Explain how to create a Rust function.",
+                TaskIntent::Explain,
+            ),
+            (
+                "Show this code and explain what it does.",
+                TaskIntent::Explain,
+            ),
+        ] {
+            let decision = classify(request);
+            assert_eq!(decision.intent, expected, "{request}: {decision:?}");
+            assert_eq!(decision.intent.write_authority(), WriteAuthority::Denied);
+            assert_eq!(decision.scores.modify, 0);
+            assert_eq!(decision.scores.generate, 0);
+        }
+        assert_eq!(
+            intent_of("Review this code and update src/main.rs."),
+            TaskIntent::Modify
+        );
+        assert_eq!(
+            intent_of("Write a Rust example showing how ownership works."),
+            TaskIntent::Generate
+        );
+    }
+
+    #[test]
+    fn bagli_olumsuz_eylemler_ve_kacinma_talimatlari_yazma_yetkisi_vermemeli() {
+        for request in [
+            "Do not test and modify src/main.rs.",
+            "Do not compile and run tests.",
+            "Avoid changing src/main.rs.",
+        ] {
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Unknown,
+                "{request}: {decision:?}"
+            );
+            assert_eq!(decision.scores.test, 0);
+            assert_eq!(decision.scores.modify, 0);
+        }
+        assert!(classify("Do not test and modify src/main.rs.").write_forbidden);
+        assert!(classify("Avoid changing src/main.rs.").write_forbidden);
+        assert_eq!(
+            intent_of("Do not run tests but update src/main.rs."),
+            TaskIntent::Modify
+        );
+    }
+
+    fn assert_stabilized(request: &str, expected: TaskIntent, authority: WriteAuthority) {
+        let decision = classify(request);
+        let actual_authority = if decision.write_forbidden {
+            WriteAuthority::Denied
+        } else {
+            decision.intent.write_authority()
+        };
+        assert_eq!(decision.intent, expected, "{request}: {decision:?}");
+        assert_eq!(actual_authority, authority, "{request}: {decision:?}");
+    }
+
+    #[test]
+    fn stabilizasyon_fonksiyon_adlari_yazma_emri_degil() {
+        assert_stabilized(
+            "Review the create and update functions in src/main.rs.",
+            TaskIntent::Analyze,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "src/main.rs içindeki update fonksiyonunu açıkla.",
+            TaskIntent::Explain,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "Review the create, update, and delete functions in src/main.rs.",
+            TaskIntent::Analyze,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "src/main.rs dosyasındaki delete ve update fonksiyonlarını incele.",
+            TaskIntent::Analyze,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "src/main.rs içindeki degistir fonksiyonunu açıkla.",
+            TaskIntent::Explain,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "src/main.rs içindeki fonksiyonu değiştir.",
+            TaskIntent::Modify,
+            WriteAuthority::Granted,
+        );
+    }
+
+    #[test]
+    fn stabilizasyon_negasyon_eylem_eslesmesi_ortak_olmali() {
+        let failures: Vec<_> = [
+            "Do not make changes to src/main.rs.",
+            "You mustn't modify src/main.rs.",
+            "You mustn’t modify src/main.rs.",
+            "You shouldn't change src/main.rs.",
+            "You shouldn’t change src/main.rs.",
+            "You can't modify src/main.rs.",
+            "You couldn’t modify src/main.rs.",
+            "You won't change src/main.rs.",
+        ]
+        .into_iter()
+        .filter_map(|request| {
+            let decision = classify(request);
+            (decision.intent == TaskIntent::Modify || !decision.write_forbidden)
+                .then_some((request, decision))
+        })
+        .collect();
+        assert!(failures.is_empty(), "{failures:#?}");
+        assert_stabilized(
+            "Can you modify src/main.rs?",
+            TaskIntent::Modify,
+            WriteAuthority::Granted,
+        );
+    }
+
+    #[test]
+    fn stabilizasyon_tam_istekte_kod_yaniti_dosya_yazimi_degil() {
+        assert_stabilized(
+            "Write a Rust function for src/main.rs. Return it in one code block. Do not call any tools.",
+            TaskIntent::Generate,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "Write a Rust function for src/main.rs.",
+            TaskIntent::Generate,
+            WriteAuthority::Denied,
+        );
+        assert_stabilized(
+            "Update src/main.rs and write a Rust example for src/lib.rs in one code block.",
+            TaskIntent::Modify,
+            WriteAuthority::Granted,
+        );
+    }
+
+    #[test]
+    fn stabilizasyon_reclaim_gecerli_kod_uretimidir() {
+        assert_stabilized(
+            "Generate a Rust function named reclaim.",
+            TaskIntent::Generate,
+            WriteAuthority::Denied,
+        );
+    }
+
+    #[test]
+    fn stabilizasyon_guncelleme_isim_tamlamasi_olumlu_olabilir() {
+        assert_stabilized(
+            "Güncelleme yap: src/main.rs başlığını değiştir.",
+            TaskIntent::Modify,
+            WriteAuthority::Granted,
+        );
+    }
+
+    #[test]
+    fn stabilizasyon_test_amaci_analiz_sozcuguyle_bastirilmamali() {
+        assert_stabilized(
+            "Run cargo test to find failures.",
+            TaskIntent::Test,
+            WriteAuthority::Denied,
+        );
+    }
+
+    #[test]
+    fn test_execution_plan_acik_desteklenen_komutlari_secmeli() {
+        use crate::repair_controller::VerifyMode::{Check, Test};
+        for (request, expected) in [
+            ("Run cargo test to find failures.", vec![Test]),
+            ("cargo test çalıştır ve sonuçları bildir.", vec![Test]),
+            ("Run cargo check.", vec![Check]),
+            ("Derle.", vec![Check]),
+            ("Build the project.", vec![Check]),
+            ("Testleri çalıştır.", vec![Test]),
+            ("Run the tests.", vec![Test]),
+            ("Run cargo check and cargo test.", vec![Check, Test]),
+            (
+                "Run cargo check and run cargo test to find failures.",
+                vec![Check, Test],
+            ),
+            ("Run cargo test and run cargo test.", vec![Test]),
+        ] {
+            assert_eq!(test_execution_plan(request), expected, "{request}");
+        }
+    }
+
+    #[test]
+    fn test_execution_plan_olumsuzlugu_ve_diger_niyetleri_korumali() {
+        use crate::repair_controller::VerifyMode::{Check, Test};
+        for request in [
+            "Do not run cargo test.",
+            "Test çalıştırma.",
+            "Test çalıştırmanı istemiyorum.",
+            "Run cargo test. Do not run tests.",
+            "Run cargo test. Test çalıştırma.",
+            "Run cargo test. Test çalıştırmanı istemiyorum.",
+            "Explain how to run cargo test.",
+            "Generate HTML and do not run tests.",
+            "Update src/main.rs and run cargo test.",
+            "src/main.rs dosyasını incele.",
+            "Run cargo test. Do not call any tools.",
+            "Run cargo test, but do not execute commands.",
+            "cargo test çalıştır ama araç çağırma.",
+            "cargo test çalıştır ama komut çalıştırma.",
+        ] {
+            assert!(test_execution_plan(request).is_empty(), "{request}");
+        }
+        assert_eq!(
+            test_execution_plan("Do not run cargo test. Run cargo check."),
+            vec![Check]
+        );
+        assert_eq!(test_execution_plan("Test çalıştırma. Derle."), vec![Check]);
+        assert_eq!(
+            test_execution_plan("Do not modify files. Run cargo test."),
+            vec![Test]
+        );
+        assert_eq!(
+            test_execution_plan("Run cargo check. Do not run tests."),
+            vec![Check]
+        );
+        assert_eq!(
+            test_execution_plan("Run cargo test. Test edildiğini iddia etme."),
+            vec![Test]
+        );
+        assert_eq!(
+            test_execution_plan("Run cargo test. Do not claim that tests passed."),
+            vec![Test]
+        );
+        assert_eq!(
+            test_execution_plan("Run cargo test. Do not claim to execute commands."),
+            vec![Test]
+        );
+    }
+
+    #[test]
+    fn test_execution_plan_desteklenmeyen_sozdizimini_kesmemeli() {
+        for request in [
+            "Run cargo clippy.",
+            "Run cargo build.",
+            "Run cargo test --release.",
+            "Run cargo test --test smoke.",
+            "Run cargo test smoke.",
+            "Run cargo check then explain cargo test.",
+            "Run cargo test && cargo check.",
+            "Run cargo test | more.",
+            "Run cargo test > result.txt.",
+            "Run `cargo test`.",
+            "Run \"cargo test\".",
+            "Run cargo test in ../other.",
+        ] {
+            assert!(test_execution_plan(request).is_empty(), "{request}");
+        }
+    }
+
+    #[test]
+    fn test_execution_plan_genel_komut_yasagini_korumali() {
+        let failures: Vec<_> = [
+            "Run cargo test. Never execute any commands.",
+            "Run cargo test. You must not use any tools.",
+            "Run cargo test. No tool calls.",
+            "Run cargo test without tools.",
+            "Run cargo test. Araç çağırma.",
+            "Run cargo test. Komutları çalıştırma.",
+            "Run cargo test. Araç kullanmanı istemiyorum.",
+        ]
+        .into_iter()
+        .filter_map(|request| {
+            let plan = test_execution_plan(request);
+            (!plan.is_empty()).then_some((request, plan))
+        })
+        .collect();
+        assert!(failures.is_empty(), "{failures:?}");
     }
 }

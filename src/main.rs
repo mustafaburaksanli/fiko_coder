@@ -1,4 +1,4 @@
-//! FIKO CODER v0.9 - INTELLIGENT TOOL ORCHESTRATOR
+//! FIKO CODER v0.9.1 - INTELLIGENT INTENT ENGINE
 //!
 //! Moduller:
 //! - tools: dosya araclari, cargo, patch hazirlama, yedekleme / geri alma
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut messages: Vec<Value> = vec![system.clone()];
 
     println!("=================================");
-    println!("  FIKO CODER v0.9 - INTELLIGENT TOOL ORCHESTRATOR");
+    println!("  FIKO CODER v0.9.1 - INTELLIGENT INTENT ENGINE");
     println!("=================================");
     println!("Model: {model}");
     println!("Proje: {}", root.display());
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Araclar: read_file, list_files, read_lines, search_code, run_tests, verify_candidate, apply_patch"
     );
     println!(
-        "Niyet: gorev turu (Analyze/Explain/Modify/Test) Rust tarafinda belirlenir; yalnizca Modify gorevlerinde dosya degisir, belirsizse sorulur."
+        "Niyet: gorev turu (Generate/Analyze/Explain/Modify/Test) Rust tarafinda belirlenir; Generate yalnizca yanitta kod uretir, arac calistirmaz. Yalnizca Modify dosya degisikligine yetki verir; belirsizse sorulur."
     );
     println!(
         "Akis: verify_candidate (gecici kopya) -> kullanici onayi -> apply_patch -> cargo check + cargo test"
