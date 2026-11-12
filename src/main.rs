@@ -1,4 +1,4 @@
-//! FIKO CODER v0.9.1 - INTELLIGENT INTENT ENGINE
+//! FIKO CODER v1.0 - MULTI-FILE WORKSPACE ENGINE
 //!
 //! Moduller:
 //! - tools: dosya araclari, cargo, patch hazirlama, yedekleme / geri alma
@@ -28,12 +28,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut messages: Vec<Value> = vec![system.clone()];
 
     println!("=================================");
-    println!("  FIKO CODER v0.9.1 - INTELLIGENT INTENT ENGINE");
+    println!("  FIKO CODER v1.0 - MULTI-FILE WORKSPACE ENGINE");
     println!("=================================");
     println!("Model: {model}");
     println!("Proje: {}", root.display());
     println!(
-        "Araclar: read_file, list_files, read_lines, search_code, run_tests, verify_candidate, apply_patch"
+        "Araclar: read_file, list_files, read_lines, search_code, search_in_file, run_tests, verify_candidate, apply_patch, verify_workspace, apply_workspace"
     );
     println!(
         "Niyet: gorev turu (Generate/Analyze/Explain/Modify/Test) Rust tarafinda belirlenir; Generate yalnizca yanitta kod uretir, arac calistirmaz. Yalnizca Modify dosya degisikligine yetki verir; belirsizse sorulur."
@@ -65,6 +65,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // Rollback modelin araci degil: sadece kullanicinin acik komutuyla.
         if matches!(input.to_lowercase().as_str(), "geri al" | "rollback") {
+            if let Some(record) = session.last_workspace.as_ref() {
+                if prompter.ask_yes("Son workspace planinin tum dosyalari geri alinsin mi?")? {
+                    match fiko_coder::workspace_patch::rollback(&session.root, record) {
+                        Ok(()) => {
+                            session.last_workspace = None;
+                            println!("[ROLLBACK] Workspace planinin tum hedefleri geri alindi.");
+                        }
+                        Err(error) => println!(
+                            "[ROLLBACK ERROR] Workspace tam geri alinamadi; proje durumu belirsiz: {error}"
+                        ),
+                    }
+                }
+                messages.truncate(1);
+                continue;
+            }
             match session.last_patch.as_ref() {
                 None => println!("[ROLLBACK] Bu oturumda geri alinacak basarili patch yok."),
                 Some(record) => {

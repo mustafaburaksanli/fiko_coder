@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::execution::TaskPhase;
 use crate::intent::{TaskIntent, test_execution_plan};
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{Orchestrator, WRITE_PATH_TOOLS};
 use crate::repair_controller::{
     ApplyRejection, MAX_PATCH_ATTEMPTS, RepairController, VerifiedCandidate, VerifyMode,
 };
@@ -20,6 +20,10 @@ use crate::tools::{self, PatchPlan, PatchRecord, tool_definitions};
 use crate::verification::{self, VerificationReport};
 
 pub const MAX_AGENT_ROUNDS: usize = 12;
+const MODIFY_NUM_PREDICT: usize = 4096;
+const MAX_MODIFY_PROSE_CHARS: usize = 2000;
+const MAX_MODIFY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MODIFY_PLAN_RETRY: &str = "[RUST PLANLAMA YENIDEN DENEMESI] Degisiklik adayi henuz olusmadi. Uzun aciklama veya metinsel diff yerine yapilandirilmis arac cagrisi yap: cok dosya/yeni dosyada ilk istegin tum acik hedeflerini tek changes dizisiyle verify_workspace'a, mevcut tek dosyada verify_candidate'a ilet. old_text okunan kaynakla LF/CRLF ve son satir sonu dahil eslesmeli; JSON stringini normal kurallarla kodla. Serbest metin uygulanmaz. Bu tek arac odakli yeniden denemedir; kullanici onayi degildir.";
 pub const OLLAMA_CHAT_URL: &str = "http://localhost:11434/api/chat";
 
 const CHECK_CONSENT: &str = "verify_candidate gecici bir kopyada 'cargo check' calistiracak. Build script ve proc-macro'lar kod calistirabilir; bu gercek bir sandbox DEGILDIR. Reddederseniz bu oturumda hicbir patch gercek projeye uygulanamaz (Verified Patch Lock). Bu projeye guveniyor ve bu oturum icin otomatik dogrulamaya izin veriyor musunuz?";
@@ -90,6 +94,7 @@ impl VerifyConsent {
 pub struct Session {
     pub root: PathBuf,
     pub last_patch: Option<PatchRecord>,
+    pub last_workspace: Option<crate::workspace_patch::WorkspaceRecord>,
     pub consent: VerifyConsent,
 }
 
@@ -98,6 +103,7 @@ impl Session {
         Self {
             root,
             last_patch: None,
+            last_workspace: None,
             consent: VerifyConsent::default(),
         }
     }
@@ -120,6 +126,8 @@ pub struct ToolOutcome {
     pub(crate) patch_effect: PatchEffect,
     /// Yalniz gercek run_tests surecinden gelen, Rust tarafinda tutulan sonuc.
     pub(crate) test_result: Option<tools::TestResult>,
+    /// Gercek workspace handler'inin Rust tarafinda uretilmis kanit raporu.
+    pub(crate) workspace_report: Option<String>,
 }
 
 impl ToolOutcome {
@@ -129,6 +137,7 @@ impl ToolOutcome {
             stop: None,
             patch_effect: PatchEffect::None,
             test_result: None,
+            workspace_report: None,
         }
     }
 
@@ -138,10 +147,11 @@ impl ToolOutcome {
             stop: Some(reason.into()),
             patch_effect: PatchEffect::None,
             test_result: None,
+            workspace_report: None,
         }
     }
 
-    fn with_patch_effect(mut self, effect: PatchEffect) -> Self {
+    pub(crate) fn with_patch_effect(mut self, effect: PatchEffect) -> Self {
         self.patch_effect = effect;
         self
     }
@@ -151,17 +161,18 @@ impl ToolOutcome {
 // SISTEM ISTEMI
 // ============================================================
 pub fn system_prompt() -> &'static str {
-    "Sen FIKO CODER v0.9.1 adli yerel Rust kodlama ajanisin. Turkce yanit ver.\n\
+    "Sen FIKO CODER v1.0 adli yerel Rust kodlama ajanisin. Turkce yanit ver.\n\
 \n\
 GOREV TURU: Her gorevin turunu Rust tarafi belirler ve kullanici mesajina [FIKO NOT] olarak ekler. Analyze/Explain/Test gorevlerinde dosya degistirilmez; verify_candidate ve apply_patch INTENT_BLOCKED ile reddedilir. Bu gorevlerde kodu oku ve bulgulari raporla.\n\
+COK DOSYALI GOREV: Yalniz acik Modify niyetinde verify_workspace ile changes dizisini gecici kopyada dogrula; ayni changes ile apply_workspace kullan. operation=edit icin path/old_text/new_text, operation=create icin path/content ver. Tum dosyalar tek diff ve kullanici onayi altindadir. Silme, tasima ve yeni dizin olusturma desteklenmez; Cargo disindaki projeler su an dogrulanip uygulanamaz. Buyuk dosyalari read_lines ile sinirli araliklarda oku; belirli dosyada search_in_file kullan.\n\
 Generate gorevinde istenen kodu dogrudan yanitta uret; hicbir arac cagirma. Dosya olusturma/degistirme, derleme, test, dogrulama ve patch onayi yapilmaz. Yanitta kod uretmek dosyanin kaydedildigi ya da kodun test edildigi anlamina gelmez; bunlari iddia etme.\n\
 \n\
 CALISMA SIRASI (kod degisikligi istenen gorevde):\n\
 1) search_code ve read_lines ile ilgili kodu bul; gerekirse read_file. Ayni dosyayi tekrar tekrar okuma.\n\
 2) Duzeltmeyi hazirla. old_text TAM satir(lar) olmali; girinti haric hic karakter atlama, satir sonu noktalamayi koru.\n\
-3) verify_candidate ile adayi gecici kopyada derle. Bu adim ana projeyi degistirmez.\n\
-4) VERIFY_OK gelirse BIREBIR AYNI path/old_text/new_text ile apply_patch cagir. Kullanici onayi, yedekleme ve gercek projede cargo check + cargo test Rust tarafinda yapilir.\n\
-5) VERIFY_FAILED gelirse derleyici hatasini oku ve FARKLI bir new_text ile verify_candidate'i tekrar cagir. Ayni basarisiz patch yasaktir. En fazla 3 dogrulama denemesi vardir; sayac ve durdurma karari Rust tarafindaki Repair Controller'a aittir.\n\
+3) Tek dosyada verify_candidate, cok dosya/yeni dosyada verify_workspace ile adayi gecici kopyada derle. Bu adim ana projeyi degistirmez.\n\
+4) VERIFY_OK gelirse tek dosyada BIREBIR AYNI path/old_text/new_text ile apply_patch; cok dosyada AYNI changes ile apply_workspace kullan. Kullanici onayi, yedekleme ve gercek projede cargo check + cargo test Rust tarafinda yapilir.\n\
+5) VERIFY_FAILED gelirse gercek derleyici hatasina gore FARKLI aday oner; tum hedefleri koruyarak ilgili verify aracini kullan. Ayni basarisiz patch yasaktir. En fazla 3 dogrulama denemesi vardir; sayac ve durdurma karari Rust tarafindaki Repair Controller'a aittir.\n\
 \n\
 KILIT (Rust tarafinda uygulanir): apply_patch yalnizca dogrulanmis ve birebir ayni adayi kabul eder. Degistirilmis, dogrulanmamis veya eskimis aday otomatik olarak yeniden dogrulanir; izin yoksa APPLY_BLOCKED ile reddedilir ve ana proje degismez.\n\
 \n\
@@ -302,6 +313,7 @@ async fn verify_candidate_flow<P: Prompter>(
             stop,
             patch_effect: PatchEffect::None,
             test_result: None,
+            workspace_report: None,
         });
     }
     let plan = match tools::prepare_patch(&session.root, path, old_text, new_text) {
@@ -524,6 +536,7 @@ async fn apply_patch_flow<P: Prompter>(
     if passed {
         println!("[VERIFY] cargo check + cargo test BASARILI.");
         session.last_patch = Some(record);
+        session.last_workspace = None;
         repair.enter(TaskPhase::Completed);
         return Ok(ToolOutcome::stop(
             format!("PATCH_VERIFIED: Degisiklik uygulandi ve testlerden gecti.\n{report}"),
@@ -558,6 +571,7 @@ async fn apply_patch_flow<P: Prompter>(
                 stop,
                 patch_effect: PatchEffect::Restored,
                 test_result: None,
+                workspace_report: None,
             })
         }
         Err(e) => {
@@ -616,6 +630,22 @@ pub async fn handle_tool_call<P: Prompter>(
                 tools::search_code(&session.root, query).unwrap_or_else(|e| format!("ERROR: {e}")),
             )
         }
+        "search_in_file" => {
+            let query = args["query"].as_str().unwrap_or("");
+            ToolOutcome::output(
+                tools::search_in_file(&session.root, path, query)
+                    .unwrap_or_else(|error| format!("ERROR: {error}")),
+            )
+        }
+        "verify_workspace" | "apply_workspace" => {
+            let mut outcome = if name == "verify_workspace" {
+                crate::workspace_agent::verify(session, repair, prompter, args).await?
+            } else {
+                crate::workspace_agent::apply(session, repair, prompter, args).await?
+            };
+            outcome.workspace_report = Some(outcome.output.clone());
+            outcome
+        }
         "run_tests" => {
             println!("[TOOL] run_tests: {mode}");
             if mode != "check" && mode != "test" {
@@ -670,6 +700,9 @@ async fn execute_task_tool<P: Prompter>(
 ) -> io::Result<ToolOutcome> {
     let outcome = task.execute(session, prompter, name, args).await?;
     log_outcome(name, &outcome.output);
+    if let Some(report) = &outcome.workspace_report {
+        println!("[RUST WORKSPACE KAYDI]\n{report}");
+    }
     // Sonraki model/HTTP adimi kesilse bile gozlenen surec kaniti gosterilir.
     if let Some(result) = &outcome.test_result {
         if result.success {
@@ -694,6 +727,32 @@ pub fn task_status_line(applied: bool) -> &'static str {
 // ============================================================
 // AJAN DONGUSU
 // ============================================================
+fn bounded_modify_prose(content: &str) -> String {
+    if let Some((end, _)) = content.char_indices().nth(MAX_MODIFY_PROSE_CHARS) {
+        format!(
+            "{}\n[MODEL ACIKLAMASI KISALTILDI; {MAX_MODIFY_PROSE_CHARS} karakter siniri]",
+            &content[..end]
+        )
+    } else {
+        content.to_owned()
+    }
+}
+
+/// Backend token secenegini yok saysa da Modify HTTP yaniti sinirsiz alinmaz.
+/// Kaynak/arguman kirpilmaz; limit asimi tum yaniti hata ile reddeder.
+async fn read_modify_response(
+    mut response: reqwest::Response,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_MODIFY_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Modify model yaniti 2 MiB sinirini asti; hicbir arac argumani kirpilarak uygulanmadi.").into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 /// Tek bir kullanici gorevini sonuna kadar yurutur. Dongu kontrolu Rust tarafindadir:
 /// niyet, asama ve arac defteri Orchestrator'da, kilit ve deneme sayaclari
 /// Repair Controller'da tutulur.
@@ -726,6 +785,8 @@ async fn run_task_at<P: Prompter>(
         .to_string();
     let mut task = Orchestrator::for_request(&request);
     let mut test_dispatch_attempted = false;
+    let mut modify_plan_retry_used = false;
+    let mut modify_write_attempted = false;
     println!("{}", task.intent_line());
     // Gorev turu ve kisa yol gosterici, modele kullanici mesajinin parcasi olarak verilir.
     if let Some(last) = messages.last_mut()
@@ -746,16 +807,22 @@ async fn run_task_at<P: Prompter>(
         if task.intent() != TaskIntent::Generate {
             payload["tools"] = tool_definitions();
         }
-        let response: Value = client
+        if task.intent() == TaskIntent::Modify {
+            payload["options"] = json!({"num_predict": MODIFY_NUM_PREDICT});
+        }
+        let response = client
             .post(chat_url)
             .json(&payload)
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let response: Value = if task.intent() == TaskIntent::Modify {
+            read_modify_response(response).await?
+        } else {
+            response.json().await?
+        };
 
-        let assistant = response
+        let mut assistant = response
             .get("message")
             .filter(|message| {
                 message["role"] == "assistant"
@@ -773,6 +840,11 @@ async fn run_task_at<P: Prompter>(
                 )
             })?
             .clone();
+        if task.intent() == TaskIntent::Modify
+            && let Some(content) = assistant["content"].as_str()
+        {
+            assistant["content"] = json!(bounded_modify_prose(content));
+        }
         let calls = assistant["tool_calls"]
             .as_array()
             .cloned()
@@ -782,6 +854,38 @@ async fn run_task_at<P: Prompter>(
         if calls.is_empty() {
             let answer = assistant["content"].as_str().unwrap_or("(Bos yanit)");
             let mut host_test_attempted = false;
+            let mut host_workspace_attempted = false;
+            if task.intent() == TaskIntent::Modify
+                && !task.phase().is_terminal()
+                && let Some(args) = task.repair.pending_workspace_args()
+            {
+                println!(
+                    "[WORKSPACE ONAYI] Model arac cagirmadi; Rust'in dogruladigi ayni plan gercek uygulama onayina iletiliyor. Modelin metinsel onay istegi izin degildir."
+                );
+                host_workspace_attempted = true;
+                let outcome =
+                    execute_task_tool(&mut task, session, prompter, "apply_workspace", &args)
+                        .await?;
+                if let Some(reason) = &outcome.stop {
+                    println!("[REPAIR CONTROLLER] {reason}\n");
+                }
+            }
+            if task.intent() == TaskIntent::Modify
+                && !host_workspace_attempted
+                && !task.applied()
+                && !task.phase().is_terminal()
+                && !modify_write_attempted
+                && task.stats().invalid_args == 0
+                && !modify_plan_retry_used
+                && step + 1 < MAX_AGENT_ROUNDS
+            {
+                modify_plan_retry_used = true;
+                println!(
+                    "[PLANLAMA] Model aday aracini cagirmadi; bir kez kisa arac odakli yeniden deneme isteniyor."
+                );
+                messages.push(json!({"role": "user", "content": MODIFY_PLAN_RETRY}));
+                continue;
+            }
             if task.intent() == TaskIntent::Test
                 && !test_dispatch_attempted
                 && !task.phase().is_terminal()
@@ -822,12 +926,22 @@ async fn run_task_at<P: Prompter>(
             }
             // Modelin metni durumu degistirmez; yalnizca gorevi kapatir.
             task.finish_answer(answer);
-            let visible = task.render_answer(answer);
+            let visible = if host_workspace_attempted {
+                format!(
+                    "[MODEL ONAY KORUMASI] Modelin metinsel diff/onay istegi yerine Rust'in dogrulanmis plan ve gercek onay kaydi esas alindi.\n{}",
+                    task.render_answer("")
+                )
+            } else {
+                task.render_answer(answer)
+            };
             println!("\nFIKO > {visible}\n");
             if host_test_attempted {
                 // Modelin tool_calls mesaji olmadigi icin sahte bir tool mesaji
                 // eklemeyiz. Gercek Rust sonucunu sonraki gorevler icin koruruz.
                 messages.push(json!({"role": "assistant", "content": format!("[RUST TEST YURUTME KAYDI]\n{visible}")}));
+            }
+            if host_workspace_attempted {
+                messages.push(json!({"role": "assistant", "content": format!("[RUST WORKSPACE YURUTME KAYDI]\n{visible}")}));
             }
             break;
         }
@@ -836,6 +950,7 @@ async fn run_task_at<P: Prompter>(
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args = tool_arguments(&call);
             test_dispatch_attempted |= name == "run_tests";
+            modify_write_attempted |= WRITE_PATH_TOOLS.contains(&name);
             let outcome = execute_task_tool(&mut task, session, prompter, name, &args).await?;
             messages.push(json!({
                 "role": "tool",
@@ -2507,4 +2622,70 @@ fn fail_after_removing_own_backup() {
         );
         assert_eq!(source, MINI_MAIN);
     }
+
+    #[tokio::test]
+    async fn workspace_model_araclari_gercek_onay_ve_kilit_yolundan_gecmeli() {
+        let root = mini_crate("workspace_http");
+        let changes = json!([
+            {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": MINI_GOOD},
+            {"operation": "create", "path": "src/helper.rs", "content": "pub fn helper() {}\n"}
+        ]);
+        let (url, server) = mock_ollama(vec![
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "verify_workspace", "arguments": {"changes": changes, "mode": "check"}
+            }}]}}),
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "apply_workspace", "arguments": {"changes": changes}
+            }}]}}),
+        ])
+        .await;
+        let mut session = Session::new(root.clone());
+        let mut prompter = ScriptedPrompter::with(&[true, true]);
+        let mut messages =
+            conversation("Update src/main.rs and create src/helper.rs in the project.");
+        let task = run_task_at(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            "kontrollu-model",
+            &mut session,
+            &mut messages,
+            &mut prompter,
+            &url,
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        let source = fs::read_to_string(root.join("src/main.rs")).unwrap();
+        let helper = fs::read_to_string(root.join("src/helper.rs")).unwrap();
+        remove(&root);
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request["tools"], tool_definitions());
+            assert!(
+                request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "apply_workspace")
+            );
+        }
+        assert_eq!(prompter.asked.len(), 2);
+        assert!(prompter.asked[0].contains("cargo check"));
+        assert!(prompter.asked[1].contains("Tum workspace"));
+        assert_eq!(task.intent(), TaskIntent::Modify);
+        assert_eq!(task.phase(), TaskPhase::Completed);
+        assert!(task.applied());
+        assert_eq!(task.repair.verify_attempts(), 1);
+        assert_eq!(task.repair.approved_attempts(), 1);
+        assert_eq!(task.stats().dispatched, 2);
+        assert!(source.contains(MINI_GOOD));
+        assert_eq!(helper, "pub fn helper() {}\n");
+        let report = task.render_answer("Bir testin hata verdigini dusunuyorum.");
+        assert!(report.contains("MODEL ACIKLAMASI - DOGRULANMAMIS"));
+        assert!(report.contains("kaynak: gecici kopya"));
+        assert!(report.contains("Cikis kodu: 0"));
+        assert!(report.contains("PATCH_VERIFIED"));
+    }
+
+    include!("workspace_approval_tests.rs");
+    include!("workspace_planning_tests.rs");
 }

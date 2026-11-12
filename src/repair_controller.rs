@@ -10,6 +10,15 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::execution::{ExecutionState, TaskPhase};
+use crate::workspace_patch::WorkspacePlan;
+use serde_json::Value;
+
+/// Yalniz gercek dogrulama basarisi uretir. changes, buyuk dosyalarda bile
+/// dogrulanan tam planin ayni sinirli edit/create girdisiyle yeniden kurulmasini saglar.
+pub(crate) struct PendingWorkspace {
+    pub plan: WorkspacePlan,
+    pub changes: Value,
+}
 
 /// Hem onayli patch sayisi hem de gecici kopyadaki dogrulama denemeleri icin ust sinir.
 pub const MAX_PATCH_ATTEMPTS: usize = 3;
@@ -169,6 +178,9 @@ pub struct RepairController {
     verify_attempts: usize,
     proposals: HashMap<Proposal, CandidateStatus>,
     verified: HashMap<Proposal, VerifiedCandidate>,
+    workspace_proposals: HashMap<WorkspacePlan, CandidateStatus>,
+    verified_workspaces: HashMap<WorkspacePlan, (u64, VerifyMode)>,
+    pending_workspace: Option<PendingWorkspace>,
     /// Gorev icinde ulasilan en guclu dogrulama turu; apply icin alt sinir olur.
     required_mode: VerifyMode,
     /// v0.9: gorevin yurutme asamasi. Yalnizca gercek arac sonuclariyla ilerler.
@@ -182,6 +194,9 @@ impl Default for RepairController {
             verify_attempts: 0,
             proposals: HashMap::new(),
             verified: HashMap::new(),
+            workspace_proposals: HashMap::new(),
+            verified_workspaces: HashMap::new(),
+            pending_workspace: None,
             required_mode: VerifyMode::Check,
             state: ExecutionState::new(),
         }
@@ -189,6 +204,119 @@ impl Default for RepairController {
 }
 
 impl RepairController {
+    pub(crate) fn pending_workspace_args(&self) -> Option<Value> {
+        self.pending_workspace
+            .as_ref()
+            .map(|pending| serde_json::json!({"changes": pending.changes}))
+    }
+
+    pub(crate) fn clear_pending_workspace(&mut self) {
+        self.pending_workspace = None;
+    }
+
+    pub(crate) fn take_pending_workspace(&mut self) -> Option<PendingWorkspace> {
+        self.pending_workspace.take()
+    }
+
+    pub(crate) fn record_pending_workspace(&mut self, plan: &WorkspacePlan, changes: &Value) {
+        self.pending_workspace = Some(PendingWorkspace {
+            plan: plan.clone(),
+            changes: changes.clone(),
+        });
+    }
+
+    /// Cok dosyali kimlik tum hedefleri, eski durumlari ve yeni icerikleri kapsar.
+    /// Tek dosyali akisin deneme butcesi ve asama makinesi paylasilir.
+    pub fn register_workspace_candidate(
+        &mut self,
+        plan: &WorkspacePlan,
+        mode: VerifyMode,
+    ) -> Result<(), String> {
+        if self.exhausted() || self.approved_attempts >= MAX_PATCH_ATTEMPTS {
+            return Err(ApplyRejection::AttemptLimit.to_string());
+        }
+        match self.workspace_proposals.get(plan) {
+            Some(CandidateStatus::Failed | CandidateStatus::Pending) => {
+                return Err(
+                    "Ayni basarisiz veya tamamlanmamis workspace adayi tekrar denenemez.".into(),
+                );
+            }
+            Some(CandidateStatus::Verified)
+                if self
+                    .verified_workspaces
+                    .get(plan)
+                    .is_some_and(|(_, have)| *have >= mode) =>
+            {
+                return Err(
+                    "Workspace adayi zaten dogrulandi; ayni changes ile apply_workspace kullan."
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        self.workspace_proposals
+            .insert(plan.clone(), CandidateStatus::Pending);
+        Ok(())
+    }
+
+    pub fn record_workspace_success(
+        &mut self,
+        plan: &WorkspacePlan,
+        fingerprint: u64,
+        mode: VerifyMode,
+    ) {
+        self.verify_attempts += 1;
+        self.required_mode = self.required_mode.max(mode);
+        self.workspace_proposals
+            .insert(plan.clone(), CandidateStatus::Verified);
+        self.verified_workspaces
+            .insert(plan.clone(), (fingerprint, mode));
+    }
+
+    pub fn record_workspace_failure(&mut self, plan: &WorkspacePlan) {
+        self.verify_attempts += 1;
+        self.mark_workspace_failed(plan);
+    }
+
+    pub fn mark_workspace_failed(&mut self, plan: &WorkspacePlan) {
+        self.verified_workspaces.remove(plan);
+        self.workspace_proposals
+            .insert(plan.clone(), CandidateStatus::Failed);
+    }
+
+    pub fn authorize_workspace(
+        &mut self,
+        plan: &WorkspacePlan,
+        fingerprint: u64,
+    ) -> Result<(), ApplyRejection> {
+        if self.approved_attempts >= MAX_PATCH_ATTEMPTS {
+            return Err(ApplyRejection::AttemptLimit);
+        }
+        match self.workspace_proposals.get(plan) {
+            Some(status @ (CandidateStatus::Failed | CandidateStatus::Pending)) => {
+                return Err(ApplyRejection::AlreadyTried(*status));
+            }
+            Some(CandidateStatus::Stale) => return Err(ApplyRejection::StaleProject),
+            _ => {}
+        }
+        let Some(&(verified_fingerprint, mode)) = self.verified_workspaces.get(plan) else {
+            return Err(ApplyRejection::NotVerified);
+        };
+        if mode < self.required_mode {
+            return Err(ApplyRejection::InsufficientMode {
+                have: mode,
+                need: self.required_mode,
+            });
+        }
+        if verified_fingerprint != fingerprint {
+            self.verified_workspaces.remove(plan);
+            self.workspace_proposals
+                .insert(plan.clone(), CandidateStatus::Stale);
+            return Err(ApplyRejection::StaleProject);
+        }
+        Ok(())
+    }
+
     /// Gorevin su anki asamasi.
     pub fn phase(&self) -> TaskPhase {
         self.state.phase()
@@ -408,6 +536,95 @@ impl RepairController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workspace_plan() -> WorkspacePlan {
+        WorkspacePlan {
+            files: ["src/a.rs", "src/b.rs"]
+                .iter()
+                .map(|path| crate::workspace_patch::PlannedFile {
+                    relative: (*path).into(),
+                    path: (*path).into(),
+                    original: Some("eski".into()),
+                    updated: "yeni".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn workspace_kilidi_tum_hedefleri_ve_icerikleri_baglamali() {
+        let mut controller = RepairController::default();
+        let plan = workspace_plan();
+        assert_eq!(
+            controller.authorize_workspace(&plan, 33),
+            Err(ApplyRejection::NotVerified)
+        );
+        controller
+            .register_workspace_candidate(&plan, VerifyMode::Check)
+            .unwrap();
+        controller.record_workspace_success(&plan, 33, VerifyMode::Check);
+        assert_eq!(controller.authorize_workspace(&plan, 33), Ok(()));
+        let mut changed = plan.clone();
+        changed.files[1].updated = "baska".into();
+        assert_eq!(
+            controller.authorize_workspace(&changed, 33),
+            Err(ApplyRejection::NotVerified)
+        );
+        changed = plan.clone();
+        changed.files.remove(1);
+        assert_eq!(
+            controller.authorize_workspace(&changed, 33),
+            Err(ApplyRejection::NotVerified)
+        );
+        changed = plan.clone();
+        changed.files[1].original = None;
+        assert_eq!(
+            controller.authorize_workspace(&changed, 33),
+            Err(ApplyRejection::NotVerified)
+        );
+    }
+
+    #[test]
+    fn workspace_kilidi_stale_mod_ve_ortak_deneme_sinirini_korumali() {
+        let mut controller = RepairController::default();
+        let plan = workspace_plan();
+        controller.record_workspace_success(&plan, 33, VerifyMode::Check);
+        assert_eq!(
+            controller.authorize_workspace(&plan, 34),
+            Err(ApplyRejection::StaleProject)
+        );
+        assert_eq!(
+            controller.authorize_workspace(&plan, 33),
+            Err(ApplyRejection::StaleProject)
+        );
+        controller
+            .register_workspace_candidate(&plan, VerifyMode::Test)
+            .unwrap();
+        controller.record_workspace_success(&plan, 34, VerifyMode::Test);
+        let mut other = plan.clone();
+        other.files[0].updated = "baska".into();
+        controller.record_workspace_success(&other, 34, VerifyMode::Check);
+        assert_eq!(
+            controller.authorize_workspace(&other, 34),
+            Err(ApplyRejection::InsufficientMode {
+                have: VerifyMode::Check,
+                need: VerifyMode::Test
+            })
+        );
+        assert!(
+            controller
+                .register_workspace_candidate(&other, VerifyMode::Test)
+                .is_err()
+        );
+        assert_eq!(controller.authorize_workspace(&plan, 34), Ok(()));
+        for _ in 0..MAX_PATCH_ATTEMPTS {
+            controller.approve();
+        }
+        assert_eq!(
+            controller.authorize_workspace(&plan, 34),
+            Err(ApplyRejection::AttemptLimit)
+        );
+    }
 
     fn verified(path: &str, old: &str, new: &str, mode: VerifyMode) -> VerifiedCandidate {
         VerifiedCandidate {

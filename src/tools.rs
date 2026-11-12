@@ -5,197 +5,20 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-pub const MAX_SEARCH_RESULTS: usize = 20;
-pub const MAX_SEARCH_FILES: usize = 150;
 pub const CARGO_TIMEOUT_SECS: u64 = 120;
 
-// ============================================================
-// ORTAK DOSYA YOLU KONTROLU
-// ============================================================
-pub fn check_relative_path(relative: &str) -> Result<(), String> {
-    if relative.trim().is_empty() {
-        return Err("Dosya veya klasor yolu bos olamaz.".into());
-    }
-
-    for component in Path::new(relative).components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
-                return Err("Mutlak veya ust klasore cikan yol yasak.".into());
-            }
-            Component::Normal(name) => {
-                let name = name.to_string_lossy();
-                if name.starts_with('.') || name == "target" {
-                    return Err("Gizli ya da korunan klasor/dosya yasak.".into());
-                }
-            }
-            Component::CurDir => {}
-        }
-    }
-    Ok(())
-}
-
-// ============================================================
-// TOOL 1: DOSYA OKUMA
-// ============================================================
-pub fn read_file(root: &Path, relative: &str) -> Result<String, String> {
-    check_relative_path(relative)?;
-    let full = root
-        .join(relative)
-        .canonicalize()
-        .map_err(|e| format!("Dosya bulunamadi: {e}"))?;
-
-    if !full.starts_with(root) {
-        return Err("Proje disina erisim yasak.".into());
-    }
-    // Sembolik baglanti gizli bir dosyaya gidiyorsa da engelle.
-    let resolved = full.strip_prefix(root).map_err(|e| e.to_string())?;
-    check_relative_path(&resolved.to_string_lossy())?;
-    let metadata = fs::metadata(&full).map_err(|e| e.to_string())?;
-    if !metadata.is_file() {
-        return Err("Bu yol bir dosya degil.".into());
-    }
-    if metadata.len() > 64_000 {
-        return Err("Dosya 64 KB sinirini asiyor.".into());
-    }
-    fs::read_to_string(full).map_err(|e| format!("Okuma hatasi: {e}"))
-}
-
-// ============================================================
-// TOOL 2: KLASOR LISTELEME
-// ============================================================
-pub fn list_files(root: &Path, relative: &str) -> Result<String, String> {
-    check_relative_path(relative)?;
-    let directory = root
-        .join(relative)
-        .canonicalize()
-        .map_err(|e| format!("Klasor bulunamadi: {e}"))?;
-
-    if !directory.starts_with(root) {
-        return Err("Proje disina erisim yasak.".into());
-    }
-    let resolved = directory.strip_prefix(root).map_err(|e| e.to_string())?;
-    // Proje kokunde bos goreli yol da guvenlidir.
-    if !resolved.as_os_str().is_empty() {
-        check_relative_path(&resolved.to_string_lossy())?;
-    }
-    if !directory.is_dir() {
-        return Err("Bu yol bir klasor degil.".into());
-    }
-
-    let mut files = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let kind = entry.file_type().map_err(|e| e.to_string())?;
-        if kind.is_symlink() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name == "target" {
-            continue;
-        }
-        let label = if kind.is_dir() { "[DIR]" } else { "[FILE]" };
-        files.push(format!("{label} {name}"));
-    }
-    files.sort();
-    files.truncate(100);
-    Ok(files.join("\n"))
-}
-
-// ============================================================
-// TOOL 3: SATIR BAZLI OKUMA
-// ============================================================
-pub fn read_lines(root: &Path, relative: &str, start: usize, end: usize) -> Result<String, String> {
-    if start == 0 || end < start || end - start >= 60 {
-        return Err("Satir araligi 1 tabanli olmali ve en fazla 60 satir icermeli.".into());
-    }
-    let content = read_file(root, relative)?;
-    let lines: Vec<&str> = content.lines().collect();
-    if start > lines.len() || end > lines.len() {
-        return Err(format!(
-            "Dosya {} satir; istenen aralik {}-{}.",
-            lines.len(),
-            start,
-            end
-        ));
-    }
-    Ok(lines[start - 1..end]
-        .iter()
-        .enumerate()
-        .map(|(i, line)| format!("{:>4} | {}", start + i, line))
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
-// ============================================================
-// TOOL 4: KOD ARAMA
-// ============================================================
-pub fn search_code(root: &Path, query: &str) -> Result<String, String> {
-    if query.trim().is_empty() || query.len() > 128 || query.contains('\n') {
-        return Err("Arama sorgusu 1-128 byte ve tek satir olmali.".into());
-    }
-    let src = root.join("src").canonicalize().map_err(|e| e.to_string())?;
-    if !src.starts_with(root) {
-        return Err("src klasoru proje disina cikiyor.".into());
-    }
-    let mut pending = vec![(src, 0usize)];
-    let mut scanned = 0usize;
-    let mut hits = Vec::new();
-
-    while let Some((folder, depth)) = pending.pop() {
-        for entry in fs::read_dir(&folder).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let kind = entry.file_type().map_err(|e| e.to_string())?;
-            if kind.is_symlink() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "target" {
-                continue;
-            }
-            let path = entry.path();
-            if kind.is_dir() {
-                if depth < 5 {
-                    pending.push((path, depth + 1));
-                }
-            } else if kind.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                scanned += 1;
-                if scanned > MAX_SEARCH_FILES {
-                    return Ok(format!(
-                        "{}\n[ARAMA SINIRI] 150 dosyaya ulasildi.",
-                        hits.join("\n")
-                    ));
-                }
-                let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
-                let rel_str = rel.to_string_lossy();
-                let content = match read_file(root, &rel_str) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                for (i, line) in content.lines().enumerate() {
-                    if line.contains(query) {
-                        let excerpt: String = line.chars().take(180).collect();
-                        hits.push(format!("{}:{}: {}", rel.display(), i + 1, excerpt));
-                        if hits.len() == MAX_SEARCH_RESULTS {
-                            return Ok(hits.join("\n"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if hits.is_empty() {
-        Ok("Eslesen Rust kodu bulunamadi.".into())
-    } else {
-        Ok(hits.join("\n"))
-    }
-}
+// Workspace discovery sinirlari tek yerde uygulanir.
+pub use crate::discovery::{
+    MAX_SEARCH_FILES, MAX_SEARCH_RESULTS, check_relative_path, list_files, read_file, read_lines,
+    search_code, search_in_file,
+};
 
 // ============================================================
 // TOOL 5: CARGO CHECK / CARGO TEST
@@ -405,7 +228,10 @@ pub async fn run_cargo(
     if mode != "check" && mode != "test" {
         return Err("Gecersiz komut. Sadece check veya test kullanilabilir.".into());
     }
-
+    if crate::verification::verification_kind(dir)? != crate::verification::VerificationKind::Cargo
+    {
+        return Err("Cargo dogrulamasi calistirilmadi: desteklenmeyen proje turu.".into());
+    }
     let program = cargo_bin();
     let command_name = format!("{program} {mode}");
     let mut command = Command::new(program);
@@ -452,7 +278,8 @@ pub fn exact_line_block_locations(content: &str, needle: &str) -> Vec<usize> {
             let end = start + needle.len();
             let suffix = content[end..].split('\n').next().unwrap_or("");
             let only_indent = prefix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
-            let only_tail = suffix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
+            let only_tail = needle.ends_with('\n')
+                || suffix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
             if only_indent && only_tail {
                 Some(start)
             } else {
@@ -494,10 +321,7 @@ pub fn prepare_patch(
     if !src_root.starts_with(root) {
         return Err("root parametresi src klasörünün bir alt dizini olmalı.".into());
     }
-    let full = root
-        .join(relative)
-        .canonicalize()
-        .map_err(|e| format!("Dosya bulunamadi: {e}"))?;
+    let full = crate::discovery::resolve_existing(root, relative)?;
 
     if !full.starts_with(&src_root) {
         return Err("Sadece src klasorundeki dosyalar duzenlenebilir.".into());
@@ -658,12 +482,12 @@ pub async fn verify_patch(root: &Path) -> (bool, String) {
 // OLLAMA ARAC TANIMLARI
 // ============================================================
 pub fn tool_definitions() -> Value {
-    json!([
+    let mut definitions = json!([
         {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Proje icindeki izinli bir dosyayi oku. 64KB siniri vardir.",
+                "description": "Izinli UTF-8 dosyasini LF/CRLF ve dosya sonundaki satir sonunu degistirmeden oku. En fazla 64000 byte; buyuk dosyalarda read_lines kullan.",
                 "parameters": {
                     "type": "object", "properties": {
                         "path": {"type": "string", "description": "Ornek: src/main.rs"}
@@ -687,7 +511,7 @@ pub fn tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "read_lines",
-                "description": "Bir dosyanin 1 tabanli satirlarini oku, en fazla 60 satir. Satir numaralari kodun parcasi degildir.",
+                "description": "Bir dosyanin 1 tabanli en fazla 60 satirini sinirli oku. Satir numaralari ve kisaltma etiketleri old_text'e eklenmez; LF/CRLF bicimi bu gorunumden anlasilmaz.",
                 "parameters": {
                     "type": "object", "properties": {
                         "path": {"type": "string"},
@@ -750,12 +574,103 @@ pub fn tool_definitions() -> Value {
                 }
             }
         }
-    ])
+    ]);
+    let changes = json!({
+        "type": "array", "minItems": 1, "maxItems": 16,
+        "description": "Istekte belirtilen tum degisiklik hedefleri; her dosya icin tek edit veya create. Tum hedefleri tek changes dizisine koy.",
+        "items": {"oneOf": [
+            {"type": "object", "properties": {
+                "operation": {"type": "string", "const": "edit"},
+                "path": {"type": "string"},
+                "old_text": {"type": "string", "description": "Okunan tam eski satir/blok, en fazla 8000 byte. JSON string olarak kodla; cozulen deger kaynakla ayni olmali. LF/CRLF ve dosya sonunda satir sonu olup olmadigini koru. Rust tam eslesmeyi denetler."},
+                "new_text": {"type": "string", "description": "Eski blok yerine gelecek tam metin, en fazla 8000 byte."}
+            }, "required": ["operation", "path", "old_text", "new_text"], "additionalProperties": false},
+            {"type": "object", "properties": {
+                "operation": {"type": "string", "const": "create"},
+                "path": {"type": "string"},
+                "content": {"type": "string", "description": "Yeni dosyanin tum UTF-8 icerigi, en fazla 8000 byte. Hedef dosya mevcut olmamali."}
+            }, "required": ["operation", "path", "content"], "additionalProperties": false}
+        ]}
+    });
+    let tools = definitions
+        .as_array_mut()
+        .expect("Sabit arac semasi bir dizidir.");
+    tools.push(json!({"type": "function", "function": {
+        "name": "search_in_file", "description": "Belirtilen izinli dosyada sinirli, satir numarali sabit metin aramasi. Buyuk dosyalar kontrollu taranir; limitler acikca belirtilir.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "query": {"type": "string"}}, "required": ["path", "query"]}
+    }}));
+    for (name, description) in [
+        (
+            "verify_workspace",
+            "Okunan tum hedefler icin tek changes dizisi hazirla ve verify_workspace arac cagrisi gonder. old_text satir sonlari dahil kaynakla eslesmeli. Rust adaylari gecici proje kopyasinda birlikte dogrular; Cargo kod calistirma izni gerekir. VERIFY_OK sonrasi ayni changes ile apply_workspace kullan. VERIFY_OK uygulama basarisi degildir.",
+        ),
+        (
+            "apply_workspace",
+            "Ayni dogrulanmis changes planinin tum hedeflerini diff ile tek kullanici onayina sun, yedekle, uygula ve cargo check+test ile dogrula. Hatada tum plan geri alinmaya calisilir. Yalniz acik Modify gorevi; silme/tasima/yeni dizin desteklenmez.",
+        ),
+    ] {
+        let mut definition = json!({"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": {"changes": changes}, "required": ["changes"]}
+        }});
+        if name == "verify_workspace" {
+            definition["function"]["parameters"]["properties"]["mode"] =
+                json!({"type": "string", "enum": ["check", "test"], "default": "check"});
+        }
+        tools.push(definition);
+    }
+    definitions
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newline_tam_satir_bloklari_eslesmeli() {
+        for ending in ["\n", "\r\n"] {
+            let first = format!("fn a() {{}}{ending}");
+            let middle = format!("fn b() {{}}{ending}");
+            let last = format!("fn c() {{}}{ending}");
+            let content = format!("{first}{middle}{last}");
+            for (needle, expected) in [
+                (first.clone(), 0),
+                (middle.clone(), first.len()),
+                (last.clone(), first.len() + middle.len()),
+                (format!("{first}{middle}"), 0),
+                (format!("{middle}{last}"), first.len()),
+            ] {
+                assert_eq!(
+                    exact_line_block_locations(&content, &needle),
+                    [expected],
+                    "ending={ending:?}, needle={needle:?}"
+                );
+            }
+            let no_final_newline = format!("{first}{middle}fn c() {{}}");
+            assert_eq!(
+                exact_line_block_locations(&no_final_newline, "fn c() {}"),
+                [first.len() + middle.len()]
+            );
+            assert_eq!(exact_line_block_locations(&content, "fn a() {}"), [0]);
+            let repeated = format!("{first}{first}");
+            assert_eq!(
+                exact_line_block_locations(&repeated, &first),
+                [0, first.len()]
+            );
+        }
+        for (content, needle) in [
+            ("fn a() {}\nfn b() {}\n", "fn a() {}\\n"),
+            ("fn a() {}\nfn b() {}\n", "fn a() {}\r\n"),
+            ("fn a() {}\r\nfn b() {}\r\n", "fn a() {}\n"),
+            ("fn a() {}\nfn b() {}\n", "a() {}\n"),
+            ("    println!(\"x\");\nfn b() {}\n", "println!(\"x\")"),
+        ] {
+            assert!(
+                exact_line_block_locations(content, needle).is_empty(),
+                "Yanlis veya eksik blok kabul edildi: {needle:?}"
+            );
+        }
+    }
 
     fn output_fixture(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
         #[cfg(windows)]

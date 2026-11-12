@@ -82,7 +82,7 @@ impl TaskIntent {
                 "Bu gorev derleme/test: dosya DEGISTIRILMEZ. run_tests ile gercek projede cargo check/test calistir (kullanici onayi istenir) ve ciktiyi oldugu gibi raporla."
             }
             TaskIntent::Modify => {
-                "Kod degisikligi istendi. Sira: search_code/read_lines ile kodu bul -> verify_candidate -> VERIFY_OK sonrasi BIREBIR AYNI path/old_text/new_text ile apply_patch. Ayni dosyayi tekrar okuma."
+                "Kod degisikligi istendi. search_code/read_lines ile kodu bul. Tek dosyada verify_candidate -> ayni path/old_text/new_text ile apply_patch. Birden fazla dosya veya yeni dosya icin verify_workspace -> BIREBIR AYNI changes ile apply_workspace; tum hedefler tek kullanici onayina sunulur. Ayni dosyayi tekrar okuma."
             }
             TaskIntent::Unknown => {
                 "Gorev turu belirsiz. Once kodu incele ve bulgulari raporla. Kod degisikligi gerekiyorsa verify_candidate cagir; Rust tarafi kullanicidan izin ister, izin yoksa degisiklik yapilamaz."
@@ -546,6 +546,67 @@ fn guard(folded: &str, tokens: &[String]) -> Option<String> {
         })
 }
 
+/// Yalniz mevcut proje kokunun disini hedefleyen yasak, kok icindeki yazma
+/// istegini iptal etmez. Ek hedef/eylem varsa muafiyet uygulanmaz; asil yol
+/// guvenligi yine discovery/patch katmaninda zorunludur.
+fn outside_workspace_only(group: &str) -> bool {
+    let Some((before, _)) = group.split_once(" outside ") else {
+        return false;
+    };
+    if before
+        .split_whitespace()
+        .any(|word| is_identifier(word.trim_end_matches(['.', ':'])))
+    {
+        return false;
+    }
+    let words = tokens(group);
+    let Some(outside) = words.iter().position(|word| word == "outside") else {
+        return false;
+    };
+    let scope = &words[outside + 1..];
+    let Some((noun, qualifiers)) = scope.split_last() else {
+        return false;
+    };
+    if !["project", "workspace", "repository"].contains(&noun.as_str())
+        || qualifiers.is_empty()
+        || qualifiers.len() > 2
+        || !qualifiers
+            .iter()
+            .all(|word| ["this", "the", "current", "my", "our"].contains(&word.as_str()))
+    {
+        return false;
+    }
+    words[..outside].iter().all(|word| {
+        english_in(word, MODIFY_EN)
+            || word.strip_suffix("ing").is_some_and(|stem| {
+                MODIFY_EN
+                    .iter()
+                    .any(|action| stem == *action || action.strip_suffix('e') == Some(stem))
+            })
+            || [
+                "do",
+                "not",
+                "never",
+                "without",
+                "please",
+                "you",
+                "must",
+                "should",
+                "shall",
+                "cannot",
+                "any",
+                "the",
+                "file",
+                "files",
+                "anything",
+                "code",
+                "changes",
+                "modifications",
+            ]
+            .contains(&word.as_str())
+    })
+}
+
 /// Kaliplar tam sozcuk sinirinda eslesir: "kod yazma" bir yasaktir,
 /// "kod yazmani istiyorum" ise olumlu istektir.
 fn phrase_match(text: &str, phrase: &str) -> bool {
@@ -559,7 +620,7 @@ fn phrase_match(text: &str, phrase: &str) -> bool {
 
 /// Cumle/eylem sinirlari olumsuzlugun komsu olumlu istege yayilmasini onler.
 /// Dosya adlarinin icindeki noktalara dokunulmaz.
-fn clauses(folded: &str) -> Vec<String> {
+fn command_groups(folded: &str) -> Vec<String> {
     let mut text = folded.replace(". ", "; ");
     for boundary in [" but ", " ama ", " ancak "] {
         text = text.replace(boundary, "; ");
@@ -567,11 +628,19 @@ fn clauses(folded: &str) -> Vec<String> {
     for boundary in [" without ", " only ", " just ", " sadece ", " yalnizca "] {
         text = text.replace(boundary, &format!("; {} ", boundary.trim()));
     }
+    text.split([';', '!', '?'])
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn clauses(folded: &str) -> Vec<String> {
     let mut result = Vec::new();
-    for sentence in text.split([';', '!', '?']) {
+    for sentence in command_groups(folded) {
         // Inceleme nesnesindeki "create and update functions" isimleri emir
         // degildir. Ayiklama baglaclardan once yapilir; Turkce fiil sonda olabilir.
-        let sentence = mask_function_names(sentence);
+        let sentence = mask_function_names(&sentence);
         for segment in sentence.split(',').flat_map(|part| part.split(" ve ")) {
             let mut negative = false;
             for clause in segment
@@ -779,6 +848,105 @@ fn execution_requested(words: &[String], clause: &str) -> bool {
     (run && test_subject) || compile || imperative_test
 }
 
+/// Acik dosya komutlari ve `- src/file.rs: ...` degisiklik listelerinin
+/// hedefleri. Referans/okuma yollarini kapsama katmaz; serbest dildeki tum
+/// isteklerin dosya kapsamlarini cikardigini iddia etmez.
+pub(crate) fn workspace_write_targets(request: &str) -> Vec<String> {
+    fn file_path(word: &str) -> Option<String> {
+        let path = word
+            .trim_start_matches(['`', '\'', '"', '(', '['])
+            .trim_end_matches(['`', '\'', '"', ')', ']', ':', '.']);
+        let mut path = path.replace('\\', "/");
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest.to_owned();
+        }
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains(':')
+            || path.split('/').any(|part| part.is_empty() || part == "..")
+            || path.contains(['=', '{', '}', '<', '>', '|'])
+        {
+            return None;
+        }
+        let extension = path.rsplit('.').next().unwrap_or("");
+        (path.contains('/') || path.contains('.') && extension.chars().any(char::is_alphabetic))
+            .then_some(path)
+    }
+
+    fn collect(part: &[&str], inherited: &mut bool, targets: &mut Vec<String>) {
+        let text = fold(&part.join(" "));
+        let words = tokens(&text);
+        let action = words
+            .iter()
+            .position(|word| modification_word(word) || english_in(word, &["register"]));
+        if read_only_lead(&words, true)
+            || action.is_some_and(|index| english_negation_at(&words, index))
+        {
+            *inherited = false;
+            return;
+        }
+        let listed = part.first().is_some_and(|word| ["-", "*"].contains(word))
+            && part
+                .get(1)
+                .is_some_and(|word| word.ends_with(':') && file_path(word).is_some());
+        let mut writing = action.is_some() || *inherited || listed;
+        for word in part {
+            let normalized = fold(word);
+            if [
+                "using",
+                "use",
+                "from",
+                "based",
+                "reference",
+                "referencing",
+                "with",
+                "read",
+                "review",
+                "explain",
+                "analyze",
+                "inspect",
+            ]
+            .contains(&normalized.as_str())
+            {
+                writing = false;
+            }
+            if writing
+                && let Some(path) = file_path(word)
+                && !targets.contains(&path)
+            {
+                targets.push(path);
+            }
+        }
+        *inherited = writing;
+    }
+
+    let text = request
+        .replace(". ", " ; ")
+        .replace(['\n', '\r', ';', '!', '?'], " ; ")
+        .replace(',', " , ");
+    let mut part = Vec::new();
+    let mut inherited = false;
+    let mut targets = Vec::new();
+    for word in text.split_whitespace() {
+        let boundary = fold(word);
+        if [
+            ",", ";", "and", "then", "but", "ve", "sonra", "ama", "ancak",
+        ]
+        .contains(&boundary.as_str())
+        {
+            collect(&part, &mut inherited, &mut targets);
+            part.clear();
+            if [";", "then", "but", "sonra", "ama", "ancak"].contains(&boundary.as_str()) {
+                inherited = false;
+            }
+        } else {
+            part.push(word);
+        }
+    }
+    collect(&part, &mut inherited, &mut targets);
+    targets
+}
+
 // ============================================================
 // SINIFLANDIRMA
 // ============================================================
@@ -943,7 +1111,6 @@ pub fn classify(request: &str) -> IntentDecision {
     let folded = fold(request)
         .replace(['’', '‘'], "'")
         .replace("n't", " not");
-    let all_tokens = tokens(&folded);
     let mut evidence = Vec::new();
     let mut scores = Scores::default();
     let mut explicit_file_write = false;
@@ -1066,7 +1233,12 @@ pub fn classify(request: &str) -> IntentDecision {
         explicit_file_write = false;
     }
 
-    let write_guard = guard(&folded, &all_tokens);
+    // Virgulle veya and/or ile uzayan hedefleri ayirmadan once kapsam secilir;
+    // aksi halde "outside this project and src/lib.rs" ic yasagi gizleyebilir.
+    let write_guard = command_groups(&folded)
+        .into_iter()
+        .filter(|group| !outside_workspace_only(group))
+        .find_map(|group| guard(&group, &tokens(&group)));
     if let Some(found) = &write_guard {
         // Kullanici acikca degisiklik istemiyor: yazma sinyalleri gecersiz.
         scores.modify = 0;
@@ -1136,6 +1308,99 @@ pub fn classify(request: &str) -> IntentDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proje_disi_yazma_yasagi_proje_ici_modify_istegini_iptal_etmemeli() {
+        for request in [
+            "Modify src/lib.rs, but do not modify files outside this project.",
+            "Update src/lib.rs. Never edit files outside the workspace.",
+            "Modify src/lib.rs, but do not write anything outside the current repository.",
+            "Modify src/lib.rs without modifying files outside this project.",
+            "Do not modify files outside this project, but update src/lib.rs.",
+        ] {
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Modify,
+                "{request}: {decision:?}"
+            );
+            assert!(!decision.write_forbidden, "{request}: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn proje_siniri_kurali_gercek_yazma_yasaklarini_gizlememeli() {
+        for request in [
+            "Modify src/lib.rs, but do not modify files.",
+            "Modify src/lib.rs, but do not modify src/lib.rs.",
+            "Modify src/lib.rs, but do not modify anything in this project.",
+            "Modify src/lib.rs, but do not modify files inside or outside this project.",
+            "Modify src/lib.rs, but do not modify src/lib.rs or files outside this project.",
+            "Modify src/lib.rs, but do not modify files outside this project and src/lib.rs.",
+            "Modify src/lib.rs, but do not modify files outside this project, or src/lib.rs.",
+            "Modify src/lib.rs. Do not modify files outside this project. Do not modify any files.",
+            "Modify src/lib.rs, but do not modify files outside this project or inside it.",
+            "Modify src/lib.rs, but do not modify files outside another project.",
+            "src/lib.rs dosyasını güncelle ama dosyaları değiştirme.",
+        ] {
+            let decision = classify(request);
+            assert!(decision.write_forbidden, "{request}: {decision:?}");
+            assert_ne!(
+                decision.intent,
+                TaskIntent::Modify,
+                "{request}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_acik_yazma_hedefleri_tum_dosyalari_kapsamali() {
+        for request in [
+            "Modify src/math.rs by preserving double and adding triple, create src/format.rs, and modify src/lib.rs to register the new module.",
+            "Modify these files:\n- src/math.rs: preserve double and add triple\n- src/format.rs: create a formatting module\n- src/lib.rs: register the new module",
+            "Modify these files:\n- `src/math.rs`: preserve double and add triple\n- `src/format.rs`: create a formatting module\n- `src/lib.rs`: register the new module",
+        ] {
+            assert_eq!(
+                workspace_write_targets(request),
+                ["src/math.rs", "src/format.rs", "src/lib.rs"],
+                "{request}"
+            );
+        }
+        assert_eq!(
+            workspace_write_targets("Modify src/Math.rs and src/Lib.rs."),
+            ["src/Math.rs", "src/Lib.rs"]
+        );
+        assert_eq!(
+            workspace_write_targets("Modify ./src/Math.rs and src\\Lib.rs."),
+            ["src/Math.rs", "src/Lib.rs"]
+        );
+        for request in ["Modify `src/lib.rs`.", "Modify \"src/lib.rs\"."] {
+            assert_eq!(
+                workspace_write_targets(request),
+                ["src/lib.rs"],
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_okuma_ve_referans_yollari_yazma_hedefi_sayilmamali() {
+        for request in [
+            "Read src/math.rs then modify src/lib.rs.",
+            "Modify src/lib.rs using src/math.rs.",
+            "Modify src/lib.rs to use src/math.rs.",
+            "Modify src/lib.rs based on src/math.rs and src/format.rs.",
+            "Modify src/lib.rs; explain how to modify src/math.rs.",
+        ] {
+            assert_eq!(
+                workspace_write_targets(request),
+                ["src/lib.rs"],
+                "{request}"
+            );
+        }
+        assert!(workspace_write_targets("Read src/math.rs and explain src/lib.rs.").is_empty());
+        assert!(workspace_write_targets("Do not modify src/math.rs.").is_empty());
+    }
 
     fn intent_of(text: &str) -> TaskIntent {
         let decision = classify(text);

@@ -34,8 +34,19 @@ pub const MAX_IDENTICAL_CALLS: usize = 3;
 /// Bir gorevde toplam arac cagrisi ust siniri (MAX_AGENT_ROUNDS'a ek guvenlik agi).
 pub const MAX_TOOL_CALLS_PER_TASK: usize = 30;
 
-pub const READ_TOOLS: &[&str] = &["read_file", "list_files", "read_lines", "search_code"];
-pub const WRITE_PATH_TOOLS: &[&str] = &["verify_candidate", "apply_patch"];
+pub const READ_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "read_lines",
+    "search_code",
+    "search_in_file",
+];
+pub const WRITE_PATH_TOOLS: &[&str] = &[
+    "verify_candidate",
+    "apply_patch",
+    "verify_workspace",
+    "apply_workspace",
+];
 pub const ALL_TOOLS: &[&str] = &[
     "read_file",
     "list_files",
@@ -44,6 +55,9 @@ pub const ALL_TOOLS: &[&str] = &[
     "run_tests",
     "verify_candidate",
     "apply_patch",
+    "search_in_file",
+    "verify_workspace",
+    "apply_workspace",
 ];
 
 const INTENT_QUESTION: &str = "Istegin turu belirsiz ve model kod degisikligi onermek istiyor. Bu gorevde kod degisikligine izin veriyor musunuz?";
@@ -63,6 +77,8 @@ const FAILURE_PREFIXES: &[&str] = &[
     "PATCH_FAILED_ROLLED_BACK",
     "CRITICAL",
     "TEST_REJECTED",
+    "WORKSPACE_APPLY_FAILED",
+    "WORKSPACE_FAILED",
 ];
 
 pub fn is_failure(output: &str) -> bool {
@@ -173,6 +189,10 @@ fn signature(name: &str) -> &'static str {
             "{path: metin, start_line: tam sayi >= 1, end_line: tam sayi >= start_line; en fazla 60 satir}"
         }
         "search_code" => "{query: tek satir metin, 1-128 byte}",
+        "search_in_file" => "{path: metin, query: tek satir metin, 1-128 byte}",
+        "verify_workspace" | "apply_workspace" => {
+            "{changes: [{operation: edit, path, old_text, new_text} | {operation: create, path, content}], mode?: check | test}"
+        }
         "run_tests" => "{mode: \"check\" | \"test\"}",
         "verify_candidate" => {
             "{path: metin, old_text: metin, new_text: metin, mode?: \"check\" | \"test\"}"
@@ -188,6 +208,10 @@ fn example(name: &str) -> &'static str {
         "list_files" => r#"{"path": "src"}"#,
         "read_lines" => r#"{"path": "src/main.rs", "start_line": 10, "end_line": 40}"#,
         "search_code" => r#"{"query": "fn read_lines"}"#,
+        "search_in_file" => r#"{"path": "src/main.rs", "query": "fn main"}"#,
+        "verify_workspace" | "apply_workspace" => {
+            r#"{"changes":[{"operation":"create","path":"src/helper.rs","content":"pub fn helper() {}\n"}]}"#
+        }
         "run_tests" => r#"{"mode": "check"}"#,
         "verify_candidate" => {
             r#"{"path": "src/main.rs", "old_text": "let x = 1;", "new_text": "let x = 2;", "mode": "check"}"#
@@ -323,13 +347,16 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             out.insert("start_line".into(), Value::from(start));
             out.insert("end_line".into(), Value::from(end));
         }
-        "search_code" => {
+        "search_code" | "search_in_file" => {
             let query = text(name, object, "query")?;
             let raw = query.as_str().unwrap_or("");
             if raw.len() > 128 || raw.contains('\n') {
                 return Err(invalid(name, "query tek satir ve en fazla 128 byte olmali"));
             }
             out.insert("query".into(), query);
+            if name == "search_in_file" {
+                out.insert("path".into(), text(name, object, "path")?);
+            }
         }
         "run_tests" => {
             out.insert("mode".into(), mode(name, object, false)?);
@@ -344,6 +371,13 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             out.insert("old_text".into(), old_text);
             out.insert("new_text".into(), new_text);
             if name == "verify_candidate" {
+                out.insert("mode".into(), mode(name, object, true)?);
+            }
+        }
+        "verify_workspace" | "apply_workspace" => {
+            crate::workspace_agent::parse_changes(args).map_err(|error| invalid(name, &error))?;
+            out.insert("changes".into(), object["changes"].clone());
+            if name == "verify_workspace" {
                 out.insert("mode".into(), mode(name, object, true)?);
             }
         }
@@ -403,6 +437,8 @@ pub struct Orchestrator {
     test_results: Vec<TestResult>,
     /// Onay verilmedigi icin surec sonucu olusmayan, dogrulanmis arac denemeleri.
     unexecuted_tests: Vec<String>,
+    workspace_reports: Vec<String>,
+    workspace_targets: Vec<String>,
 }
 
 impl Orchestrator {
@@ -422,12 +458,18 @@ impl Orchestrator {
             unproven_claim: false,
             test_results: Vec::new(),
             unexecuted_tests: Vec::new(),
+            workspace_reports: Vec::new(),
+            workspace_targets: Vec::new(),
         }
     }
 
     /// Kullanici istegini siniflandirip gorev baglamini kurar.
     pub fn for_request(request: &str) -> Self {
-        Self::new(intent::classify(request))
+        let mut task = Self::new(intent::classify(request));
+        if task.intent() == TaskIntent::Modify {
+            task.workspace_targets = intent::workspace_write_targets(request);
+        }
+        task
     }
 
     pub fn intent(&self) -> TaskIntent {
@@ -469,6 +511,7 @@ impl Orchestrator {
             .iter()
             .map(|result| result.report.as_str())
             .chain(self.unexecuted_tests.iter().map(String::as_str))
+            .chain(self.workspace_reports.iter().map(String::as_str))
             .collect();
         if reports.is_empty() {
             return "[RUST SUREC SONUCU] Bu gorevde calistirilmis test/derleme komutu kaydi yok. Basari veya basarisizlik sonucu yok; cikis kodu ve test sayilari mevcut degil.".into();
@@ -486,7 +529,10 @@ impl Orchestrator {
                 self.command_report()
             );
         }
-        if self.test_results.is_empty() && self.unexecuted_tests.is_empty() {
+        if self.test_results.is_empty()
+            && self.unexecuted_tests.is_empty()
+            && self.workspace_reports.is_empty()
+        {
             return answer.to_owned();
         }
         format!(
@@ -590,6 +636,7 @@ impl Orchestrator {
         stop: Option<&str>,
         announce: bool,
     ) -> ToolOutcome {
+        self.repair.clear_pending_workspace();
         let phase = self.phase();
         if stop.is_some() && self.intent() == TaskIntent::Generate && !phase.is_terminal() {
             self.repair.enter(TaskPhase::Blocked);
@@ -610,6 +657,7 @@ impl Orchestrator {
             stop: stop.map(str::to_string),
             patch_effect: PatchEffect::None,
             test_result: None,
+            workspace_report: None,
         }
     }
 
@@ -623,6 +671,11 @@ impl Orchestrator {
         name: &str,
         raw_args: &Value,
     ) -> io::Result<ToolOutcome> {
+        // apply_workspace kendi kaydini handler'da tuketir; her diger yazma
+        // girisimi eski bekleyen adayi arguman dogrulamasindan once iptal eder.
+        if WRITE_PATH_TOOLS.contains(&name) && name != "apply_workspace" {
+            self.repair.clear_pending_workspace();
+        }
         self.stats.calls += 1;
         let key = call_key(name, raw_args);
         let repeats = self.ledger.repeats(&key);
@@ -680,6 +733,16 @@ impl Orchestrator {
         }
 
         // 3) Arguman dogrulama (arac calistirilmadan).
+        // Kesin yazma yasagi hatali argumanlarla bile izin sorusuna donusmez.
+        if WRITE_PATH_TOOLS.contains(&name)
+            && (self.authority == WriteAuthority::Denied
+                || (matches!(name, "verify_workspace" | "apply_workspace")
+                    && self.intent() != TaskIntent::Modify))
+        {
+            self.stats.intent_blocked += 1;
+            let output = self.intent_block_text(name);
+            return Ok(self.refuse(name, key, output, None, true));
+        }
         let args = match validate_args(name, raw_args) {
             Ok(args) => args,
             Err(detail) => {
@@ -687,6 +750,47 @@ impl Orchestrator {
                 return Ok(self.refuse(name, key, format!("ERROR: {detail}"), None, false));
             }
         };
+        if matches!(name, "verify_workspace" | "apply_workspace") {
+            let path_key = |path: &str| {
+                let path = path.replace('\\', "/");
+                let path = std::path::Path::new(&path)
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(name) => {
+                            Some(name.to_string_lossy().into_owned())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if cfg!(windows) {
+                    path.to_lowercase()
+                } else {
+                    path
+                }
+            };
+            let targets: Vec<_> = args["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|change| change["path"].as_str())
+                .map(path_key)
+                .collect();
+            let missing: Vec<_> = self
+                .workspace_targets
+                .iter()
+                .filter(|path| !targets.contains(&path_key(path)))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                self.stats.invalid_args += 1;
+                let output = format!(
+                    "ERROR: Workspace plani acik degisiklik hedeflerini kapsamiyor: {}. Eksik plan dogrulanmadi veya uygulanmadi; tam changes listesi gerekir.",
+                    missing.join(", ")
+                );
+                return Ok(self.refuse(name, key, output, None, true));
+            }
+        }
 
         // 4) Yazma yoluna giden araclar: asama ve niyet kapisi.
         if name == "run_tests" && self.phase().is_terminal() {
@@ -717,6 +821,11 @@ impl Orchestrator {
         let mut outcome =
             handle_tool_call(session, &mut self.repair, prompter, name, &args).await?;
         self.stats.dispatched += 1;
+        if matches!(name, "verify_workspace" | "apply_workspace")
+            && let Some(report) = &outcome.workspace_report
+        {
+            self.workspace_reports.push(report.clone());
+        }
         // Aracin cagrilmis olmasi komutun basarili oldugunu gostermez.
         // stdout/JSON icindeki FAILED veya INTENT_BLOCKED sozcukleri karar vermez.
         let command_result = (name == "run_tests")
@@ -762,7 +871,7 @@ impl Orchestrator {
         }
         // Tipli etkiyi yalnizca gercek apply_patch cagrisi tasiyabilir. Okunan
         // kaynakta PATCH_VERIFIED yazmasi bu durumu degistiremez.
-        if name == "apply_patch" {
+        if matches!(name, "apply_patch" | "apply_workspace" | "verify_workspace") {
             match outcome.patch_effect {
                 PatchEffect::None => {}
                 PatchEffect::Uncertain => self.project_state = ProjectState::Uncertain,
@@ -834,6 +943,7 @@ impl Orchestrator {
             lines.push(result.summary_line());
         }
         lines.extend(self.unexecuted_tests.iter().cloned());
+        lines.extend(self.workspace_reports.iter().cloned());
         if self.intent() == TaskIntent::Test && self.test_results.is_empty() {
             lines.push("[RUST SUREC SONUCU] Komut calistirilmadi; sonuc, cikis kodu ve test sayilari mevcut degil.".into());
         }

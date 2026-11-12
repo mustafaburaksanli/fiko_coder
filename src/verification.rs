@@ -13,20 +13,22 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::repair_controller::VerifyMode;
 use crate::tools::{ExecutionStatus, PatchPlan, TestResult, check_relative_path, run_cargo};
+use crate::workspace_patch::WorkspacePlan;
 
 /// Ilk dogrulama bagimliliklari sifirdan derleyebilir; bu yuzden run_tests'ten uzun.
 pub const VERIFY_TIMEOUT_SECS: u64 = 300;
 pub const MAX_COPY_FILES: usize = 2_000;
 pub const MAX_COPY_BYTES: u64 = 32 * 1024 * 1024;
 /// Gecici kopyanin derleme ciktilari ana projenin target/ klasoru altinda,
-/// ana derleme ciktilarindan ayri bir alt klasorde tutulur (bagimliliklar bir kez derlenir).
+/// ana derleme ciktilarindan ayri, canli calisma alani basina bir alt klasorde tutulur.
 pub const VERIFY_TARGET_SUBDIR: &str = "fiko_verify";
 
 const MAX_DIAGNOSTICS: usize = 8;
@@ -168,6 +170,38 @@ impl Drop for TempWorkspace {
 // ============================================================
 // PROJE KOPYALAMA VE PARMAK IZI
 // ============================================================
+/// Ilk surum yalnizca Cargo projelerini dogrular. Diger turler, komut
+/// calistirilmadan acikca desteklenmiyor olarak bildirilir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationKind {
+    Cargo,
+    Unsupported,
+}
+
+pub fn verification_kind(root: &Path) -> Result<VerificationKind, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    match fs::symlink_metadata(root.join("Cargo.toml")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(VerificationKind::Unsupported),
+        Err(error) => Err(format!("Cargo.toml okunamadi: {error}")),
+        Ok(_) => {
+            let manifest = crate::discovery::resolve_existing(&root, "Cargo.toml")?;
+            if !manifest.is_file() {
+                return Err("Cargo.toml normal bir dosya olmali.".into());
+            }
+            Ok(VerificationKind::Cargo)
+        }
+    }
+}
+
+fn require_cargo(root: &Path) -> Result<(), String> {
+    match verification_kind(root)? {
+        VerificationKind::Cargo => Ok(()),
+        VerificationKind::Unsupported => Err(
+            "Cargo.toml bulunamadi; proje turu desteklenmiyor, dogrulama CALISTIRILMADI.".into(),
+        ),
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CopyStats {
     pub files: usize,
@@ -196,43 +230,83 @@ pub fn project_fingerprint(root: &Path) -> Result<u64, String> {
 }
 
 fn walk_project(root: &Path, dest: Option<&Path>) -> Result<CopyStats, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    if let Some(dest) = dest {
+        let dest = dest.canonicalize().map_err(|e| e.to_string())?;
+        if dest.starts_with(&root) {
+            return Err("Gecici kopya kaynak proje icinde olamaz.".into());
+        }
+    }
     let mut stats = CopyStats::default();
     let mut hasher = DefaultHasher::new();
-    walk_dir(root, "", dest, &mut stats, &mut hasher)?;
+    let mut entries_left = MAX_COPY_FILES * 4;
+    walk_dir(
+        &root,
+        &root,
+        "",
+        dest,
+        &mut stats,
+        &mut hasher,
+        &mut entries_left,
+    )?;
     stats.fingerprint = hasher.finish();
     Ok(stats)
 }
 
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
 fn walk_dir(
+    root: &Path,
     from: &Path,
     rel_prefix: &str,
     dest: Option<&Path>,
     stats: &mut CopyStats,
     hasher: &mut DefaultHasher,
+    entries_left: &mut usize,
 ) -> Result<(), String> {
+    if Path::new(rel_prefix).components().count() > 64 {
+        return Err("Proje dizin derinligi 64 sinirini asiyor.".into());
+    }
     let mut entries: Vec<fs::DirEntry> = fs::read_dir(from)
         .map_err(|e| format!("{} okunamadi: {e}", from.display()))?
+        .take(entries_left.saturating_add(1))
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
+    if entries.len() > *entries_left {
+        return Err("Proje dizin girdisi tarama sinirini asiyor.".into());
+    }
+    *entries_left -= entries.len();
     // Parmak izi siraya bagli; dosya sistemi sirasina guvenme.
     entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
         let kind = entry.file_type().map_err(|e| e.to_string())?;
-        if kind.is_symlink() {
+        if kind.is_symlink()
+            || is_reparse_point(&fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?)
+        {
             continue;
         }
         let name = entry.file_name();
         let name_text = name.to_string_lossy();
-        if name_text.starts_with('.') || name_text == "target" {
-            continue;
-        }
         let relative = if rel_prefix.is_empty() {
             name_text.to_string()
         } else {
             format!("{rel_prefix}/{name_text}")
         };
-        let source = entry.path();
+        if check_relative_path(&relative).is_err() {
+            continue;
+        }
+        let source = crate::discovery::resolve_existing(root, &relative)?;
         let target = dest.map(|d| d.join(&name));
 
         if kind.is_dir() {
@@ -240,23 +314,37 @@ fn walk_dir(
                 fs::create_dir(target)
                     .map_err(|e| format!("{} olusturulamadi: {e}", target.display()))?;
             }
-            walk_dir(&source, &relative, target.as_deref(), stats, hasher)?;
+            walk_dir(
+                root,
+                &source,
+                &relative,
+                target.as_deref(),
+                stats,
+                hasher,
+                entries_left,
+            )?;
         } else if kind.is_file() {
-            let bytes =
-                fs::read(&source).map_err(|e| format!("{} okunamadi: {e}", source.display()))?;
-            stats.files += 1;
-            stats.bytes += bytes.len() as u64;
-            if stats.files > MAX_COPY_FILES {
+            if stats.files >= MAX_COPY_FILES {
                 return Err(format!(
                     "Proje {MAX_COPY_FILES} dosya sinirini asiyor; gecici kopya alinamadi."
                 ));
             }
-            if stats.bytes > MAX_COPY_BYTES {
+            let remaining = MAX_COPY_BYTES.saturating_sub(stats.bytes);
+            if fs::metadata(&source).map_err(|e| e.to_string())?.len() > remaining {
                 return Err(format!(
                     "Proje {} MB kopya sinirini asiyor; gecici kopya alinamadi.",
                     MAX_COPY_BYTES / (1024 * 1024)
                 ));
             }
+            let mut bytes = Vec::new();
+            fs::File::open(&source)
+                .and_then(|file| file.take(remaining + 1).read_to_end(&mut bytes))
+                .map_err(|e| format!("{} okunamadi: {e}", source.display()))?;
+            if bytes.len() as u64 > remaining {
+                return Err("Proje okunurken kopya byte sinirini asti.".into());
+            }
+            stats.files += 1;
+            stats.bytes += bytes.len() as u64;
             hasher.write(relative.as_bytes());
             hasher.write_u64(bytes.len() as u64);
             hasher.write(&bytes);
@@ -475,6 +563,210 @@ fn completed_result(result: TestResult) -> Result<TestResult, String> {
     }
 }
 
+/// Her canli dogrulama ayri bir Cargo target dizini kullanir. Bu, paralel
+/// Windows linker'larin ayni cikti dosyasi uzerinde yarisini azaltir.
+fn verification_target(root: &Path, group: &str, tag: &str) -> Result<PathBuf, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let mut target = root.clone();
+    for component in ["target", group, tag] {
+        target.push(component);
+        match fs::create_dir(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("Cargo target dizini olusturulamadi: {error}")),
+        }
+        let metadata = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
+        if !metadata.is_dir() || is_reparse_point(&metadata) {
+            return Err("Cargo target yolu normal bir dizin olmali; symlink/reparse yasak.".into());
+        }
+        target = target.canonicalize().map_err(|e| e.to_string())?;
+        if !target.starts_with(&root) {
+            return Err("Cargo target dizini proje disina cikiyor.".into());
+        }
+    }
+    Ok(strip_verbatim(&target))
+}
+
+async fn cargo_sequence(
+    root: &Path,
+    mode: VerifyMode,
+    target: &Path,
+) -> Result<Vec<TestResult>, String> {
+    require_cargo(root)?;
+    let mut results = Vec::new();
+    for command in [VerifyMode::Check, VerifyMode::Test] {
+        if command > mode {
+            break;
+        }
+        let result = run_cargo(
+            root,
+            command.as_str(),
+            Some(target),
+            Duration::from_secs(VERIFY_TIMEOUT_SECS),
+        )
+        .await?;
+        let success = result.status == ExecutionStatus::Succeeded;
+        results.push(result);
+        if !success {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+/// Modelin raporu degil, gecici kopyada gozlenen gercek surec kayitlari.
+#[derive(Debug)]
+pub struct WorkspaceVerification {
+    pub results: Vec<TestResult>,
+    pub mode: VerifyMode,
+    pub project_fingerprint: u64,
+    pub cleanup_error: Option<String>,
+}
+
+impl WorkspaceVerification {
+    pub fn success(&self) -> bool {
+        self.results.len() == (if self.mode == VerifyMode::Test { 2 } else { 1 })
+            && self
+                .results
+                .iter()
+                .all(|result| result.status == ExecutionStatus::Succeeded)
+    }
+
+    pub fn render(&self) -> String {
+        let status = if self.success() {
+            "VERIFY_WORKSPACE_OK"
+        } else {
+            "VERIFY_WORKSPACE_FAILED"
+        };
+        let mut report = format!("{status}\nkaynak: gecici kopya (ana proje DEGISMEDI)\n");
+        if self.results.is_empty() {
+            report.push_str("Dogrulama CALISTIRILMADI; surec kaydi yok.\n");
+        }
+        for result in &self.results {
+            report.push_str(&result.report);
+            report.push('\n');
+        }
+        if let Some(error) = &self.cleanup_error {
+            report.push_str(&format!("uyari: gecici klasor silinemedi: {error}\n"));
+        }
+        report
+    }
+}
+
+fn matches_candidate(path: &Path, expected: &str) -> Result<bool, String> {
+    if !fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("Aday hedefi normal bir dosya olmali.".into());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(expected.len() as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|e| e.to_string())?;
+    Ok(bytes == expected.as_bytes())
+}
+
+/// Once kopyadaki tum eski/yok durumlarini kontrol et, sonra adaylari yaz.
+/// Kopyalama sirasinda degisen hedef hicbir zaman dogrulanmis sayilmaz.
+fn stage_workspace_candidate(workspace: &Path, plan: &WorkspacePlan) -> Result<(), String> {
+    let mut targets = Vec::with_capacity(plan.files.len());
+    for file in &plan.files {
+        let target = crate::discovery::resolve_target(workspace, &file.relative)?;
+        match &file.original {
+            Some(original) => {
+                if !matches_candidate(&target, original)? {
+                    return Err(format!(
+                        "Kopyalama sirasinda hedef degisti: {}",
+                        file.relative
+                    ));
+                }
+            }
+            None => match fs::symlink_metadata(&target) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+                Ok(_) => {
+                    return Err(format!(
+                        "Yeni dosya kopyada zaten mevcut: {}",
+                        file.relative
+                    ));
+                }
+            },
+        }
+        targets.push(target);
+    }
+    for (file, target) in plan.files.iter().zip(targets) {
+        fs::write(&target, &file.updated)
+            .map_err(|e| format!("Aday kopyaya yazilamadi ({}): {e}", file.relative))?;
+    }
+    Ok(())
+}
+
+/// Bu fonksiyonu cagiran agent, VerifyConsent iznini onceden almis olmalidir.
+/// Gecici kopya bir isletim sistemi sandbox'i degildir.
+pub async fn verify_workspace(
+    root: &Path,
+    plan: &WorkspacePlan,
+    mode: VerifyMode,
+) -> Result<WorkspaceVerification, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    require_cargo(&root)?;
+    crate::workspace_patch::revalidate(&root, plan)?;
+    let mut workspace = TempWorkspace::create(&root)?;
+    let outcome: Result<(Vec<TestResult>, u64), String> = async {
+        let stats = copy_project(&root, workspace.path())?;
+        crate::workspace_patch::revalidate(&root, plan)?;
+        if project_fingerprint(&root)? != stats.fingerprint {
+            return Err("Proje kopyalama sirasinda degisti; dogrulama baslatilmadi.".into());
+        }
+        stage_workspace_candidate(workspace.path(), plan)?;
+        let tag = workspace.path().file_name().unwrap().to_string_lossy();
+        let target = verification_target(&root, "fiko_workspace_verify", &tag)?;
+        let results = cargo_sequence(workspace.path(), mode, &target).await?;
+        if crate::workspace_patch::revalidate(&root, plan).is_err()
+            || project_fingerprint(&root)? != stats.fingerprint
+        {
+            let evidence = results.iter().map(|result| result.report.as_str()).collect::<Vec<_>>().join("\n");
+            return Err(format!("Kaynak proje dogrulama sirasinda degisti; Verified kaydi uretilmedi. Proje durumu yeniden incelenmeli.\n{evidence}"));
+        }
+        // Build script/proc-macro kodu aday dosyalarini da degistirebilir.
+        // Boyle bir kopya, modelin onerdigi aday icin dogrulama kaniti olamaz.
+        for file in &plan.files {
+            let target = crate::discovery::resolve_existing(workspace.path(), &file.relative)
+                .and_then(|path| matches_candidate(&path, &file.updated));
+            if target != Ok(true) {
+                let evidence = results.iter().map(|result| result.report.as_str()).collect::<Vec<_>>().join("\n");
+                return Err(format!("Dogrulama sirasinda aday degisti/okunamadi: {}. Verified kaydi uretilmedi.\n{evidence}", file.relative));
+            }
+        }
+        Ok((results, stats.fingerprint))
+    }
+    .await;
+    let cleanup_error = workspace.cleanup().await.err();
+    let (results, project_fingerprint) = outcome?;
+    Ok(WorkspaceVerification {
+        results,
+        mode,
+        project_fingerprint,
+        cleanup_error,
+    })
+}
+
+/// Gecici dogrulama izni ve gercek cargo check+test'i acikca kapsayan tek
+/// workspace onayindan sonra cagirilir.
+/// Tum dosyalar uygulandiktan sonra gercek projeyi bir butun olarak dogrular.
+pub async fn verify_workspace_applied(root: &Path) -> Result<Vec<TestResult>, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    require_cargo(&root)?;
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        WORKSPACE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let target = verification_target(&root, "fiko_workspace_applied", &tag)?;
+    cargo_sequence(&root, VerifyMode::Test, &target).await
+}
+
 async fn run_in_workspace(
     root: &Path,
     workspace: &Path,
@@ -490,7 +782,8 @@ async fn run_in_workspace(
     fs::write(&candidate, &plan.updated)
         .map_err(|e| format!("Aday gecici kopyaya yazilamadi: {e}"))?;
 
-    let target_dir = strip_verbatim(&root.join("target").join(VERIFY_TARGET_SUBDIR));
+    let tag = workspace.file_name().unwrap().to_string_lossy();
+    let target_dir = verification_target(root, VERIFY_TARGET_SUBDIR, &tag)?;
     let result = run_cargo(
         workspace,
         mode,
@@ -514,12 +807,7 @@ pub async fn verify_candidate(
     let root = root
         .canonicalize()
         .map_err(|e| format!("Proje koku cozulemedi: {e}"))?;
-    if !root.join("Cargo.toml").is_file() {
-        return Err(
-            "Cargo.toml bulunamadi; cargo dogrulamasi yalnizca Rust projelerinde yapilabilir."
-                .into(),
-        );
-    }
+    require_cargo(&root)?;
     let relative = plan
         .path
         .strip_prefix(&root)
@@ -615,6 +903,236 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::tools::prepare_patch;
+    use crate::workspace_patch::{FileChange, prepare};
+
+    #[tokio::test]
+    async fn bilinmeyen_projede_cargo_dogrulamasi_calismamali() {
+        let root = mini_crate("unsupported_workspace");
+        fs::remove_file(root.join("Cargo.toml")).unwrap();
+        let plan = prepare(
+            &root,
+            &[FileChange::Edit {
+                path: "src/main.rs".into(),
+                old_text: MINI_OLD.into(),
+                new_text: MINI_GOOD.into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            verification_kind(&root).unwrap(),
+            VerificationKind::Unsupported
+        );
+        let error = verify_workspace(&root, &plan, VerifyMode::Test)
+            .await
+            .unwrap_err();
+        assert!(error.contains("CALISTIRILMADI"), "{error}");
+        assert!(verify_workspace_applied(&root).await.is_err());
+        assert!(!root.join("target").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            MINI_MAIN
+        );
+        remove(&root);
+    }
+
+    #[test]
+    fn manifest_dizin_ise_proje_cargo_sayilmamali() {
+        let root = mini_crate("manifest_directory");
+        fs::remove_file(root.join("Cargo.toml")).unwrap();
+        fs::create_dir(root.join("Cargo.toml")).unwrap();
+        assert!(
+            verification_kind(&root)
+                .unwrap_err()
+                .contains("normal bir dosya")
+        );
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn kopyadaki_ikinci_hedef_degisirse_hicbir_aday_yazilmamali() {
+        let root = mini_crate("copy_drift");
+        let original_other = "pub fn value() -> u32 { 1 }\n";
+        fs::write(root.join("src/other.rs"), original_other).unwrap();
+        let plan = prepare(
+            &root,
+            &[
+                FileChange::Edit {
+                    path: "src/main.rs".into(),
+                    old_text: MINI_OLD.into(),
+                    new_text: MINI_GOOD.into(),
+                },
+                FileChange::Edit {
+                    path: "src/other.rs".into(),
+                    old_text: original_other.into(),
+                    new_text: "pub fn value() -> u32 { 2 }\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let mut workspace = TempWorkspace::create(&root).unwrap();
+        copy_project(&root, workspace.path()).unwrap();
+        fs::write(
+            workspace.path().join("src/other.rs"),
+            "pub fn value() -> u32 { 3 }\n",
+        )
+        .unwrap();
+        assert!(
+            stage_workspace_candidate(workspace.path(), &plan)
+                .unwrap_err()
+                .contains("hedef degisti")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("src/main.rs")).unwrap(),
+            MINI_MAIN
+        );
+        workspace.cleanup().await.unwrap();
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn cok_dosyali_aday_butun_proje_olarak_dogrulanmali() {
+        let root = mini_crate("workspace_verify");
+        let plan = prepare(&root, &[
+            FileChange::Edit {
+                path: "src/main.rs".into(), old_text: MINI_MAIN.into(),
+                new_text: "mod helper;\nfn main() { assert_eq!(helper::value(), 2); }\n#[test]\nfn value_test() { assert_eq!(helper::value(), 2); }\n".into(),
+            },
+            FileChange::Create { path: "src/helper.rs".into(), content: "pub fn value() -> u32 { 2 }\n".into() },
+        ]).unwrap();
+        let before = project_fingerprint(&root).unwrap();
+        let report = verify_workspace(&root, &plan, VerifyMode::Test)
+            .await
+            .unwrap();
+        assert!(report.success(), "{}", report.render());
+        assert_eq!(report.results.len(), 2);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.exit_code == Some(0))
+        );
+        assert_eq!(report.project_fingerprint, before);
+        assert_eq!(project_fingerprint(&root).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            MINI_MAIN
+        );
+        assert!(!root.join("src/helper.rs").exists());
+        assert!(report.cleanup_error.is_none());
+        remove(&root);
+    }
+
+    #[tokio::test]
+    async fn build_script_adayi_degistirirse_basarili_surec_kilit_uretememeli() {
+        let root = mini_crate("workspace_mutating_build");
+        let original = "pub fn value() -> u32 { 1 }\n";
+        fs::write(root.join("src/helper.rs"), original).unwrap();
+        fs::write(root.join("build.rs"), "fn main() { std::fs::write(\"src/helper.rs\", \"pub fn value() -> u32 { 3 }\\n\").unwrap(); }\n").unwrap();
+        let plan = prepare(
+            &root,
+            &[FileChange::Edit {
+                path: "src/helper.rs".into(),
+                old_text: original.into(),
+                new_text: "pub fn value() -> u32 { 2 }\n".into(),
+            }],
+        )
+        .unwrap();
+        let error = verify_workspace(&root, &plan, VerifyMode::Check)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Verified kaydi uretilmedi"), "{error}");
+        assert!(
+            error.contains("Durum: succeeded") && error.contains("Cikis kodu: 0"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/helper.rs")).unwrap(),
+            original
+        );
+        remove(&root);
+    }
+
+    #[test]
+    fn eksik_test_sureci_dogrulanmis_sayilmamali() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        let result = TestResult::from_output(
+            "cargo check".into(),
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        let mut report = WorkspaceVerification {
+            results: vec![result],
+            mode: VerifyMode::Test,
+            project_fingerprint: 1,
+            cleanup_error: None,
+        };
+        assert!(
+            !report.success(),
+            "Test modu icin sadece cargo check yeterli degil"
+        );
+        report.results.clear();
+        report.mode = VerifyMode::Check;
+        assert!(!report.success());
+        assert!(report.render().contains("CALISTIRILMADI"));
+    }
+
+    #[tokio::test]
+    async fn gecici_build_script_kaynak_projeyi_degistirirse_kilit_uretilmemeli() {
+        let root = mini_crate("workspace_source_drift");
+        let changed = MINI_MAIN.replace(MINI_OLD, "let value: i32 = 99;");
+        fs::write(
+            root.join("build.rs"),
+            format!(
+                "fn main() {{ std::fs::write({:?}, {:?}).unwrap(); }}",
+                root.join("src/main.rs"),
+                changed
+            ),
+        )
+        .unwrap();
+        let plan = prepare(
+            &root,
+            &[FileChange::Edit {
+                path: "src/main.rs".into(),
+                old_text: MINI_OLD.into(),
+                new_text: MINI_GOOD.into(),
+            }],
+        )
+        .unwrap();
+        let result = verify_workspace(&root, &plan, VerifyMode::Check).await;
+        let actual = fs::read_to_string(root.join("src/main.rs")).unwrap();
+        remove(&root);
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Kaynak proje dogrulama sirasinda degisti"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Cikis kodu: 0"),
+            "Gercek surec kaniti korunmali: {error}"
+        );
+        assert_eq!(actual, changed);
+    }
+
+    #[tokio::test]
+    async fn kopya_limiti_dosya_okunmadan_denetlenmeli() {
+        let root = mini_crate("copy_byte_limit");
+        fs::File::create(root.join("too_large.bin"))
+            .unwrap()
+            .set_len(MAX_COPY_BYTES + 1)
+            .unwrap();
+        let mut workspace = TempWorkspace::create(&root).unwrap();
+        let error = copy_project(&root, workspace.path()).unwrap_err();
+        assert!(error.contains("kopya sinirini"), "{error}");
+        assert!(!workspace.path().join("too_large.bin").exists());
+        workspace.cleanup().await.unwrap();
+        remove(&root);
+    }
 
     #[test]
     fn tamamlanmamis_komut_aday_hatasi_sayilmamali_ve_kanit_korunmali() {
