@@ -312,6 +312,21 @@ pub struct WorkspaceRecord {
     pub files: Vec<RecordedFile>,
 }
 
+impl WorkspaceRecord {
+    /// Geri alma raporu, yazma baslamadan olusan hatayi uygulama saymaz.
+    pub(crate) fn has_writes(&self) -> bool {
+        self.files.iter().any(|record| {
+            record.written.as_ref().is_some_and(|written| {
+                record
+                    .file
+                    .original
+                    .as_ref()
+                    .is_none_or(|original| written != original.as_bytes())
+            })
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct ApplyError {
     pub message: String,

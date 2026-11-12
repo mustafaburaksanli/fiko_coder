@@ -24,8 +24,10 @@ use serde_json::{Map, Value};
 use crate::agent::{
     PatchEffect, Prompter, Session, ToolOutcome, handle_tool_call, task_status_line,
 };
+use crate::context::ContextBudget;
 use crate::execution::TaskPhase;
 use crate::intent::{self, IntentDecision, TaskIntent, WriteAuthority};
+use crate::planning::TaskPlan;
 use crate::repair_controller::RepairController;
 use crate::tools::{ExecutionStatus, TestResult};
 
@@ -79,6 +81,7 @@ const FAILURE_PREFIXES: &[&str] = &[
     "TEST_REJECTED",
     "WORKSPACE_APPLY_FAILED",
     "WORKSPACE_FAILED",
+    "BAGLAM_SINIRI:",
 ];
 
 pub fn is_failure(output: &str) -> bool {
@@ -438,7 +441,10 @@ pub struct Orchestrator {
     /// Onay verilmedigi icin surec sonucu olusmayan, dogrulanmis arac denemeleri.
     unexecuted_tests: Vec<String>,
     workspace_reports: Vec<String>,
-    workspace_targets: Vec<String>,
+    plan: Option<TaskPlan>,
+    plan_verified: bool,
+    context_budget: ContextBudget,
+    patch_events: Vec<PatchEffect>,
 }
 
 impl Orchestrator {
@@ -448,6 +454,7 @@ impl Orchestrator {
         } else {
             decision.intent.write_authority()
         };
+        let plan = (decision.intent == TaskIntent::Modify).then(|| TaskPlan::new(""));
         Self {
             decision,
             authority,
@@ -459,7 +466,10 @@ impl Orchestrator {
             test_results: Vec::new(),
             unexecuted_tests: Vec::new(),
             workspace_reports: Vec::new(),
-            workspace_targets: Vec::new(),
+            plan,
+            plan_verified: false,
+            context_budget: ContextBudget::default(),
+            patch_events: Vec::new(),
         }
     }
 
@@ -467,7 +477,7 @@ impl Orchestrator {
     pub fn for_request(request: &str) -> Self {
         let mut task = Self::new(intent::classify(request));
         if task.intent() == TaskIntent::Modify {
-            task.workspace_targets = intent::workspace_write_targets(request);
+            task.plan = Some(TaskPlan::new(request));
         }
         task
     }
@@ -486,6 +496,56 @@ impl Orchestrator {
 
     pub fn phase(&self) -> TaskPhase {
         self.repair.phase()
+    }
+
+    pub fn plan(&self) -> Option<&TaskPlan> {
+        self.plan.as_ref()
+    }
+
+    pub fn context_bytes(&self) -> usize {
+        self.context_budget.used()
+    }
+
+    pub(crate) fn context_key(&self, name: &str, args: &Value) -> String {
+        if self.plan.is_some()
+            && READ_TOOLS.contains(&name)
+            && let Ok(mut normalized) = validate_args(name, args)
+        {
+            if let Some(path) = normalized["path"].as_str()
+                && let Ok(path) = crate::context::normalize_path(path)
+            {
+                normalized["path"] = Value::String(if cfg!(windows) {
+                    path.to_lowercase()
+                } else {
+                    path
+                });
+            }
+            call_key(name, &normalized)
+        } else {
+            call_key(name, args)
+        }
+    }
+
+    pub fn context_hint(&self, root: &std::path::Path) -> String {
+        self.plan.as_ref().map_or_else(String::new, |plan| {
+            crate::context::hint(root, &plan.inspection_targets)
+        })
+    }
+
+    pub fn plan_report(&self) -> String {
+        self.plan.as_ref().map_or_else(String::new, |plan| {
+            plan.report(self.phase(), self.plan_verified)
+        })
+    }
+
+    fn project_description(&self) -> &'static str {
+        if self.project_state == ProjectState::Unchanged
+            && self.patch_events.contains(&PatchEffect::Restored)
+        {
+            "uygulama basarisiz olduktan sonra GERI ALINDI"
+        } else {
+            self.project_state.description()
+        }
     }
 
     pub fn stats(&self) -> &ToolStats {
@@ -624,7 +684,7 @@ impl Orchestrator {
         format!(
             "INTENT_BLOCKED: {name} bu gorevde kullanilamaz. Gorev turu: {} ({reason}). Ana proje {}.\nsonraki_adim: Bulgularini KANITLANMIS HATA / POTANSIYEL RISK olarak raporla; kod degisikligi icin kullanici ayri bir gorevle acikca istemeli.",
             self.decision.intent,
-            self.project_state.description()
+            self.project_description()
         )
     }
 
@@ -637,6 +697,7 @@ impl Orchestrator {
         announce: bool,
     ) -> ToolOutcome {
         self.repair.clear_pending_workspace();
+        self.plan_verified = false;
         let phase = self.phase();
         if stop.is_some() && self.intent() == TaskIntent::Generate && !phase.is_terminal() {
             self.repair.enter(TaskPhase::Blocked);
@@ -658,6 +719,7 @@ impl Orchestrator {
             patch_effect: PatchEffect::None,
             test_result: None,
             workspace_report: None,
+            candidate_verified: false,
         }
     }
 
@@ -676,8 +738,11 @@ impl Orchestrator {
         if WRITE_PATH_TOOLS.contains(&name) && name != "apply_workspace" {
             self.repair.clear_pending_workspace();
         }
+        if WRITE_PATH_TOOLS.contains(&name) {
+            self.plan_verified = false;
+        }
         self.stats.calls += 1;
-        let key = call_key(name, raw_args);
+        let key = self.context_key(name, raw_args);
         let repeats = self.ledger.repeats(&key);
 
         // 1) Dongu ve toplam cagri korumasi.
@@ -685,7 +750,7 @@ impl Orchestrator {
             self.stats.loop_stops += 1;
             let output = format!(
                 "TOOL_LIMIT: Bu gorevde {MAX_TOOL_CALLS_PER_TASK} arac cagrisi sinirina ulasildi; gorev durduruldu. Ana proje {}.",
-                self.project_state.description()
+                self.project_description()
             );
             return Ok(self.refuse(
                 name,
@@ -699,7 +764,7 @@ impl Orchestrator {
             self.stats.loop_stops += 1;
             let output = format!(
                 "LOOP_BLOCKED: {name} ayni argumanlarla {MAX_IDENTICAL_CALLS}. kez cagrildi; gorev durduruldu. Ana proje {}.",
-                self.project_state.description()
+                self.project_description()
             );
             return Ok(self.refuse(
                 name,
@@ -750,48 +815,6 @@ impl Orchestrator {
                 return Ok(self.refuse(name, key, format!("ERROR: {detail}"), None, false));
             }
         };
-        if matches!(name, "verify_workspace" | "apply_workspace") {
-            let path_key = |path: &str| {
-                let path = path.replace('\\', "/");
-                let path = std::path::Path::new(&path)
-                    .components()
-                    .filter_map(|component| match component {
-                        std::path::Component::Normal(name) => {
-                            Some(name.to_string_lossy().into_owned())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/");
-                if cfg!(windows) {
-                    path.to_lowercase()
-                } else {
-                    path
-                }
-            };
-            let targets: Vec<_> = args["changes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|change| change["path"].as_str())
-                .map(path_key)
-                .collect();
-            let missing: Vec<_> = self
-                .workspace_targets
-                .iter()
-                .filter(|path| !targets.contains(&path_key(path)))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                self.stats.invalid_args += 1;
-                let output = format!(
-                    "ERROR: Workspace plani acik degisiklik hedeflerini kapsamiyor: {}. Eksik plan dogrulanmadi veya uygulanmadi; tam changes listesi gerekir.",
-                    missing.join(", ")
-                );
-                return Ok(self.refuse(name, key, output, None, true));
-            }
-        }
-
         // 4) Yazma yoluna giden araclar: asama ve niyet kapisi.
         if name == "run_tests" && self.phase().is_terminal() {
             let output = format!(
@@ -805,7 +828,7 @@ impl Orchestrator {
             if phase.is_terminal() {
                 let output = format!(
                     "TASK_ENDED: Gorev '{phase}' durumunda sonlandi; {name} artik kullanilamaz. Ana proje {}. Kullaniciya sonucu ozetle.",
-                    self.project_state.description()
+                    self.project_description()
                 );
                 return Ok(self.refuse(name, key, output, None, true));
             }
@@ -813,6 +836,20 @@ impl Orchestrator {
                 self.stats.intent_blocked += 1;
                 let output = self.intent_block_text(name);
                 return Ok(self.refuse(name, key, output, None, true));
+            }
+        }
+
+        // Plan, yalniz terminal/niyet/izin kapilarini gecen adaya ait olabilir.
+        if WRITE_PATH_TOOLS.contains(&name)
+            && let Some(plan) = &mut self.plan
+        {
+            let previous = plan.targets.clone();
+            if let Err(error) = plan.prepare_candidate(name, &args) {
+                self.stats.invalid_args += 1;
+                return Ok(self.refuse(name, key, format!("ERROR: Plan: {error}"), None, true));
+            }
+            if previous != plan.targets {
+                println!("{}", plan.note());
             }
         }
 
@@ -831,7 +868,7 @@ impl Orchestrator {
         let command_result = (name == "run_tests")
             .then_some(outcome.test_result.as_ref())
             .flatten();
-        let failed = command_result.map_or_else(
+        let mut failed = command_result.map_or_else(
             || name == "run_tests" || is_failure(&outcome.output),
             |result| result.status != ExecutionStatus::Succeeded,
         );
@@ -855,10 +892,12 @@ impl Orchestrator {
 
         // 6) Tekrar okuma: icerik degismediyse tam ciktiyi yeniden gondermek yerine kisa not.
         let mut stored = None;
+        let mut context_reused = false;
         if !failed && READ_TOOLS.contains(&name) {
             match self.ledger.last_success_output(&key) {
                 Some((number, previous)) if previous == outcome.output => {
                     self.stats.duplicate_reads += 1;
+                    context_reused = true;
                     self.stats.saved_chars += outcome.output.chars().count();
                     stored = Some(previous.to_string());
                     outcome.output = format!(
@@ -869,9 +908,27 @@ impl Orchestrator {
                 _ => stored = Some(outcome.output.clone()),
             }
         }
+        if READ_TOOLS.contains(&name) && self.plan.is_some() {
+            if !context_reused && let Err(error) = self.context_budget.record(outcome.output.len())
+            {
+                outcome.output = error;
+                stored = None;
+                failed = true;
+            }
+            if !failed
+                && matches!(name, "read_file" | "read_lines" | "search_in_file")
+                && let Some(path) = args["path"].as_str()
+                && let Some(plan) = &mut self.plan
+            {
+                plan.inspect(path);
+            }
+        }
         // Tipli etkiyi yalnizca gercek apply_patch cagrisi tasiyabilir. Okunan
         // kaynakta PATCH_VERIFIED yazmasi bu durumu degistiremez.
         if matches!(name, "apply_patch" | "apply_workspace" | "verify_workspace") {
+            if outcome.patch_effect != PatchEffect::None {
+                self.patch_events.push(outcome.patch_effect);
+            }
             match outcome.patch_effect {
                 PatchEffect::None => {}
                 PatchEffect::Uncertain => self.project_state = ProjectState::Uncertain,
@@ -883,6 +940,9 @@ impl Orchestrator {
                 }
                 PatchEffect::Verified | PatchEffect::Restored => {}
             }
+        }
+        if WRITE_PATH_TOOLS.contains(&name) {
+            self.plan_verified = outcome.candidate_verified || self.applied();
         }
         self.ledger.record(CallRecord {
             key,
@@ -938,7 +998,34 @@ impl Orchestrator {
     /// Gorev sonunda kullaniciya gosterilen Rust tarafi gercegi + olculebilir sayaclar.
     pub fn status_report(&self) -> String {
         let stats = &self.stats;
-        let mut lines = vec![self.project_state.status_line().to_string()];
+        let restored = self.project_state == ProjectState::Unchanged
+            && self.patch_events.contains(&PatchEffect::Restored);
+        let mut lines = vec![if restored {
+            "[DURUM] Bu gorevde degisiklikler UYGULANDI; uygulama/son dogrulama basarisiz oldu ve GERI ALINDI. Islem hedeflerinin geri alindigi Rust tarafinda teyit edildi.".to_owned()
+        } else {
+            self.project_state.status_line().to_owned()
+        }];
+        for (index, event) in self.patch_events.iter().enumerate() {
+            let description = match event {
+                PatchEffect::Verified => "Uygulandi ve cargo check + cargo test ile dogrulandi.",
+                PatchEffect::Restored => {
+                    "Uygulama basarisiz oldu; degisiklikler basariyla geri alindi."
+                }
+                PatchEffect::Uncertain => {
+                    "Kaynak/uygulama/rollback durumu kesin teyit edilemedi: Uncertain."
+                }
+                PatchEffect::None => continue,
+            };
+            lines.push(format!("[ISLEM GECMISI] #{} {description}", index + 1));
+        }
+        if self.plan.is_some() {
+            lines.push(self.plan_report());
+            lines.push(format!(
+                "[BAGLAM] {} byte yeni okuma icerigi sunuldu; {} byte butce kaldi.",
+                self.context_budget.used(),
+                self.context_budget.remaining()
+            ));
+        }
         for result in &self.test_results {
             lines.push(result.summary_line());
         }

@@ -1,4 +1,4 @@
-//! FIKO CODER v1.0 - MULTI-FILE WORKSPACE ENGINE
+//! FIKO CODER v1.1 - INTELLIGENT CODE PLANNING ENGINE
 //!
 //! Moduller:
 //! - tools: dosya araclari, cargo, patch hazirlama, yedekleme / geri alma
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut messages: Vec<Value> = vec![system.clone()];
 
     println!("=================================");
-    println!("  FIKO CODER v1.0 - MULTI-FILE WORKSPACE ENGINE");
+    println!("  FIKO CODER v1.1 - INTELLIGENT CODE PLANNING ENGINE");
     println!("=================================");
     println!("Model: {model}");
     println!("Proje: {}", root.display());

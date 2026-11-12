@@ -128,6 +128,8 @@ pub struct ToolOutcome {
     pub(crate) test_result: Option<tools::TestResult>,
     /// Gercek workspace handler'inin Rust tarafinda uretilmis kanit raporu.
     pub(crate) workspace_report: Option<String>,
+    /// Yalniz gercek verification handler'indan gelen aday kaniti; model metni degil.
+    pub(crate) candidate_verified: bool,
 }
 
 impl ToolOutcome {
@@ -138,6 +140,7 @@ impl ToolOutcome {
             patch_effect: PatchEffect::None,
             test_result: None,
             workspace_report: None,
+            candidate_verified: false,
         }
     }
 
@@ -148,11 +151,17 @@ impl ToolOutcome {
             patch_effect: PatchEffect::None,
             test_result: None,
             workspace_report: None,
+            candidate_verified: false,
         }
     }
 
     pub(crate) fn with_patch_effect(mut self, effect: PatchEffect) -> Self {
         self.patch_effect = effect;
+        self
+    }
+
+    pub(crate) fn with_verified_candidate(mut self) -> Self {
+        self.candidate_verified = true;
         self
     }
 }
@@ -161,7 +170,7 @@ impl ToolOutcome {
 // SISTEM ISTEMI
 // ============================================================
 pub fn system_prompt() -> &'static str {
-    "Sen FIKO CODER v1.0 adli yerel Rust kodlama ajanisin. Turkce yanit ver.\n\
+    "Sen FIKO CODER v1.1 adli yerel Rust kodlama ajanisin. Turkce yanit ver.\n\
 \n\
 GOREV TURU: Her gorevin turunu Rust tarafi belirler ve kullanici mesajina [FIKO NOT] olarak ekler. Analyze/Explain/Test gorevlerinde dosya degistirilmez; verify_candidate ve apply_patch INTENT_BLOCKED ile reddedilir. Bu gorevlerde kodu oku ve bulgulari raporla.\n\
 COK DOSYALI GOREV: Yalniz acik Modify niyetinde verify_workspace ile changes dizisini gecici kopyada dogrula; ayni changes ile apply_workspace kullan. operation=edit icin path/old_text/new_text, operation=create icin path/content ver. Tum dosyalar tek diff ve kullanici onayi altindadir. Silme, tasima ve yeni dizin olusturma desteklenmez; Cargo disindaki projeler su an dogrulanip uygulanamaz. Buyuk dosyalari read_lines ile sinirli araliklarda oku; belirli dosyada search_in_file kullan.\n\
@@ -260,7 +269,7 @@ fn finish_verification(
                 repair.required_mode().as_str()
             ));
         }
-        return ToolOutcome::output(output);
+        return ToolOutcome::output(output).with_verified_candidate();
     }
 
     println!(
@@ -314,6 +323,7 @@ async fn verify_candidate_flow<P: Prompter>(
             patch_effect: PatchEffect::None,
             test_result: None,
             workspace_report: None,
+            candidate_verified: false,
         });
     }
     let plan = match tools::prepare_patch(&session.root, path, old_text, new_text) {
@@ -572,6 +582,7 @@ async fn apply_patch_flow<P: Prompter>(
                 patch_effect: PatchEffect::Restored,
                 test_result: None,
                 workspace_report: None,
+                candidate_verified: false,
             })
         }
         Err(e) => {
@@ -787,12 +798,37 @@ async fn run_task_at<P: Prompter>(
     let mut test_dispatch_attempted = false;
     let mut modify_plan_retry_used = false;
     let mut modify_write_attempted = false;
+    let mut read_message_indices = std::collections::HashMap::<String, usize>::new();
     println!("{}", task.intent_line());
+    if task.plan().is_some() {
+        println!("{}", task.plan_report());
+        // Onceki gorevin okuma govdeleri guncel kaynak kaniti degildir.
+        for message in messages.iter_mut() {
+            if message["role"] == "tool"
+                && message["tool_name"]
+                    .as_str()
+                    .is_some_and(|name| crate::orchestrator::READ_TOOLS.contains(&name))
+            {
+                message["content"] = json!(
+                    "[BAGLAM] Onceki gorevin okuma sonucu eskimis olabilir; gerekiyorsa guncel kaynagi yeniden oku."
+                );
+            }
+        }
+    }
     // Gorev turu ve kisa yol gosterici, modele kullanici mesajinin parcasi olarak verilir.
     if let Some(last) = messages.last_mut()
         && last["role"] == "user"
     {
-        last["content"] = json!(format!("{request}\n\n{}", task.request_note()));
+        let note = if let Some(plan) = task.plan() {
+            format!(
+                "[FIKO NOT] Gorev turu: Modify.\n{}\n{}",
+                plan.note(),
+                task.context_hint(&session.root)
+            )
+        } else {
+            task.request_note()
+        };
+        last["content"] = json!(format!("{request}\n\n{note}"));
     }
 
     'agent: for step in 0..MAX_AGENT_ROUNDS {
@@ -951,7 +987,20 @@ async fn run_task_at<P: Prompter>(
             let args = tool_arguments(&call);
             test_dispatch_attempted |= name == "run_tests";
             modify_write_attempted |= WRITE_PATH_TOOLS.contains(&name);
+            let duplicates_before = task.stats().duplicate_reads;
             let outcome = execute_task_tool(&mut task, session, prompter, name, &args).await?;
+            if task.plan().is_some()
+                && crate::orchestrator::READ_TOOLS.contains(&name)
+                && task.stats().duplicate_reads == duplicates_before
+                && !crate::orchestrator::is_failure(&outcome.output)
+            {
+                let key = task.context_key(name, &args);
+                if let Some(previous) = read_message_indices.insert(key, messages.len()) {
+                    messages[previous]["content"] = json!(
+                        "[BAGLAM] Bu okumanin guncel sonucu sonraki arac mesajinda; eski govde baglamdan cikarildi."
+                    );
+                }
+            }
             messages.push(json!({
                 "role": "tool",
                 "tool_name": name,
@@ -2237,7 +2286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basarili_rollback_degismemis_proje_olarak_raporlanmali() {
+    async fn basarili_rollback_uygulanip_geri_alindi_olarak_raporlanmali() {
         let root = mini_crate("rollback_restored");
         let fixture =
             format!("{MINI_MAIN}\n#[test]\nfn fails() {{ panic!(\"kontrollu test hatasi\"); }}\n");
@@ -2266,9 +2315,14 @@ mod tests {
         assert_eq!(content, fixture);
         assert_eq!(task.phase(), TaskPhase::Failed);
         assert!(!task.applied());
+        let first = report.lines().next().unwrap();
         assert!(
-            report.contains("[DURUM] Bu gorevde ana proje DEGISMEDI"),
+            first.contains("UYGULANDI") && first.contains("GERI ALINDI"),
             "{report}"
+        );
+        assert!(
+            !first.contains("DEGISMEDI"),
+            "Uygulama gecmisi gizlenmemeli: {report}"
         );
         assert!(!report.contains("BELIRSIZ"));
     }
@@ -2688,4 +2742,5 @@ fn fail_after_removing_own_backup() {
 
     include!("workspace_approval_tests.rs");
     include!("workspace_planning_tests.rs");
+    include!("task_plan_tests.rs");
 }

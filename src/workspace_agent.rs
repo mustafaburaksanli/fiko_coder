@@ -145,10 +145,15 @@ async fn verify_plan<P: Prompter>(
             } else {
                 "VERIFY_FAILED"
             };
-            Ok(ToolOutcome::output(format!(
+            let outcome = ToolOutcome::output(format!(
                 "{status}: Workspace gecici kopyasi; ana proje degismedi.\n{}",
                 report.render()
-            )))
+            ));
+            Ok(if success {
+                outcome.with_verified_candidate()
+            } else {
+                outcome
+            })
         }
         Err(error) => {
             repair.record_workspace_failure(plan);
@@ -287,11 +292,20 @@ pub(crate) async fn apply<P: Prompter>(
                 ),
                 "Workspace uygulamasi basarisiz.",
             )
-            .with_patch_effect(if restored {
-                PatchEffect::Restored
-            } else {
-                PatchEffect::Uncertain
-            }));
+            .with_patch_effect(
+                if restored
+                    && error
+                        .record
+                        .as_ref()
+                        .is_some_and(|record| record.has_writes())
+                {
+                    PatchEffect::Restored
+                } else if restored {
+                    PatchEffect::None
+                } else {
+                    PatchEffect::Uncertain
+                },
+            ));
         }
     };
     let verification = verification::verify_workspace_applied(&session.root).await;
