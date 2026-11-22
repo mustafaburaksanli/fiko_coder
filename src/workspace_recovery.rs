@@ -499,7 +499,7 @@ fn stage_original_and_replace(
             Err(e) => return Err(format!("Geri yukleme gecici dosyasi olusturulamadi: {e}")),
         }
     }
-    let (mut staged, stage_path) = created.ok_or("Gecici dosya adlari kullaniliyor.")?;
+    let (stage_handle, stage_path) = created.ok_or("Gecici dosya adlari kullaniliyor.")?;
     // If the process dies, Drop is not invoked and an orphan staging file may
     // remain for manual review. On ordinary failures, clean up our own file.
     struct StageCleanup(Option<PathBuf>);
@@ -511,6 +511,9 @@ fn stage_original_and_replace(
         }
     }
     let mut cleanup = StageCleanup(Some(stage_path.clone()));
+    // Declare the live file handle AFTER the cleanup guard, so it closes
+    // before cleanup runs on early return (required on Windows).
+    let mut staged = stage_handle;
     staged.write_all(bytes).map_err(|e| e.to_string())?;
     staged.sync_all().map_err(|e| e.to_string())?;
     // Preserve source permissions, including Unix executable bits. Timestamp
