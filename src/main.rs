@@ -42,8 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let root = std::env::current_dir()?.canonicalize()?;
-    if model == "--recovery-audit" {
-        match fiko_coder::workspace_recovery::audit(&root) {
+    if model == "--recovery-audit" || model == "--recovery-plan" {
+        let report = if model == "--recovery-plan" {
+            fiko_coder::workspace_recovery::restoration_preview(&root)
+        } else {
+            fiko_coder::workspace_recovery::audit(&root)
+        };
+        match report {
             Ok(report) => println!("{report}"),
             Err(error) => {
                 eprintln!("[RECOVERY] {error}");
