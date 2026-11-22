@@ -474,7 +474,10 @@ fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), S
         return Err(format!("{}: Source is not a normal file.", file.relative));
     }
 
-    let parent = file.path.parent().ok_or("Source parent directory is missing.")?;
+    let parent = file
+        .path
+        .parent()
+        .ok_or("Source parent directory is missing.")?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -487,7 +490,11 @@ fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), S
             stamp,
             attempt
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&stage_path) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+        {
             Ok(stage_file) => {
                 created = Some((stage_file, stage_path));
                 break;
@@ -537,16 +544,25 @@ fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), S
     drop(staged);
 
     let stage_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
-    if !stage_metadata.is_file() || is_link(&stage_metadata) || stage_metadata.len() != bytes.len() as u64 {
+    if !stage_metadata.is_file()
+        || is_link(&stage_metadata)
+        || stage_metadata.len() != bytes.len() as u64
+    {
         return Err(format!("{}: Staged file metadata changed.", file.relative));
     }
     if read_bytes(&stage_path)? != bytes {
-        return Err(format!("{}: Staged file contents do not match.", file.relative));
+        return Err(format!(
+            "{}: Staged file contents do not match.",
+            file.relative
+        ));
     }
     revalidate_file(root, file)?;
     // Recheck the staged copy as late as possible before replacement.
     if read_bytes(&stage_path)? != bytes {
-        return Err(format!("{}: Staged file changed before replacement.", file.relative));
+        return Err(format!(
+            "{}: Staged file changed before replacement.",
+            file.relative
+        ));
     }
     fs::rename(&stage_path, &file.path)
         .map_err(|e| format!("{}: Could not replace source: {e}", file.relative))?;
@@ -555,7 +571,10 @@ fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), S
     // safely enter rollback. A killed process still leaves a pending marker.
     record.written = Some(bytes.to_vec());
     if read_bytes(&file.path)? != bytes {
-        return Err(format!("{}: Source did not match staged contents.", file.relative));
+        return Err(format!(
+            "{}: Source did not match staged contents.",
+            file.relative
+        ));
     }
     Ok(())
 }
@@ -1543,18 +1562,24 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        child.kill().expect("unable to terminate staged apply child");
+        child
+            .kill()
+            .expect("unable to terminate staged apply child");
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success());
 
         assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), original);
         let marker = project.0.join(".fiko_backups/workspace.pending.json");
-        assert!(marker.is_file(), "interrupted apply must retain pending marker");
+        assert!(
+            marker.is_file(),
+            "interrupted apply must retain pending marker"
+        );
         let orphan_stages: Vec<_> = fs::read_dir(project.0.join("src"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
-                entry.file_name()
+                entry
+                    .file_name()
                     .to_string_lossy()
                     .starts_with(".fiko_apply_stage_")
             })
@@ -1562,7 +1587,10 @@ mod tests {
         assert_eq!(orphan_stages.len(), 1);
         let staged_bytes = fs::read(orphan_stages[0].path()).unwrap();
         let updated = b"pub fn a() -> u8 { 3 }\n";
-        assert_eq!(staged_bytes.as_slice(), &updated[..(updated.len() / 2).max(1)]);
+        assert_eq!(
+            staged_bytes.as_slice(),
+            &updated[..(updated.len() / 2).max(1)]
+        );
 
         let report: serde_json::Value =
             serde_json::from_str(&workspace_recovery::restoration_preview(&project.0).unwrap())
@@ -1587,7 +1615,10 @@ mod tests {
         let outside = project.0.parent().unwrap().join(format!(
             "fiko_staged_apply_hardlink_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::hard_link(&source, &outside).unwrap();
         let original = fs::read(&outside).unwrap();
