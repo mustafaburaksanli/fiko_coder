@@ -514,6 +514,25 @@ fn stage_original_and_replace(
     // Declare the live file handle AFTER the cleanup guard, so it closes
     // before cleanup runs on early return (required on Windows).
     let mut staged = stage_handle;
+    // Test-only interruption *during* staged write, before sync/replacement.
+    // Production binaries cannot enable this branch.
+    #[cfg(test)]
+    if step.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_PARTIAL_STAGE_KILL_PROJECT").is_some()
+    {
+        let partial_len = (bytes.len() / 2).max(1);
+        staged
+            .write_all(&bytes[..partial_len])
+            .map_err(|e| e.to_string())?;
+        staged.sync_all().map_err(|e| e.to_string())?;
+        let signal = root.join(".fiko_test_partial_stage_ready");
+        let mut ready = File::create(signal).map_err(|e| e.to_string())?;
+        ready.write_all(b"ready").map_err(|e| e.to_string())?;
+        ready.sync_all().map_err(|e| e.to_string())?;
+        drop(ready);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Partial-stage child should have been terminated.".into());
+    }
     staged.write_all(bytes).map_err(|e| e.to_string())?;
     staged.sync_all().map_err(|e| e.to_string())?;
     // Preserve source permissions, including Unix executable bits. Timestamp
