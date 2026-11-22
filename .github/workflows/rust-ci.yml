@@ -25,6 +25,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit and offline integration tests
         run: cargo test --locked
+      - name: Real subprocess interruption recovery regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
       - name: Stabilization stress (20 parallel + 20 serial runs)
         shell: pwsh
         run: |
@@ -60,3 +62,5 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit and offline integration tests
         run: cargo test --locked
+      - name: Real subprocess interruption recovery regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
