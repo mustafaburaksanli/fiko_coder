@@ -1315,7 +1315,10 @@ mod tests {
 
         child.kill().expect("cannot terminate crash child process");
         let output = child.wait_with_output().unwrap();
-        assert!(!output.status.success(), "child must be forcibly interrupted");
+        assert!(
+            !output.status.success(),
+            "child must be forcibly interrupted"
+        );
 
         assert_eq!(
             read_text(&project.0.join("src/a.rs")).unwrap(),
@@ -1334,8 +1337,14 @@ mod tests {
         );
 
         let audit = workspace_recovery::audit(&project.0).unwrap();
-        assert!(audit.contains("src/a.rs\": updated; backup=intact"), "{audit}");
-        assert!(audit.contains("src/b.rs\": updated; backup=intact"), "{audit}");
+        assert!(
+            audit.contains("src/a.rs\": updated; backup=intact"),
+            "{audit}"
+        );
+        assert!(
+            audit.contains("src/b.rs\": updated; backup=intact"),
+            "{audit}"
+        );
         assert!(
             audit.contains("src/c.rs\": original_absent; backup=not_required"),
             "{audit}"
