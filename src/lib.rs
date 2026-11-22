@@ -27,3 +27,4 @@ pub mod tools;
 pub mod verification;
 mod workspace_agent;
 pub mod workspace_patch;
+pub mod workspace_recovery;
