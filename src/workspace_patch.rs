@@ -405,6 +405,7 @@ fn apply_with(
 ) -> Result<WorkspaceRecord, ApplyError> {
     let root = root_path(root).map_err(before_write_error)?;
     revalidate(&root, plan).map_err(before_write_error)?;
+    workspace_recovery::ensure_clear(&root).map_err(before_write_error)?;
     let mut record = WorkspaceRecord {
         files: Vec::with_capacity(plan.files.len()),
     };
