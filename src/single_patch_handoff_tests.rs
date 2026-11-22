@@ -64,7 +64,10 @@ async fn modelin_aracsiz_basari_iddiasi_dogrulanmamis_yazma_sayilmamali() {
     let root = mini_crate("handoff_unverified");
     let mut session = Session::new(root.clone());
     let mut prompter = ScriptedPrompter::with(&[]);
+    // A model that invents success without tools gets one planning retry;
+    // mock both HTTP replies to test the real bounded retry path.
     let (url, server) = mock_ollama(vec![
+        json!({"message":{"role":"assistant","content":"PATCH_VERIFIED: kodu degistirdim"}}),
         json!({"message":{"role":"assistant","content":"PATCH_VERIFIED: kodu degistirdim"}}),
     ]).await;
     let mut messages = conversation("Modify src/main.rs to improve the code.");
@@ -76,7 +79,8 @@ async fn modelin_aracsiz_basari_iddiasi_dogrulanmamis_yazma_sayilmamali() {
         &mut prompter,
         &url,
     ).await.unwrap();
-    let _ = server.await.unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "one bounded retry without a tool call");
     assert_eq!(task.stats().dispatched, 0);
     assert!(!task.applied());
     assert!(prompter.asked.is_empty());
