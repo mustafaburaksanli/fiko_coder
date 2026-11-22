@@ -57,6 +57,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if model == "--recovery-restore" {
+        use std::io::IsTerminal;
+
+        if !io::stdin().is_terminal() {
+            eprintln!(
+                "[RECOVERY] Geri yukleme yalnizca yerel, etkilesimli terminalden onaylanabilir."
+            );
+            std::process::exit(1);
+        }
+        let preview = fiko_coder::workspace_recovery::restoration_preview(&root)
+            .map_err(|e| format!("Kurtarma plani okunamadi: {e}"))?;
+        let parsed: Value = serde_json::from_str(&preview)?;
+        println!("{preview}");
+        if parsed["status"] != "pending" || parsed["eligible_for_review"] != true {
+            eprintln!(
+                "[RECOVERY] Guvenli geri yukleme kosullari saglanmadi. Once dosyalari elle inceleyin."
+            );
+            std::process::exit(1);
+        }
+        let fingerprint = parsed["marker_fingerprint_sha256"]
+            .as_str()
+            .ok_or("Kurtarma kaydi parmak izi yok.")?;
+        println!(
+            "[UYARI] Bu islem degistirilmis kodu eski yedeklerden geri yukler ve yeni dosyalari silebilir."
+        );
+        println!(
+            "[UYARI] Devam etmeden once projeyi ve .fiko_backups klasorunu BAGIMSIZ olarak yedekleyin."
+        );
+        println!(
+            "[UYARI] Cargo testi veya otomatik onarim yapilmaz; dis sureclerle tam dosya kilidi yoktur."
+        );
+        print!("Acik onay icin tam olarak RESTORE {fingerprint} yazin: ");
+        io::stdout().flush()?;
+        let mut confirmation = String::new();
+        if io::stdin().read_line(&mut confirmation)? == 0
+            || confirmation.trim() != format!("RESTORE {fingerprint}")
+        {
+            eprintln!("[RECOVERY] Onay eslesmedi; dosyalar degistirilmedi.");
+            std::process::exit(1);
+        }
+        match fiko_coder::workspace_recovery::restore_after_explicit_approval(&root, fingerprint) {
+            Ok(report) => println!("{report}"),
+            Err(error) => {
+                eprintln!(
+                    "[RECOVERY] {error} Kayit olasi kismi geri yuklemeyi incelemek icin korunmus olabilir."
+                );
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let client = reqwest::Client::new();
     let mut session = Session::new(root.clone());
     match fiko_coder::memory::MemoryConfig::from_env() {

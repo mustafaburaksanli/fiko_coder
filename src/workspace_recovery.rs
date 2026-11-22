@@ -4,7 +4,7 @@
 //! It never restores files automatically and never grants write authorization.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -418,6 +418,238 @@ pub fn restoration_preview(root: &Path) -> Result<String, String> {
     .map_err(|e| e.to_string())
 }
 
+/// A restore action prepared from a trusted, read-only preview.
+struct RestoreStep {
+    relative: String,
+    target: PathBuf,
+    original_sha256: Option<String>,
+    updated_sha256: String,
+    action: String,
+    backup_bytes: Option<Vec<u8>>,
+}
+
+fn verified_backup_bytes(root: &Path, entry: &Value) -> Result<Vec<u8>, String> {
+    if backup_state(root, entry) != "intact" {
+        return Err("Kurtarma yedegi orijinal SHA256 ile dogrulanmadi.".into());
+    }
+    let name = entry["backup_name"]
+        .as_str()
+        .ok_or("Kurtarma yedegi adi gecersiz.")?;
+    let path = root.join(".fiko_backups").join(name);
+    let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || is_link(&metadata) || metadata.len() > MAX_FILE_BYTES as u64 {
+        return Err("Kurtarma yedegi guvensiz veya cok buyuk.".into());
+    }
+    let mut bytes = Vec::new();
+    File::open(&path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_FILE_BYTES
+        || entry["original_sha256"].as_str() != Some(sha(&bytes).as_str())
+    {
+        return Err("Kurtarma yedegi yeniden okundugunda SHA256 degisti.".into());
+    }
+    Ok(bytes)
+}
+
+/// Trusted HOST API for recovery after a separately collected, explicit local
+/// terminal approval. Not a model tool. This method NEVER asks for approval:
+/// callers must perform the human prompt and pass the exact marker fingerprint.
+///
+/// Re-checks all targets before any mutation, then re-checks each before use.
+/// On uncertainty or partial failures the pending marker is deliberately kept.
+pub fn restore_after_explicit_approval(
+    root: &Path,
+    approved_fingerprint: &str,
+) -> Result<String, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let preview: Value =
+        serde_json::from_str(&restoration_preview(&root)?).map_err(|e| e.to_string())?;
+    if preview["status"] != "pending" || preview["eligible_for_review"] != true {
+        return Err(
+            "Kurtarma plani manuel inceleme istiyor veya kayit yok; yazma reddedildi.".into(),
+        );
+    }
+    let fingerprint = preview["marker_fingerprint_sha256"]
+        .as_str()
+        .ok_or("Kurtarma kaydi parmak izi gecersiz.")?;
+    if approved_fingerprint != fingerprint {
+        return Err("Kullanici onayi bu kurtarma kaydinin parmak iziyle eslesmiyor.".into());
+    }
+    let marker = read_marker(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+    if sha(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?) != fingerprint {
+        return Err("Kurtarma kaydi onaydan sonra degisti.".into());
+    }
+    let source_files = marker["files"]
+        .as_array()
+        .ok_or("Kurtarma listesi gecersiz.")?;
+    let planned_files = preview["files"]
+        .as_array()
+        .ok_or("Kurtarma onizlemesi gecersiz.")?;
+    if source_files.len() != planned_files.len() {
+        return Err("Kurtarma listesi onaydan sonra degisti.".into());
+    }
+
+    // Read all original backups and validate ALL targets before the first edit.
+    // This is not a filesystem snapshot and cannot defeat an external writer.
+    let mut steps = Vec::with_capacity(source_files.len());
+    for (entry, proposal) in source_files.iter().zip(planned_files) {
+        let relative = entry["path"].as_str().ok_or("Gecersiz kurtarma yolu.")?;
+        if proposal["path"] != relative {
+            return Err("Kurtarma hedef listesi uyusmuyor.".into());
+        }
+        let target = discovery::resolve_target(&root, relative)?;
+        let original = entry["original_sha256"].as_str();
+        let updated = entry["updated_sha256"]
+            .as_str()
+            .ok_or("Aday SHA256 eksik.")?;
+        let action = proposal["proposed_action"]
+            .as_str()
+            .ok_or("Kurtarma eylemi eksik.")?;
+        let required_state = match action {
+            "restore_original_from_backup" | "remove_created_candidate" => "updated",
+            "already_original" => "original",
+            "already_absent" => "original_absent",
+            _ => return Err("Manuel inceleme gerektiren kurtarma eylemi reddedildi.".into()),
+        };
+        if file_state(&root, relative, original, updated) != required_state {
+            return Err(format!(
+                "{relative}: Dosya onaydan once degisti; geri yukleme reddedildi."
+            ));
+        }
+        let backup_bytes = if action == "restore_original_from_backup" {
+            Some(verified_backup_bytes(&root, entry)?)
+        } else {
+            if !matches!(backup_state(&root, entry), "intact" | "not_required") {
+                return Err(format!("{relative}: Yedek durumu degisti."));
+            }
+            None
+        };
+        steps.push(RestoreStep {
+            relative: relative.to_owned(),
+            target,
+            original_sha256: original.map(str::to_owned),
+            updated_sha256: updated.to_owned(),
+            action: action.to_owned(),
+            backup_bytes,
+        });
+    }
+
+    for step in &steps {
+        let original = step.original_sha256.as_deref();
+        let observed = file_state(&root, &step.relative, original, &step.updated_sha256);
+        let expected = match step.action.as_str() {
+            "restore_original_from_backup" | "remove_created_candidate" => "updated",
+            "already_original" => "original",
+            "already_absent" => "original_absent",
+            _ => return Err("Bilinmeyen kurtarma eylemi.".into()),
+        };
+        if observed != expected {
+            return Err(format!(
+                "{}: Dis degisiklik tespit edildi; kurtarma durduruldu, kayit korundu.",
+                step.relative
+            ));
+        }
+
+        match step.action.as_str() {
+            "restore_original_from_backup" => {
+                let meta = fs::symlink_metadata(&step.target).map_err(|e| e.to_string())?;
+                if !meta.is_file() || is_link(&meta) || meta.len() > MAX_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "{}: Geri yuklenecek hedef guvenli degil.",
+                        step.relative
+                    ));
+                }
+                let bytes = step
+                    .backup_bytes
+                    .as_ref()
+                    .ok_or("Geri yukleme yedegi kayip.")?;
+                let mut handle = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&step.target)
+                    .map_err(|e| format!("{}: {e}", step.relative))?;
+                // Recheck the bytes through the exact writable file handle.
+                // This reduces the race between the earlier path check and open,
+                // though it is NOT an OS-level no-follow/exclusive-open guarantee.
+                let opened = handle.metadata().map_err(|e| e.to_string())?;
+                if !opened.is_file() || opened.len() > MAX_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "{}: Acilan hedef normal bir dosya degil.",
+                        step.relative
+                    ));
+                }
+                if discovery::resolve_existing(&root, &step.relative)? != step.target {
+                    return Err(format!("{}: Hedef dosya yolu degisti.", step.relative));
+                }
+                let mut candidate = Vec::new();
+                (&mut handle)
+                    .take(MAX_FILE_BYTES as u64 + 1)
+                    .read_to_end(&mut candidate)
+                    .map_err(|e| e.to_string())?;
+                if candidate.len() > MAX_FILE_BYTES || sha(&candidate) != step.updated_sha256 {
+                    return Err(format!(
+                        "{}: Acilan dosya onayli adayla eslesmiyor.",
+                        step.relative
+                    ));
+                }
+                handle.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                handle.set_len(0).map_err(|e| e.to_string())?;
+                handle.write_all(bytes).map_err(|e| e.to_string())?;
+                handle.sync_all().map_err(|e| e.to_string())?;
+            }
+            "remove_created_candidate" => {
+                fs::remove_file(&step.target).map_err(|e| format!("{}: {e}", step.relative))?;
+            }
+            "already_original" | "already_absent" => {}
+            _ => return Err("Bilinmeyen kurtarma eylemi.".into()),
+        }
+        let final_state = file_state(&root, &step.relative, original, &step.updated_sha256);
+        let desired = if original.is_some() {
+            "original"
+        } else {
+            "original_absent"
+        };
+        if final_state != desired {
+            return Err(format!(
+                "{}: Geri yukleme sonrasi hash farkli; kayit korundu.",
+                step.relative
+            ));
+        }
+    }
+
+    // Do not clear evidence until both marker and ALL file states are verified.
+    let current = read_marker(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+    if sha(&serde_json::to_vec(&current).map_err(|e| e.to_string())?) != fingerprint {
+        return Err("Kurtarma kaydi degisti; kayit korunuyor.".into());
+    }
+    for (step, entry) in steps.iter().zip(source_files) {
+        let desired = if step.original_sha256.is_some() {
+            "original"
+        } else {
+            "original_absent"
+        };
+        if file_state(
+            &root,
+            &step.relative,
+            step.original_sha256.as_deref(),
+            &step.updated_sha256,
+        ) != desired
+            || !matches!(backup_state(&root, entry), "intact" | "not_required")
+        {
+            return Err("Geri yuklenen dosyalar tekrar dogrulanamadi; kayit korundu.".into());
+        }
+    }
+    let path = marker_path(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+    fs::remove_file(&path).map_err(|e| format!("Kayit silinemedi; tekrar inceleyin: {e}"))?;
+    Ok(format!(
+        "RECOVERY_RESTORED: {} dosya orijinal durumuyla eslesti. Cargo dogrulamasi calistirilmadi.",
+        steps.len()
+    ))
+}
+
 /// Read-only, bounded incident report. It does not erase, restore or trust a model.
 pub fn audit(root: &Path) -> Result<String, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
@@ -671,6 +903,187 @@ mod tests {
         assert!(project.0.join(".fiko_backups").join(MARKER).exists());
         // A plan never removes the marker or alters its backup.
         assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
+    fn approved_fingerprint(root: &Path) -> String {
+        let preview: Value = serde_json::from_str(&restoration_preview(root).unwrap()).unwrap();
+        preview["marker_fingerprint_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn explicit_approval_restores_original_and_removes_created_file() {
+        let project = Fixture::new("approved_restore");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "pub fn new_file() {}\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let outcome = restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(outcome.contains("RECOVERY_RESTORED"));
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert!(!project.0.join("src/new.rs").exists());
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn incorrect_approval_never_mutates_targets() {
+        let project = Fixture::new("wrong_approval");
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let error = restore_after_explicit_approval(&project.0, "not-the-approved-fingerprint")
+            .unwrap_err();
+        assert!(error.contains("parmak iziyle eslesmiyor"), "{error}");
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn external_change_in_one_target_refuses_entire_recovery() {
+        let project = Fixture::new("restore_drift");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "new\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        fs::write(project.0.join("src/new.rs"), "external edit\n").unwrap();
+        assert!(restore_after_explicit_approval(&project.0, &fingerprint).is_err());
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/new.rs")).unwrap(),
+            "external edit\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn partially_restored_targets_can_resume_after_new_explicit_approval() {
+        let project = Fixture::new("restore_resume");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "new\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 1 }\n").unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_original");
+        let fingerprint = approved_fingerprint(&project.0);
+        restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(!project.0.join("src/new.rs").exists());
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn tampered_backup_after_review_refuses_restore_without_writing_sources() {
+        let project = Fixture::new("late_backup_tampering");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let backup = record.files[0].backup_path.as_ref().unwrap();
+        fs::write(backup, "outside tampering\n").unwrap();
+        let result = restore_after_explicit_approval(&project.0, &fingerprint);
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_target_after_approval_never_writes_outside_project() {
+        use std::os::unix::fs::symlink;
+        let project = Fixture::new("late_symlink");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let original_target = project.0.join("src/a.rs");
+        let outside_target = project.0.parent().unwrap().join(format!(
+            "fiko_recovery_external_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside_target, "do-not-touch\n").unwrap();
+        fs::remove_file(&original_target).unwrap();
+        symlink(&outside_target, &original_target).unwrap();
+
+        let restore_result = restore_after_explicit_approval(&project.0, &fingerprint);
+        let external_bytes = fs::read(&outside_target).unwrap();
+        let _ = fs::remove_file(&outside_target);
+        assert!(
+            restore_result.is_err(),
+            "symlink replacement must be blocked"
+        );
+        assert_eq!(external_bytes, b"do-not-touch\n");
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
+    #[test]
+    fn changed_marker_invalidates_prior_approval_without_writes() {
+        let project = Fixture::new("restore_marker_changed");
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let mut json: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        json["comment"] = json!("modified marker after approval");
+        fs::write(&marker, serde_json::to_vec(&json).unwrap()).unwrap();
+        let error = restore_after_explicit_approval(&project.0, &fingerprint).unwrap_err();
+        assert!(error.contains("parmak iziyle eslesmiyor"), "{error}");
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(marker.exists());
     }
 
     #[test]
