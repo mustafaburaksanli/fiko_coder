@@ -1228,6 +1228,126 @@ mod tests {
         assert!(!project.0.join(".fiko_backups").exists());
     }
 
+    // The child test is invoked by the parent test in a separate OS process.
+    // It must never run accidentally in the normal cargo test suite.
+    #[test]
+    #[ignore = "only invoked by the dedicated process-interruption test"]
+    fn crash_child_hold_before_third_workspace_write() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CRASH_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let plan = prepare(
+            &root,
+            &[
+                edit_a(),
+                edit(
+                    "src/b.rs",
+                    "pub fn b() -> u8 { 2 }",
+                    "pub fn b() -> u8 { 4 }",
+                ),
+                create("src/c.rs", "pub fn c() {}\n"),
+            ],
+        )
+        .unwrap();
+        let signal = root.join(".fiko_test_interrupt_ready");
+        let result = apply_with(&root, &plan, |index, _| {
+            if index == 2 {
+                // The first two targets have been synced. The parent will kill
+                // this actual process while the transaction remains open.
+                let mut ready = File::create(&signal).map_err(|e| e.to_string())?;
+                ready.write_all(b"ready").map_err(|e| e.to_string())?;
+                ready.sync_all().map_err(|e| e.to_string())?;
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return Err("child was not terminated by the parent".into());
+            }
+            Ok(())
+        });
+        panic!("crash child unexpectedly reached completion: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "run as an isolated CI step rather than in each stabilization repetition"]
+    fn process_kill_during_workspace_apply_keeps_recovery_evidence() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Project::new();
+        let signal = project.0.join(".fiko_test_interrupt_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::crash_child_hold_before_third_workspace_write",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_CRASH_PROJECT", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot start isolated crash child process");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "crash child exited before the ready signal: {status}; {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "crash child did not reach the third file: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        child.kill().expect("cannot terminate crash child process");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "child must be forcibly interrupted");
+
+        assert_eq!(
+            read_text(&project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 3 }\n"
+        );
+        assert_eq!(
+            read_text(&project.0.join("src/b.rs")).unwrap(),
+            "pub fn b() -> u8 { 4 }\n"
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
+
+        let audit = workspace_recovery::audit(&project.0).unwrap();
+        assert!(audit.contains("src/a.rs\": updated; backup=intact"), "{audit}");
+        assert!(audit.contains("src/b.rs\": updated; backup=intact"), "{audit}");
+        assert!(
+            audit.contains("src/c.rs\": original_absent; backup=not_required"),
+            "{audit}"
+        );
+
+        let plan = prepare(&project.0, &[create("src/later.rs", "not allowed")]).unwrap();
+        let blocked = apply(&project.0, &plan).unwrap_err();
+        assert!(blocked.restored);
+        assert!(blocked.message.contains("belirsiz"), "{blocked}");
+        assert!(!project.0.join("src/later.rs").exists());
+    }
+
     #[test]
     fn bos_yeni_dosyanin_diffi_ve_yokluk_geri_almasi_acik_olmali() {
         let project = Project::new();
