@@ -25,3 +25,20 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit and offline integration tests
         run: cargo test --locked
+      - name: Stabilization stress (20 parallel + 20 serial runs)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($mode in @('parallel', 'serial')) {
+            for ($attempt = 1; $attempt -le 20; $attempt++) {
+              Write-Host ("[STRESS] {0}: {1}/20" -f $mode, $attempt)
+              if ($mode -eq 'parallel') {
+                cargo test --locked --test stabilization_flow -- --test-threads=4
+              } else {
+                cargo test --locked --test stabilization_flow -- --test-threads=1
+              }
+              if ($LASTEXITCODE -ne 0) {
+                throw ("stabilization_flow failed in {0} run {1}/20 (exit code: {2})" -f $mode, $attempt, $LASTEXITCODE)
+              }
+            }
+          }
