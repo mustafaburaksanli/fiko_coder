@@ -516,11 +516,25 @@ fn stage_original_and_replace(
     // Preserve source permissions, including Unix executable bits. Timestamp
     // metadata may change and is not guaranteed to be preserved.
     fs::set_permissions(&stage_path, opened_metadata.permissions()).map_err(|e| e.to_string())?;
+    // Permission changes modify metadata too; flush them before replacement.
+    staged.sync_all().map_err(|e| e.to_string())?;
     let staged_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
-    if !staged_metadata.is_file() || is_link(&staged_metadata) {
-        return Err("Gecici dosya normal bir dosya degil.".into());
+    if !staged_metadata.is_file()
+        || is_link(&staged_metadata)
+        || staged_metadata.len() != bytes.len() as u64
+    {
+        return Err("Gecici dosya normal bir dosya degil veya uzunlugu degisti.".into());
     }
     drop(staged);
+    let mut staged_readback = Vec::new();
+    File::open(&stage_path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut staged_readback)
+        .map_err(|e| e.to_string())?;
+    if staged_readback.len() != bytes.len() || sha(&staged_readback) != sha(bytes) {
+        return Err("Gecici dosya diskte dogrulanamadi; hedef degistirilmedi.".into());
+    }
 
     #[cfg(test)]
     if step.relative == "src/a.rs"
