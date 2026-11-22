@@ -202,6 +202,55 @@ fn file_state(
     }
 }
 
+/// Do not trust paths from the on-disk manifest. Backup checks are strictly read-only.
+fn backup_state(root: &Path, entry: &Value) -> &'static str {
+    let Some(original) = entry["original_sha256"].as_str() else {
+        return if entry["backup_name"].is_null() {
+            "not_required"
+        } else {
+            "unexpected_reference"
+        };
+    };
+    if original.len() != 64 || !original.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return "invalid_original_hash";
+    }
+    let Some(name) = entry["backup_name"].as_str() else {
+        return "missing_reference";
+    };
+    if name.is_empty()
+        || name.len() > 240
+        || !name.ends_with(".bak")
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+        || name == "."
+        || name == ".."
+    {
+        return "unsafe_reference";
+    }
+    let path = root.join(".fiko_backups").join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_file() && !is_link(&meta) && meta.len() <= MAX_FILE_BYTES as u64 => {}
+        Ok(_) => return "unsafe_or_oversized",
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return "missing",
+        Err(_) => return "unreadable",
+    }
+    let mut bytes = Vec::new();
+    if File::open(&path)
+        .and_then(|file| file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes))
+        .is_err()
+    {
+        return "unreadable";
+    }
+    if bytes.len() > MAX_FILE_BYTES {
+        return "unsafe_or_oversized";
+    }
+    if sha(&bytes) == original {
+        "intact"
+    } else {
+        "mismatch"
+    }
+}
+
 fn state_matches(root: &Path, record: &WorkspaceRecord, verified: bool) -> bool {
     record.files.iter().all(|entry| {
         let original = entry
@@ -274,8 +323,9 @@ pub fn audit(root: &Path) -> Result<String, String> {
         };
         let original = entry["original_sha256"].as_str();
         let state = file_state(&root, path, original, updated);
+        let backup = backup_state(&root, entry);
         lines.push(format!(
-            "{}: {state}",
+            "{}: {state}; backup={backup}",
             serde_json::to_string(path).unwrap_or_default()
         ));
     }
