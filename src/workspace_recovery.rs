@@ -1518,15 +1518,22 @@ mod tests {
         }
         child.kill().expect("cannot terminate partial-stage child");
         let output = child.wait_with_output().unwrap();
-        assert!(!output.status.success(), "child must be forcefully terminated");
+        assert!(
+            !output.status.success(),
+            "child must be forcefully terminated"
+        );
 
         assert_eq!(fs::read(&marker).unwrap(), previous_marker);
-        assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), candidate_before);
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            candidate_before
+        );
         let stage_files: Vec<_> = fs::read_dir(project.0.join("src"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
-                entry.file_name()
+                entry
+                    .file_name()
                     .to_string_lossy()
                     .starts_with(".fiko_restore_stage_")
             })
@@ -1546,15 +1553,15 @@ mod tests {
         );
         // A new approval can restore from the verified backup, not the
         // untrusted, incomplete staged orphan left by the terminated process.
-        let result = restore_after_explicit_approval(
-            &project.0,
-            &approved_fingerprint(&project.0),
-        )
-        .unwrap();
+        let result =
+            restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0)).unwrap();
         assert!(result.contains("RECOVERY_RESTORED"));
         assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), original);
         assert!(!marker.exists());
-        assert!(stage_files[0].path().exists(), "orphan evidence remains for review");
+        assert!(
+            stage_files[0].path().exists(),
+            "orphan evidence remains for review"
+        );
     }
 
     #[cfg(unix)]
