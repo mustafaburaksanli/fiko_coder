@@ -25,7 +25,7 @@ Experimental, local-first Rust coding agent for Ollama-compatible models. FİKO 
 ```powershell
 git clone https://github.com/mustafaburaksanli/fiko_coder.git
 cd fiko_coder
-git switch feature/postgresql-memory-v1.2
+git switch fix/verified-handoff-and-oss-readiness-v1.2.2
 cargo build --locked
 cargo run -- qwen-code-local:9b
 ```
@@ -84,6 +84,6 @@ Read [SECURITY.md](SECURITY.md) before using on real projects.
 
 ## Contributing and licensing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). A license decision is pending; until an explicit open-source license is committed, public visibility does **not** grant permission to reuse or redistribute the code under an open-source license.
+See [CONTRIBUTING.md](CONTRIBUTING.md). This development branch proposes the **Apache License 2.0** for FİKO CODER (see [LICENSE](LICENSE)). Licensing of this independent repository does not extend to private FİKO AI / FİKO OS repositories.
 
 This repository is independent from any proprietary FİKO AI / FİKO OS codebases.
