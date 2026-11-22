@@ -454,6 +454,24 @@ fn verified_backup_bytes(root: &Path, entry: &Value) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
+/// Verify the exact staged path immediately before it can replace a source.
+fn verify_staged_copy(path: &Path, original: &[u8]) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || is_link(&meta) || meta.len() != original.len() as u64 {
+        return Err("Gecici dosyanin turu veya boyutu degisti; hedef korunuyor.".into());
+    }
+    let mut current = Vec::new();
+    File::open(path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut current)
+        .map_err(|e| e.to_string())?;
+    if current.len() != original.len() || sha(&current) != sha(original) {
+        return Err("Gecici dosyanin SHA256 degeri degisti; hedef korunuyor.".into());
+    }
+    Ok(())
+}
+
 /// A file is staged as a sibling on the same filesystem and synced BEFORE
 /// replacing the candidate. On process termination during staging, the target
 /// remains untouched and the recovery marker stays pending.
@@ -540,23 +558,8 @@ fn stage_original_and_replace(
     fs::set_permissions(&stage_path, opened_metadata.permissions()).map_err(|e| e.to_string())?;
     // Permission changes modify metadata too; flush them before replacement.
     staged.sync_all().map_err(|e| e.to_string())?;
-    let staged_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
-    if !staged_metadata.is_file()
-        || is_link(&staged_metadata)
-        || staged_metadata.len() != bytes.len() as u64
-    {
-        return Err("Gecici dosya normal bir dosya degil veya uzunlugu degisti.".into());
-    }
     drop(staged);
-    let mut staged_readback = Vec::new();
-    File::open(&stage_path)
-        .map_err(|e| e.to_string())?
-        .take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut staged_readback)
-        .map_err(|e| e.to_string())?;
-    if staged_readback.len() != bytes.len() || sha(&staged_readback) != sha(bytes) {
-        return Err("Gecici dosya diskte dogrulanamadi; hedef degistirilmedi.".into());
-    }
+    verify_staged_copy(&stage_path, bytes)?;
 
     #[cfg(test)]
     if step.relative == "src/a.rs"
@@ -587,6 +590,16 @@ fn stage_original_and_replace(
     {
         return Err("Hedef gecici dosya hazirlanirken degisti; degisiklik durduruldu.".into());
     }
+    // A staged file could have changed after its initial readback (e.g. a
+    // concurrent writer while the marker or target was being revalidated).
+    // Recheck immediately before rename; this still is NOT an OS lock.
+    #[cfg(test)]
+    if step.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_TAMPER_STAGED_COPY").is_some()
+    {
+        fs::write(&stage_path, b"tampered stage bytes").map_err(|e| e.to_string())?;
+    }
+    verify_staged_copy(&stage_path, bytes)?;
     // Release the source handle before rename, especially on Windows.
     drop(opened);
     fs::rename(&stage_path, &step.target)
