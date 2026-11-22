@@ -340,8 +340,13 @@ pub fn restoration_preview(root: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
     let mut eligible_for_review = true;
 
-    for entry in value["files"].as_array().ok_or("Kurtarma listesi gecersiz.")? {
-        let path = entry["path"].as_str().ok_or("Kurtarma hedef yolu gecersiz.")?;
+    for entry in value["files"]
+        .as_array()
+        .ok_or("Kurtarma listesi gecersiz.")?
+    {
+        let path = entry["path"]
+            .as_str()
+            .ok_or("Kurtarma hedef yolu gecersiz.")?;
         let updated = entry["updated_sha256"]
             .as_str()
             .ok_or("Kurtarma hedef SHA256 eksik.")?;
@@ -350,9 +355,8 @@ pub fn restoration_preview(root: &Path) -> Result<String, String> {
             serde_json::Value::String(text) => Some(text.as_str()),
             _ => return Err("Kurtarma orijinal SHA256 gecersiz.".into()),
         };
-        let valid_hash = |hash: &str| {
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        };
+        let valid_hash =
+            |hash: &str| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
         let valid_entry = valid_hash(updated) && original.is_none_or(valid_hash);
         let target = if valid_entry && discovery::check_relative_path(path).is_ok() {
             discovery::resolve_target(&root, path).ok()
@@ -560,13 +564,20 @@ mod tests {
         let _record = workspace_patch::apply(&project.0, &plan).unwrap();
         let marker = project.0.join(".fiko_backups").join(MARKER);
         let before = fs::read(&marker).unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["status"], "pending");
         assert_eq!(preview["eligible_for_review"], true);
         assert_eq!(preview["automatic_restore"], false);
         assert_eq!(preview["requires_explicit_user_approval"], true);
-        assert_eq!(preview["files"][0]["proposed_action"], "restore_original_from_backup");
-        assert_eq!(preview["files"][1]["proposed_action"], "remove_created_candidate");
+        assert_eq!(
+            preview["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
+        assert_eq!(
+            preview["files"][1]["proposed_action"],
+            "remove_created_candidate"
+        );
         assert_eq!(preview["files"][1]["backup_state"], "not_required");
         assert_eq!(fs::read(&marker).unwrap(), before);
         assert_eq!(
@@ -582,14 +593,16 @@ mod tests {
         let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
         let backup = record.files[0].backup_path.as_ref().unwrap();
         fs::write(project.0.join("src/a.rs"), "external modification\n").unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], false);
         assert_eq!(preview["files"][0]["target_state"], "unexpected");
         assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
 
         fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 2 }\n").unwrap();
         fs::write(backup, "tampered backup\n").unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], false);
         assert_eq!(preview["files"][0]["backup_state"], "mismatch");
         assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
@@ -604,29 +617,39 @@ mod tests {
         let duplicated = manifest["files"][0].clone();
         manifest["files"].as_array_mut().unwrap().push(duplicated);
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], false);
-        assert_eq!(preview["files"][1]["target_state"], "invalid_or_duplicate_target");
+        assert_eq!(
+            preview["files"][1]["target_state"],
+            "invalid_or_duplicate_target"
+        );
         assert_eq!(preview["files"][1]["proposed_action"], "manual_review");
 
         manifest["files"].as_array_mut().unwrap().pop();
         manifest["files"][0]["updated_sha256"] = json!("forged");
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], false);
-        assert_eq!(preview["files"][0]["target_state"], "invalid_or_duplicate_target");
+        assert_eq!(
+            preview["files"][0]["target_state"],
+            "invalid_or_duplicate_target"
+        );
         assert!(path.is_file());
     }
 
     #[test]
     fn restoration_preview_marks_original_and_missing_marker_without_mutation() {
         let project = Fixture::new("preview_original");
-        let absent: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let absent: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(absent["status"], "no_pending");
         assert_eq!(absent["eligible_for_review"], false);
         let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
         fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 1 }\n").unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], true);
         assert_eq!(preview["files"][0]["proposed_action"], "already_original");
         assert!(project.0.join(".fiko_backups").join(MARKER).exists());
