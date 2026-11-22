@@ -977,7 +977,10 @@ mod tests {
         let error = restore_after_explicit_approval(&root, &fingerprint).unwrap_err();
         assert!(error.contains("Baska bir FIKO"), "{error}");
         let rollback_error = workspace_patch::rollback(&root, &record).unwrap_err();
-        assert!(rollback_error.contains("Baska bir FIKO"), "{rollback_error}");
+        assert!(
+            rollback_error.contains("Baska bir FIKO"),
+            "{rollback_error}"
+        );
         assert!(root.join(".fiko_backups").join(MARKER).exists());
         drop(lock);
 
@@ -1055,7 +1058,10 @@ mod tests {
         child.kill().expect("could not kill lock-owning child");
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success());
-        assert!(root.join(".fiko_backups/workspace.operation.lock").is_file());
+        assert!(
+            root.join(".fiko_backups/workspace.operation.lock")
+                .is_file()
+        );
 
         let new_owner = try_lock_operation(&root).unwrap();
         let blocked = try_lock_operation(&root).err().unwrap();
