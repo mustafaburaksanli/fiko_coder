@@ -1438,15 +1438,17 @@ mod tests {
         let external = project.0.parent().unwrap().join(format!(
             "fiko_external_hardlink_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::hard_link(project.0.join("src/a.rs"), &external).unwrap();
         assert_eq!(
             fs::read_to_string(&external).unwrap(),
             "pub fn a() -> u8 { 2 }\n"
         );
-        let result =
-            restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0));
+        let result = restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0));
         let outside_content = fs::read_to_string(&external).unwrap();
         let _ = fs::remove_file(&external);
         assert!(result.is_ok(), "{result:?}");
