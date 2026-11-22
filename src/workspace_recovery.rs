@@ -286,10 +286,9 @@ fn finish(root: &Path, record: &WorkspaceRecord, verified: bool) -> Result<(), S
     if verified {
         let expected = manifest(record);
         if !expected["files"].as_array().is_some_and(|files| {
-            files.iter().all(|entry| matches!(
-                backup_state(&root, entry),
-                "intact" | "not_required"
-            ))
+            files
+                .iter()
+                .all(|entry| matches!(backup_state(&root, entry), "intact" | "not_required"))
         }) {
             return Err("Yedeklerin butunlugu dogrulanamadi; kurtarma kaydi korundu.".into());
         }
@@ -508,7 +507,11 @@ mod tests {
         value["files"][0]["backup_name"] = json!("../outside.bak");
         fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
         let audit_before = fs::read(&marker).unwrap();
-        assert!(audit(&project.0).unwrap().contains("backup=unsafe_reference"));
+        assert!(
+            audit(&project.0)
+                .unwrap()
+                .contains("backup=unsafe_reference")
+        );
         assert_eq!(fs::read(&marker).unwrap(), audit_before);
         assert!(finish_verified(&project.0, &record).is_err());
         assert!(marker.exists());
