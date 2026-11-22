@@ -1,0 +1,8 @@
+# Preserve source line endings for byte-exact patch verification.
+# Do not renormalize existing files as part of a functional fix.
+*.rs text -eol
+*.toml text -eol
+*.lock text -eol
+*.sql text -eol
+*.md text -eol
+*.yml text -eol
