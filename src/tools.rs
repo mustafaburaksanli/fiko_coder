@@ -896,10 +896,10 @@ pub fn apply_approved_patch(root: &Path, plan: PatchPlan) -> Result<PatchRecord,
 
 pub fn rollback_patch(record: &PatchRecord) -> Result<(), String> {
     let root = record
-        .path
+        .backup_path
         .parent()
         .and_then(Path::parent)
-        .ok_or("Patch hedefi bir src altinda olmali.")?;
+        .ok_or("Patch yedegi proje kokune baglanamadi.")?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     // Read-only checks first; then recheck under the same lock used by apply.
     let current = fs::read_to_string(&record.path).map_err(|e| e.to_string())?;
