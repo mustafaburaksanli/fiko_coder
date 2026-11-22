@@ -538,6 +538,12 @@ pub fn restore_after_explicit_approval(
     }
 
     for step in &steps {
+        // Reject a replaced pending marker even if an earlier target was
+        // restored. A marker is not a cross-process lock or atomic snapshot.
+        let current_marker = read_marker(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+        if sha(&serde_json::to_vec(&current_marker).map_err(|e| e.to_string())?) != fingerprint {
+            return Err("Kurtarma kaydi islem sirasinda degisti; sonraki dosyaya dokunulmadi.".into());
+        }
         let original = step.original_sha256.as_deref();
         let observed = file_state(&root, &step.relative, original, &step.updated_sha256);
         let expected = match step.action.as_str() {
@@ -617,6 +623,20 @@ pub fn restore_after_explicit_approval(
                 "{}: Geri yukleme sonrasi hash farkli; kayit korundu.",
                 step.relative
             ));
+        }
+        // Test-only pause after the first restored file. Parent test kills the
+        // actual process at this point; production binaries cannot enable it.
+        #[cfg(test)]
+        if step.relative == "src/a.rs"
+            && std::env::var_os("FIKO_TEST_RESTORE_CRASH_PROJECT").is_some()
+        {
+            let signal = root.join(".fiko_test_restore_interrupt_ready");
+            let mut file = File::create(signal).map_err(|e| e.to_string())?;
+            file.write_all(b"ready").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            drop(file);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Err("Crash test child should have been terminated.".into());
         }
     }
 
