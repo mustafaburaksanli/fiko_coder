@@ -1164,6 +1164,7 @@ async fn run_task_loop<P: Prompter>(
             let answer = assistant["content"].as_str().unwrap_or("(Bos yanit)");
             let mut host_test_attempted = false;
             let mut host_workspace_attempted = false;
+            let mut host_patch_attempted = false;
             if task.intent() == TaskIntent::Modify
                 && !task.phase().is_terminal()
                 && let Some(args) = task.repair.pending_workspace_args()
@@ -1179,8 +1180,23 @@ async fn run_task_loop<P: Prompter>(
                     println!("[REPAIR CONTROLLER] {reason}\n");
                 }
             }
+            // Model prose cannot authorize a patch; hand off only the
+            // candidate actually verified by Rust in this task.
             if task.intent() == TaskIntent::Modify
                 && !host_workspace_attempted
+                && !task.phase().is_terminal()
+                && let Some(args) = task.repair.take_pending_patch_args()
+            {
+                println!("[PATCH ONAYI] Model arac cagirmadi; Rust tarafindan dogrulanmis tek dosya adayi mevcut apply onayina iletiliyor.");
+                host_patch_attempted = true;
+                let outcome = execute_task_tool(&mut task, session, prompter, "apply_patch", &args).await?;
+                if let Some(reason) = &outcome.stop {
+                    println!("[REPAIR CONTROLLER] {reason}\n");
+                }
+            }
+            if task.intent() == TaskIntent::Modify
+                && !host_workspace_attempted
+                && !host_patch_attempted
                 && !task.applied()
                 && !task.phase().is_terminal()
                 && !modify_write_attempted
@@ -1235,7 +1251,7 @@ async fn run_task_loop<P: Prompter>(
             }
             // Modelin metni durumu degistirmez; yalnizca gorevi kapatir.
             task.finish_answer(answer);
-            let visible = if host_workspace_attempted {
+            let visible = if host_workspace_attempted || host_patch_attempted {
                 format!(
                     "[MODEL ONAY KORUMASI] Modelin metinsel diff/onay istegi yerine Rust'in dogrulanmis plan ve gercek onay kaydi esas alindi.\n{}",
                     task.render_answer("")
@@ -1251,6 +1267,9 @@ async fn run_task_loop<P: Prompter>(
             }
             if host_workspace_attempted {
                 messages.push(json!({"role": "assistant", "content": format!("[RUST WORKSPACE YURUTME KAYDI]\n{visible}")}));
+            }
+            if host_patch_attempted {
+                messages.push(json!({"role": "assistant", "content": format!("[RUST PATCH YURUTME KAYDI]\n{visible}")}));
             }
             break;
         }
