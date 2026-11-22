@@ -1312,6 +1312,127 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "only invoked by the isolated staged-restore kill test"]
+    fn staged_restore_child_waits_before_replace() {
+        let Some(root) = std::env::var_os("FIKO_TEST_RESTORE_STAGE_KILL_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let result = restore_after_explicit_approval(&root, &fingerprint);
+        panic!("stage child reached completion without forced termination: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "dedicated cross-platform process kill regression"]
+    fn process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Fixture::new("restore_staged_process_kill");
+        let plan = project.plan();
+        let record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let marker_before = fs::read(&marker).unwrap();
+        let signal = project.0.join(".fiko_test_restore_stage_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::staged_restore_child_waits_before_replace",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_RESTORE_STAGE_KILL_PROJECT", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot launch staged restore child");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "staged restore child exited before kill point ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "staged restore child did not emit signal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill().expect("failed to terminate staged restore child");
+        let child_output = child.wait_with_output().unwrap();
+        assert!(!child_output.status.success());
+
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "restore_original_from_backup");
+
+        let stage_count = fs::read_dir(project.0.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_restore_stage_")
+            })
+            .count();
+        assert_eq!(stage_count, 1, "killed child should leave one staged copy");
+
+        // A fresh, separately approved host recovery can safely finish despite
+        // the orphan stage. It does not silently delete orphan evidence.
+        restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0)).unwrap();
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn staged_restore_preserves_source_permissions_when_supported() {
+        let project = Fixture::new("restore_permissions");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let source = project.0.join("src/a.rs");
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(project.0.join("src/a.rs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+    }
+
+    #[test]
     fn changed_marker_invalidates_prior_approval_without_writes() {
         let project = Fixture::new("restore_marker_changed");
         let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
