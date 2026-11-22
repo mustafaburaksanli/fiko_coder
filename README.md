@@ -4,7 +4,7 @@
 
 The point is to separate *model suggestions* from *host-verified code changes*. A model saying "done" is never evidence that a file was written or that Cargo checks succeeded.
 
-> **Status: v1.2.2 experimental open-source candidate.** This repository is a work in progress, not a security sandbox. Do not use it on untrusted repositories or valuable working trees without independent backups.
+> **Status: v1.2.2 experimental open-source software.** This repository is a work in progress, not a security sandbox. Do not use it on untrusted repositories or valuable working trees without independent backups.
 
 ## What it does
 
@@ -20,11 +20,12 @@ The point is to separate *model suggestions* from *host-verified code changes*. 
 
 CI evidence below is from specific commits; it does not imply universal correctness or production readiness.
 
-- **Automated checks:** Windows GitHub Actions runs formatting, `cargo check --locked`, strict Clippy, and `cargo test --locked` on the review branch.
+- **Automated checks:** Windows GitHub Actions runs formatting, `cargo check --locked`, strict Clippy, `cargo test --locked`, and 40 repeated stabilization test processes on the published branch. Linux CI runs isolated PostgreSQL 17 integration acceptance.
 - **Local automated run (2026-11-22):** 338 tests passed, 0 failed, 13 skipped. Skipped tests are opt-in PostgreSQL integration/agent tests, **not** successful database acceptance results.
 - **Updated Windows GitHub Actions (commit `56cea37`, 2026-11-22):** 339 passing tests, 0 failed, 13 ignored; both push and pull-request workflows succeeded. This includes an additional 16-thread fixture-uniqueness regression. Earlier Windows CI showed intermittent `0xc0000409` aborts; the test fixture collision and cleanup risks were addressed, but repeated stress validation is still recommended.
 - **Live local model acceptance (2026-11-22):** A single Windows + `qwen-code-local:9b` exercise showed `VERIFY_WORKSPACE_OK`, explicit approval, `PATCH_VERIFIED`, 3 → 4 passing Rust math tests, and an unchanged protected `src/lib.rs` SHA-256 hash.
 - **PostgreSQL acceptance (2026-11-22, commit `1db2953`):** 12/12 real PostgreSQL integration tests plus 1/1 Rust agent + PostgreSQL integration test passed on separate, temporary PostgreSQL 17 databases in **both** [PR CI](https://github.com/mustafaburaksanli/fiko_coder/actions/runs/45038843308) and [push CI](https://github.com/mustafaburaksanli/fiko_coder/actions/runs/45038838533). The agent test uses controlled local HTTP responses rather than a live LLM; test-only service authentication is not suitable for deployment.
+- **Post-merge checks (2026-11-22, merge `b366554`):** [Windows Rust CI](https://github.com/mustafaburaksanli/fiko_coder/actions/runs/45040120636) and [PostgreSQL acceptance CI](https://github.com/mustafaburaksanli/fiko_coder/actions/runs/45040120648) both passed. Earlier [PR](https://github.com/mustafaburaksanli/fiko_coder/actions/runs/45036862325) and [push](https://github.com/mustafaburaksanli/fiko_coder/actions/runs/45036857375) stress runs each executed 20 parallel and 20 serial iterations, giving 80 process-level runs with no reported failures.
 - **Repeat it yourself:** [Step-by-step local Qwen acceptance demo](docs/live-qwen-acceptance.md). This exercises the workspace path; separate single-file handoff has unit/integration regression tests but has not been live-validated in that exercise.
 
 The local exercise is one maintainer-run observation, **not** a reliability benchmark or evidence of third-party adoption. See [SECURITY.md](SECURITY.md) for limitations.
@@ -79,6 +80,8 @@ PostgreSQL integration tests are opt-in and must use a **separate local test dat
 - PostgreSQL storage is optional and observational, not an execution authority.
 
 Read [SECURITY.md](SECURITY.md) before using on real projects.
+
+For a release overview see [CHANGELOG.md](CHANGELOG.md); for design and trust boundaries see [architecture](docs/architecture.md).
 
 ## Project structure
 
