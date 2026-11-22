@@ -1224,6 +1224,11 @@ impl Orchestrator {
                 PatchEffect::Verified | PatchEffect::Restored => {}
             }
         }
+        if name == "verify_candidate" && outcome.candidate_verified && !failed {
+            // Store validated args, not a new write authorization. Apply still
+            // performs scope, fingerprint, lock, and user-approval checks.
+            self.repair.record_pending_patch(&args);
+        }
         if WRITE_PATH_TOOLS.contains(&name) {
             self.plan_verified = outcome.candidate_verified || self.applied();
         }
