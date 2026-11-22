@@ -283,6 +283,17 @@ fn finish(root: &Path, record: &WorkspaceRecord, verified: bool) -> Result<(), S
     if !state_matches(&root, record, verified) {
         return Err("Dosyalar beklenen kurtarma durumunda degil; kayit korundu.".into());
     }
+    if verified {
+        let expected = manifest(record);
+        if !expected["files"].as_array().is_some_and(|files| {
+            files.iter().all(|entry| matches!(
+                backup_state(&root, entry),
+                "intact" | "not_required"
+            ))
+        }) {
+            return Err("Yedeklerin butunlugu dogrulanamadi; kurtarma kaydi korundu.".into());
+        }
+    }
     let path = marker_path(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
     fs::remove_file(&path).map_err(|e| format!("Kurtarma kaydi kapatilamadi: {e}"))
 }
