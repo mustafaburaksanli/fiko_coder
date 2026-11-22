@@ -61,7 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use std::io::IsTerminal;
 
         if !io::stdin().is_terminal() {
-            eprintln!("[RECOVERY] Geri yukleme yalnizca yerel, etkilesimli terminalden onaylanabilir.");
+            eprintln!(
+                "[RECOVERY] Geri yukleme yalnizca yerel, etkilesimli terminalden onaylanabilir."
+            );
             std::process::exit(1);
         }
         let preview = fiko_coder::workspace_recovery::restoration_preview(&root)
@@ -69,7 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let parsed: Value = serde_json::from_str(&preview)?;
         println!("{preview}");
         if parsed["status"] != "pending" || parsed["eligible_for_review"] != true {
-            eprintln!("[RECOVERY] Guvenli geri yukleme kosullari saglanmadi. Once dosyalari elle inceleyin.");
+            eprintln!(
+                "[RECOVERY] Guvenli geri yukleme kosullari saglanmadi. Once dosyalari elle inceleyin."
+            );
             std::process::exit(1);
         }
         let fingerprint = parsed["marker_fingerprint_sha256"]
@@ -93,13 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[RECOVERY] Onay eslesmedi; dosyalar degistirilmedi.");
             std::process::exit(1);
         }
-        match fiko_coder::workspace_recovery::restore_after_explicit_approval(
-            &root,
-            fingerprint,
-        ) {
+        match fiko_coder::workspace_recovery::restore_after_explicit_approval(&root, fingerprint) {
             Ok(report) => println!("{report}"),
             Err(error) => {
-                eprintln!("[RECOVERY] {error} Kayit olasi kismi geri yuklemeyi incelemek icin korunmus olabilir.");
+                eprintln!(
+                    "[RECOVERY] {error} Kayit olasi kismi geri yuklemeyi incelemek icin korunmus olabilir."
+                );
                 std::process::exit(1);
             }
         }
