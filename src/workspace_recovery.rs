@@ -576,7 +576,10 @@ pub fn restore_after_explicit_approval(
                 // though it is NOT an OS-level no-follow/exclusive-open guarantee.
                 let opened = handle.metadata().map_err(|e| e.to_string())?;
                 if !opened.is_file() || opened.len() > MAX_FILE_BYTES as u64 {
-                    return Err(format!("{}: Acilan hedef normal bir dosya degil.", step.relative));
+                    return Err(format!(
+                        "{}: Acilan hedef normal bir dosya degil.",
+                        step.relative
+                    ));
                 }
                 if discovery::resolve_existing(&root, &step.relative)? != step.target {
                     return Err(format!("{}: Hedef dosya yolu degisti.", step.relative));
@@ -587,7 +590,10 @@ pub fn restore_after_explicit_approval(
                     .read_to_end(&mut candidate)
                     .map_err(|e| e.to_string())?;
                 if candidate.len() > MAX_FILE_BYTES || sha(&candidate) != step.updated_sha256 {
-                    return Err(format!("{}: Acilan dosya onayli adayla eslesmiyor.", step.relative));
+                    return Err(format!(
+                        "{}: Acilan dosya onayli adayla eslesmiyor.",
+                        step.relative
+                    ));
                 }
                 handle.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                 handle.set_len(0).map_err(|e| e.to_string())?;
