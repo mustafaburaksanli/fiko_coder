@@ -423,18 +423,19 @@ mod tests {
     #[test]
     fn pending_workspace_blocks_single_file_apply_before_backup_and_write() {
         let project = Fixture::new("single_guard");
-        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let root = project.0.canonicalize().unwrap();
+        let record = workspace_patch::apply(&root, &project.plan()).unwrap();
         let backups = project.0.join(".fiko_backups");
         let entries_before = fs::read_dir(&backups).unwrap().count();
 
         let single = crate::tools::prepare_patch(
-            &project.0,
+            &root,
             "src/a.rs",
             "pub fn a() -> u8 { 2 }",
             "pub fn a() -> u8 { 3 }",
         )
         .unwrap();
-        let error = crate::tools::apply_approved_patch(&project.0, single)
+        let error = crate::tools::apply_approved_patch(&root, single)
             .err()
             .expect("pending marker must reject single-file write");
         assert!(error.contains("belirsiz"), "{error}");
@@ -445,15 +446,15 @@ mod tests {
         );
         assert!(backups.join(MARKER).exists());
 
-        workspace_patch::rollback(&project.0, &record).unwrap();
+        workspace_patch::rollback(&root, &record).unwrap();
         let cleared = crate::tools::prepare_patch(
-            &project.0,
+            &root,
             "src/a.rs",
             "pub fn a() -> u8 { 1 }",
             "pub fn a() -> u8 { 3 }",
         )
         .unwrap();
-        let single_record = crate::tools::apply_approved_patch(&project.0, cleared).unwrap();
+        let single_record = crate::tools::apply_approved_patch(&root, cleared).unwrap();
         assert_eq!(
             fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
             "pub fn a() -> u8 { 3 }\n"
@@ -464,18 +465,19 @@ mod tests {
     #[test]
     fn invalid_pending_marker_blocks_single_file_apply() {
         let project = Fixture::new("single_invalid_marker");
+        let root = project.0.canonicalize().unwrap();
         let backups = project.0.join(".fiko_backups");
         fs::create_dir(&backups).unwrap();
         fs::write(backups.join(MARKER), b"{not-json").unwrap();
 
         let single = crate::tools::prepare_patch(
-            &project.0,
+            &root,
             "src/a.rs",
             "pub fn a() -> u8 { 1 }",
             "pub fn a() -> u8 { 3 }",
         )
         .unwrap();
-        let error = crate::tools::apply_approved_patch(&project.0, single)
+        let error = crate::tools::apply_approved_patch(&root, single)
             .err()
             .expect("pending marker must reject single-file write");
         assert!(error.contains("belirsiz"), "{error}");
