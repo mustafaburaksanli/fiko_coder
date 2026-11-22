@@ -597,7 +597,7 @@ fn stage_original_and_replace(
     if step.relative == "src/a.rs"
         && std::env::var_os("FIKO_TEST_TAMPER_STAGED_COPY").is_some()
     {
-        fs::write(&stage_path, b"tampered stage bytes").map_err(|e| e.to_string())?;
+        fs::write(&stage_path, vec![b'x'; bytes.len()]).map_err(|e| e.to_string())?;
     }
     verify_staged_copy(&stage_path, bytes)?;
     // Release the source handle before rename, especially on Windows.
