@@ -594,9 +594,7 @@ fn stage_original_and_replace(
     // concurrent writer while the marker or target was being revalidated).
     // Recheck immediately before rename; this still is NOT an OS lock.
     #[cfg(test)]
-    if step.relative == "src/a.rs"
-        && std::env::var_os("FIKO_TEST_TAMPER_STAGED_COPY").is_some()
-    {
+    if step.relative == "src/a.rs" && std::env::var_os("FIKO_TEST_TAMPER_STAGED_COPY").is_some() {
         fs::write(&stage_path, vec![b'x'; bytes.len()]).map_err(|e| e.to_string())?;
     }
     verify_staged_copy(&stage_path, bytes)?;
