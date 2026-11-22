@@ -3617,4 +3617,5 @@ fn fail_after_removing_own_backup() {
     include!("patch_recovery_tests.rs");
     include!("intent_scope_tests.rs");
     include!("mixed_line_ending_tests.rs");
+    include!("single_patch_handoff_tests.rs");
 }
