@@ -1,6 +1,8 @@
 # FİKO CODER
 
-Experimental, local-first Rust coding agent for Ollama-compatible models. FİKO CODER treats model output as untrusted: Rust performs tool authorization, patch matching, verification, explicit user approval, and rollback handling.
+**Local-first, human-approved code changes.** FİKO CODER is an experimental Rust coding agent for Ollama-compatible models. It treats generated text and tool requests as untrusted: Rust controls tool authorization, exact patch matching, source freshness, temporary verification, explicit user approval, and rollback handling.
+
+The point is to separate *model suggestions* from *host-verified code changes*. A model saying "done" is never evidence that a file was written or that Cargo checks succeeded.
 
 > **Status: v1.2.2 development / pre-release.** This repository is a work in progress, not a security sandbox. Do not use it on untrusted repositories or valuable working trees without independent backups.
 
@@ -13,6 +15,15 @@ Experimental, local-first Rust coding agent for Ollama-compatible models. FİKO 
 - Supports strict patch matching and explicitly opted-in LF/CRLF recovery with source hash checks.
 - Records limited task and file metadata in optional PostgreSQL memory; memory cannot authorize code changes.
 - Tracks real tool execution outcomes rather than trusting the language model's claims.
+
+## Reproducible evidence
+
+- **Automated checks:** Windows GitHub Actions runs formatting, `cargo check --locked`, strict Clippy, and `cargo test --locked` on the review branch.
+- **Local automated run (2026-11-22):** 338 tests passed, 0 failed, 13 skipped. Skipped tests are opt-in PostgreSQL integration/agent tests, **not** successful database acceptance results.
+- **Live local model acceptance (2026-11-22):** A single Windows + `qwen-code-local:9b` exercise showed `VERIFY_WORKSPACE_OK`, explicit approval, `PATCH_VERIFIED`, 3 → 4 passing Rust math tests, and an unchanged protected `src/lib.rs` SHA-256 hash.
+- **Repeat it yourself:** [Step-by-step local Qwen acceptance demo](docs/live-qwen-acceptance.md). This exercises the workspace path; separate single-file handoff has unit/integration regression tests but has not been live-validated in that exercise.
+
+The local exercise is one maintainer-run observation, **not** a reliability benchmark or evidence of third-party adoption. See [SECURITY.md](SECURITY.md) for limitations.
 
 ## Requirements
 
@@ -84,6 +95,4 @@ Read [SECURITY.md](SECURITY.md) before using on real projects.
 
 ## Contributing and licensing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). This development branch proposes the **Apache License 2.0** for FİKO CODER (see [LICENSE](LICENSE)). Licensing of this independent repository does not extend to private FİKO AI / FİKO OS repositories.
-
-This repository is independent from any proprietary FİKO AI / FİKO OS codebases.
+See [CONTRIBUTING.md](CONTRIBUTING.md). This review branch **proposes** the **Apache License 2.0** for code contained in this repository (see [LICENSE](LICENSE)); the maintainer must approve this license decision before the branch is merged or a release is published.
