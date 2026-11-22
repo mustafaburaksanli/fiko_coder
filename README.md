@@ -20,6 +20,7 @@ The point is to separate *model suggestions* from *host-verified code changes*. 
 
 - **Automated checks:** Windows GitHub Actions runs formatting, `cargo check --locked`, strict Clippy, and `cargo test --locked` on the review branch.
 - **Local automated run (2026-11-22):** 338 tests passed, 0 failed, 13 skipped. Skipped tests are opt-in PostgreSQL integration/agent tests, **not** successful database acceptance results.
+- **Updated Windows GitHub Actions (commit `56cea37`, 2026-11-22):** 339 passing tests, 0 failed, 13 ignored; both push and pull-request workflows succeeded. This includes an additional 16-thread fixture-uniqueness regression. Earlier Windows CI showed intermittent `0xc0000409` aborts; the test fixture collision and cleanup risks were addressed, but repeated stress validation is still recommended.
 - **Live local model acceptance (2026-11-22):** A single Windows + `qwen-code-local:9b` exercise showed `VERIFY_WORKSPACE_OK`, explicit approval, `PATCH_VERIFIED`, 3 → 4 passing Rust math tests, and an unchanged protected `src/lib.rs` SHA-256 hash.
 - **Repeat it yourself:** [Step-by-step local Qwen acceptance demo](docs/live-qwen-acceptance.md). This exercises the workspace path; separate single-file handoff has unit/integration regression tests but has not been live-validated in that exercise.
 
