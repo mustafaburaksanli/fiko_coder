@@ -412,7 +412,7 @@ pub fn restoration_preview(root: &Path) -> Result<String, String> {
         "eligible_for_review": eligible_for_review,
         "automatic_restore": false,
         "requires_explicit_user_approval": true,
-        "warning": "READ_ONLY preview. Recheck all file and backup hashes at restore time. No restoration is implemented here.",
+        "warning": "READ_ONLY preview. A separate interactive recovery command requires explicit approval and rechecks hashes before writing; this preview never restores files.",
         "files": entries,
     }))
     .map_err(|e| e.to_string())
