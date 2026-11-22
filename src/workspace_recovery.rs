@@ -542,7 +542,9 @@ pub fn restore_after_explicit_approval(
         // restored. A marker is not a cross-process lock or atomic snapshot.
         let current_marker = read_marker(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
         if sha(&serde_json::to_vec(&current_marker).map_err(|e| e.to_string())?) != fingerprint {
-            return Err("Kurtarma kaydi islem sirasinda degisti; sonraki dosyaya dokunulmadi.".into());
+            return Err(
+                "Kurtarma kaydi islem sirasinda degisti; sonraki dosyaya dokunulmadi.".into(),
+            );
         }
         let original = step.original_sha256.as_deref();
         let observed = file_state(&root, &step.relative, original, &step.updated_sha256);
@@ -1127,7 +1129,8 @@ mod tests {
                     content: "pub fn c() {}\n".into(),
                 },
             ],
-        ).unwrap();
+        )
+        .unwrap();
         let _record = workspace_patch::apply(&project.0, &plan).unwrap();
         let marker_path = project.0.join(".fiko_backups").join(MARKER);
         let original_marker = fs::read(&marker_path).unwrap();
@@ -1189,8 +1192,14 @@ mod tests {
             serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], true);
         assert_eq!(preview["files"][0]["proposed_action"], "already_original");
-        assert_eq!(preview["files"][1]["proposed_action"], "restore_original_from_backup");
-        assert_eq!(preview["files"][2]["proposed_action"], "remove_created_candidate");
+        assert_eq!(
+            preview["files"][1]["proposed_action"],
+            "restore_original_from_backup"
+        );
+        assert_eq!(
+            preview["files"][2]["proposed_action"],
+            "remove_created_candidate"
+        );
 
         // This explicit library call is a trusted test of host functionality.
         // The user-facing binary separately requires interactive confirmation.
