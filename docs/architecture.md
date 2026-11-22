@@ -47,7 +47,7 @@ Rust-owned status report and optional PostgreSQL observation
 - **Memory is not a permission system.** Prior success cannot override protected paths, a changed source hash, or an unapproved candidate.
 - **Temporary workspace is not isolation.** Cargo may run build scripts, procedural macros and tests with the same filesystem/network privileges as the process.
 - **No crash-atomic guarantee.** Multi-file writes are still not atomic. Before target mutation, a bounded `.fiko_backups/workspace.pending.json` marker is saved (best effort; directory metadata durability is not guaranteed). The marker is cleared only after successful host verification or a complete validated rollback. An unexpected shutdown leaves it as evidence and later multi-file writes fail closed.
-- **Recovery is read-only by default.** Run `fiko_coder --recovery-audit` from the project directory to inspect any pending marker and compare file hashes. It never repairs or deletes files automatically. A missing marker does not prove earlier writes were safe. Do not manually delete unresolved markers without independently examining the files and backups.
+- **Recovery is read-only by default.** Run `fiko_coder --recovery-audit` from the project directory to inspect any pending marker and compare target and backup hashes; see the [recovery runbook](workspace-recovery.md). It never repairs or deletes files automatically. A missing marker does not prove earlier writes were safe. Do not manually delete unresolved markers without independently examining the files and backups.
 - External writers, filesystem races and abrupt termination can defeat assumptions. Work on disposable or independently backed-up projects.
 
 ## Independent verification
