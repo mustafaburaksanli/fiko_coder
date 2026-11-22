@@ -515,8 +515,7 @@ fn stage_original_and_replace(
     staged.sync_all().map_err(|e| e.to_string())?;
     // Preserve source permissions, including Unix executable bits. Timestamp
     // metadata may change and is not guaranteed to be preserved.
-    fs::set_permissions(&stage_path, opened_metadata.permissions())
-        .map_err(|e| e.to_string())?;
+    fs::set_permissions(&stage_path, opened_metadata.permissions()).map_err(|e| e.to_string())?;
     let staged_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
     if !staged_metadata.is_file() || is_link(&staged_metadata) {
         return Err("Gecici dosya normal bir dosya degil.".into());
@@ -539,14 +538,16 @@ fn stage_original_and_replace(
     // Recheck before replacement. This narrows, but does not fully close,
     // the race between inspection and renaming the staged file.
     let marker = read_marker(root)?.ok_or("Kurtarma kaydi kayboldu.")?;
-    if sha(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?)
-        != expected_fingerprint
-    {
+    if sha(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?) != expected_fingerprint {
         return Err("Kurtarma kaydi gecici dosya hazirlanirken degisti.".into());
     }
     if discovery::resolve_existing(root, &step.relative)? != step.target
-        || file_state(root, &step.relative, step.original_sha256.as_deref(), &step.updated_sha256)
-            != "updated"
+        || file_state(
+            root,
+            &step.relative,
+            step.original_sha256.as_deref(),
+            &step.updated_sha256,
+        ) != "updated"
     {
         return Err("Hedef gecici dosya hazirlanirken degisti; degisiklik durduruldu.".into());
     }
@@ -1373,7 +1374,9 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        child.kill().expect("failed to terminate staged restore child");
+        child
+            .kill()
+            .expect("failed to terminate staged restore child");
         let child_output = child.wait_with_output().unwrap();
         assert!(!child_output.status.success());
 
@@ -1386,7 +1389,10 @@ mod tests {
         let preview: Value =
             serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], true);
-        assert_eq!(preview["files"][0]["proposed_action"], "restore_original_from_backup");
+        assert_eq!(
+            preview["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
 
         let stage_count = fs::read_dir(project.0.join("src"))
             .unwrap()
