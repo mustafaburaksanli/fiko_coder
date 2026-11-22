@@ -1258,6 +1258,7 @@ mod tests {
                 let mut ready = File::create(&signal).map_err(|e| e.to_string())?;
                 ready.write_all(b"ready").map_err(|e| e.to_string())?;
                 ready.sync_all().map_err(|e| e.to_string())?;
+                drop(ready); // Windows readers must not depend on the child's open handle.
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 return Err("child was not terminated by the parent".into());
             }
