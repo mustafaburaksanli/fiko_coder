@@ -184,6 +184,9 @@ pub struct RepairController {
     workspace_proposals: HashMap<WorkspacePlan, CandidateStatus>,
     verified_workspaces: HashMap<WorkspacePlan, (u64, VerifyMode)>,
     pending_workspace: Option<PendingWorkspace>,
+    /// The exact tool arguments of a successful single-file verification.
+    /// This is a handoff hint, never independent write authority.
+    pending_patch: Option<Value>,
     /// Gorev icinde ulasilan en guclu dogrulama turu; apply icin alt sinir olur.
     required_mode: VerifyMode,
     /// v0.9: gorevin yurutme asamasi. Yalnizca gercek arac sonuclariyla ilerler.
@@ -201,6 +204,7 @@ impl Default for RepairController {
             workspace_proposals: HashMap::new(),
             verified_workspaces: HashMap::new(),
             pending_workspace: None,
+            pending_patch: None,
             required_mode: VerifyMode::Check,
             state: ExecutionState::new(),
         }
@@ -239,6 +243,20 @@ impl RepairController {
         }
         self.prepared_candidates.insert(identity);
         Ok(())
+    }
+
+    /// A verified single-file candidate may be handed to Rust if the model
+    /// stops issuing tool calls. The original apply path still revalidates it.
+    pub(crate) fn record_pending_patch(&mut self, args: &Value) {
+        self.pending_patch = Some(args.clone());
+    }
+
+    pub(crate) fn take_pending_patch_args(&mut self) -> Option<Value> {
+        self.pending_patch.take()
+    }
+
+    pub(crate) fn clear_pending_patch(&mut self) {
+        self.pending_patch = None;
     }
 
     pub(crate) fn pending_workspace_args(&self) -> Option<Value> {
