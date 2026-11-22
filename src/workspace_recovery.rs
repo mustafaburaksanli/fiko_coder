@@ -995,6 +995,48 @@ mod tests {
     }
 
     #[test]
+    fn tampered_backup_after_review_refuses_restore_without_writing_sources() {
+        let project = Fixture::new("late_backup_tampering");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let backup = record.files[0].backup_path.as_ref().unwrap();
+        fs::write(backup, "outside tampering\n").unwrap();
+        let result = restore_after_explicit_approval(&project.0, &fingerprint);
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_target_after_approval_never_writes_outside_project() {
+        use std::os::unix::fs::symlink;
+        let project = Fixture::new("late_symlink");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let original_target = project.0.join("src/a.rs");
+        let outside_target = project.0.parent().unwrap().join(format!(
+            "fiko_recovery_external_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::write(&outside_target, "do-not-touch\n").unwrap();
+        fs::remove_file(&original_target).unwrap();
+        symlink(&outside_target, &original_target).unwrap();
+
+        let restore_result = restore_after_explicit_approval(&project.0, &fingerprint);
+        let external_bytes = fs::read(&outside_target).unwrap();
+        let _ = fs::remove_file(&outside_target);
+        assert!(restore_result.is_err(), "symlink replacement must be blocked");
+        assert_eq!(external_bytes, b"do-not-touch\n");
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
+    #[test]
     fn changed_marker_invalidates_prior_approval_without_writes() {
         let project = Fixture::new("restore_marker_changed");
         let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
