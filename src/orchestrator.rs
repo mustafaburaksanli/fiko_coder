@@ -968,6 +968,11 @@ impl Orchestrator {
         if WRITE_PATH_TOOLS.contains(&name) && name != "apply_workspace" {
             self.repair.clear_pending_workspace();
         }
+        // Any new candidate or explicit apply invalidates a previous
+        // single-file handoff; no later model prose can resurrect it.
+        if WRITE_PATH_TOOLS.contains(&name) {
+            self.repair.clear_pending_patch();
+        }
         if WRITE_PATH_TOOLS.contains(&name) {
             self.plan_verified = false;
         }
