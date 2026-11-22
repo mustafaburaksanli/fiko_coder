@@ -220,7 +220,7 @@ fn backup_state(root: &Path, entry: &Value) -> &'static str {
     if name.is_empty()
         || name.len() > 240
         || !name.ends_with(".bak")
-        || name.contains(['/', '\\'])
+        || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
         || name.chars().any(char::is_control)
         || name == "."
         || name == ".."
@@ -515,6 +515,10 @@ mod tests {
         assert_eq!(fs::read(&marker).unwrap(), audit_before);
         assert!(finish_verified(&project.0, &record).is_err());
         assert!(marker.exists());
+        // A Windows drive-relative or ADS name must never escape the backup directory.
+        value["files"][0]["backup_name"] = json!("C:outside.bak");
+        fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(audit(&project.0).unwrap().contains("backup=unsafe_reference"));
     }
 
     #[cfg(unix)]
