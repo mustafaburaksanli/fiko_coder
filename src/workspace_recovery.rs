@@ -538,6 +538,14 @@ pub fn restore_after_explicit_approval(
     }
 
     for step in &steps {
+        // Reject a replaced pending marker even if an earlier target was
+        // restored. A marker is not a cross-process lock or atomic snapshot.
+        let current_marker = read_marker(&root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+        if sha(&serde_json::to_vec(&current_marker).map_err(|e| e.to_string())?) != fingerprint {
+            return Err(
+                "Kurtarma kaydi islem sirasinda degisti; sonraki dosyaya dokunulmadi.".into(),
+            );
+        }
         let original = step.original_sha256.as_deref();
         let observed = file_state(&root, &step.relative, original, &step.updated_sha256);
         let expected = match step.action.as_str() {
@@ -617,6 +625,20 @@ pub fn restore_after_explicit_approval(
                 "{}: Geri yukleme sonrasi hash farkli; kayit korundu.",
                 step.relative
             ));
+        }
+        // Test-only pause after the first restored file. Parent test kills the
+        // actual process at this point; production binaries cannot enable it.
+        #[cfg(test)]
+        if step.relative == "src/a.rs"
+            && std::env::var_os("FIKO_TEST_RESTORE_CRASH_PROJECT").is_some()
+        {
+            let signal = root.join(".fiko_test_restore_interrupt_ready");
+            let mut file = File::create(signal).map_err(|e| e.to_string())?;
+            file.write_all(b"ready").map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            drop(file);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return Err("Crash test child should have been terminated.".into());
         }
     }
 
@@ -1066,6 +1088,130 @@ mod tests {
         assert_eq!(external_bytes, b"do-not-touch\n");
         assert!(project.0.join(".fiko_backups").join(MARKER).exists());
         assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
+    #[test]
+    #[ignore = "invoked only by isolated process-kill parent test"]
+    fn restore_child_wait_after_first_file() {
+        let Some(root) = std::env::var_os("FIKO_TEST_RESTORE_CRASH_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let result = restore_after_explicit_approval(&root, &fingerprint);
+        panic!("restore child escaped process termination: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "run once in explicit Windows/Linux CI step, not every test suite"]
+    fn restore_parent_kills_child_and_resumes() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Fixture::new("restore_process_kill");
+        fs::write(project.0.join("src/b.rs"), "pub fn b() -> u8 { 2 }\n").unwrap();
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 3 }".into(),
+                },
+                FileChange::Edit {
+                    path: "src/b.rs".into(),
+                    old_text: "pub fn b() -> u8 { 2 }".into(),
+                    new_text: "pub fn b() -> u8 { 4 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/c.rs".into(),
+                    content: "pub fn c() {}\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let marker_path = project.0.join(".fiko_backups").join(MARKER);
+        let original_marker = fs::read(&marker_path).unwrap();
+
+        let signal = project.0.join(".fiko_test_restore_interrupt_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::restore_child_wait_after_first_file",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_RESTORE_CRASH_PROJECT", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to launch dedicated restore child");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "restore child terminated early ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "restore child did not reach first restored file: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill().expect("cannot kill restore child process");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/b.rs")).unwrap(),
+            "pub fn b() -> u8 { 4 }\n"
+        );
+        assert!(project.0.join("src/c.rs").is_file());
+        assert_eq!(fs::read(&marker_path).unwrap(), original_marker);
+
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_original");
+        assert_eq!(
+            preview["files"][1]["proposed_action"],
+            "restore_original_from_backup"
+        );
+        assert_eq!(
+            preview["files"][2]["proposed_action"],
+            "remove_created_candidate"
+        );
+
+        // This explicit library call is a trusted test of host functionality.
+        // The user-facing binary separately requires interactive confirmation.
+        let fingerprint = approved_fingerprint(&project.0);
+        let result = restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(result.contains("RECOVERY_RESTORED"));
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/b.rs")).unwrap(),
+            "pub fn b() -> u8 { 2 }\n"
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+        assert!(!marker_path.exists());
     }
 
     #[test]

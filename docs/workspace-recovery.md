@@ -68,6 +68,18 @@ cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_
 
 The parent test kills a dedicated child process **after two workspace files have been written and before the third write**. It then verifies that the read-only audit can still describe the pending marker, intact backups and unchanged third target. This is a real process kill but **not** a partial-byte-write or sudden power-loss simulation.
 
+### Restore interruption regression
+
+The Windows and Linux CI also run a separate, ignored-by-default test:
+
+```shell
+cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
+```
+
+The parent process kills a dedicated child after the **first** of three files has been restored. It verifies that the marker is retained, the next two files remain unchanged, and the fresh preview reports a resumable `already_original` / `restore_original_from_backup` / `remove_created_candidate` plan. The test then uses the trusted library host API with a newly checked marker fingerprint. The production command still requires interactive local terminal authorization.
+
+This is an actual process kill **between** file writes, not during a partial-byte write or a simulated power outage. The underlying restore procedure is still not an atomic filesystem transaction.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.
