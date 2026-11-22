@@ -4,7 +4,7 @@
 
 The point is to separate *model suggestions* from *host-verified code changes*. A model saying "done" is never evidence that a file was written or that Cargo checks succeeded.
 
-> **Status: v1.2.2 development / pre-release.** This repository is a work in progress, not a security sandbox. Do not use it on untrusted repositories or valuable working trees without independent backups.
+> **Status: v1.2.2 experimental open-source candidate.** This repository is a work in progress, not a security sandbox. Do not use it on untrusted repositories or valuable working trees without independent backups.
 
 ## What it does
 
@@ -17,6 +17,8 @@ The point is to separate *model suggestions* from *host-verified code changes*. 
 - Tracks real tool execution outcomes rather than trusting the language model's claims.
 
 ## Reproducible evidence
+
+CI evidence below is from specific commits; it does not imply universal correctness or production readiness.
 
 - **Automated checks:** Windows GitHub Actions runs formatting, `cargo check --locked`, strict Clippy, and `cargo test --locked` on the review branch.
 - **Local automated run (2026-11-22):** 338 tests passed, 0 failed, 13 skipped. Skipped tests are opt-in PostgreSQL integration/agent tests, **not** successful database acceptance results.
@@ -38,12 +40,9 @@ The local exercise is one maintainer-run observation, **not** a reliability benc
 ```powershell
 git clone https://github.com/mustafaburaksanli/fiko_coder.git
 cd fiko_coder
-git switch fix/verified-handoff-and-oss-readiness-v1.2.2
 cargo build --locked
 cargo run -- qwen-code-local:9b
 ```
-
-**Note:** The default GitHub branch currently points to an older development version. Switch to the newer branch explicitly until a reviewed release is merged.
 
 The agent operates on **the current working directory**, not automatically the directory containing its executable. Open the target Rust/Cargo project first, and invoke the compiled agent by absolute path:
 
@@ -97,4 +96,4 @@ Read [SECURITY.md](SECURITY.md) before using on real projects.
 
 ## Contributing and licensing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). This review branch **proposes** the **Apache License 2.0** for code contained in this repository (see [LICENSE](LICENSE)); the maintainer must approve this license decision before the branch is merged or a release is published.
+See [CONTRIBUTING.md](CONTRIBUTING.md). FİKO CODER source code in this independent repository is made available under the **Apache License 2.0** (see [LICENSE](LICENSE)). This license does not grant rights to code outside this repository.
