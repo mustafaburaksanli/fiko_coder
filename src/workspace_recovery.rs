@@ -4,7 +4,7 @@
 //! It never restores files automatically and never grants write authorization.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -454,6 +454,128 @@ fn verified_backup_bytes(root: &Path, entry: &Value) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
+/// A file is staged as a sibling on the same filesystem and synced BEFORE
+/// replacing the candidate. On process termination during staging, the target
+/// remains untouched and the recovery marker stays pending.
+///
+/// This is not a whole-workspace transaction, a power-loss guarantee, or a
+/// defense against a malicious concurrent filesystem writer.
+fn stage_original_and_replace(
+    root: &Path,
+    step: &RestoreStep,
+    opened: File,
+    opened_metadata: &fs::Metadata,
+    expected_fingerprint: &str,
+) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let bytes = step
+        .backup_bytes
+        .as_ref()
+        .ok_or("Geri yukleme yedegi kayip.")?;
+    if step.original_sha256.as_deref() != Some(sha(bytes).as_str()) {
+        return Err("Geri yukleme icerigi orijinal SHA256 ile uyusmuyor.".into());
+    }
+    let parent = step.target.parent().ok_or("Hedef ebeveyn klasoru yok.")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mut created = None;
+    for attempt in 0..16 {
+        let name = format!(
+            ".fiko_restore_stage_{}_{}_{}.tmp",
+            std::process::id(),
+            stamp,
+            attempt
+        );
+        let path = parent.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                created = Some((file, path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Geri yukleme gecici dosyasi olusturulamadi: {e}")),
+        }
+    }
+    let (stage_handle, stage_path) = created.ok_or("Gecici dosya adlari kullaniliyor.")?;
+    // If the process dies, Drop is not invoked and an orphan staging file may
+    // remain for manual review. On ordinary failures, clean up our own file.
+    struct StageCleanup(Option<PathBuf>);
+    impl Drop for StageCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = StageCleanup(Some(stage_path.clone()));
+    // Declare the live file handle AFTER the cleanup guard, so it closes
+    // before cleanup runs on early return (required on Windows).
+    let mut staged = stage_handle;
+    staged.write_all(bytes).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    // Preserve source permissions, including Unix executable bits. Timestamp
+    // metadata may change and is not guaranteed to be preserved.
+    fs::set_permissions(&stage_path, opened_metadata.permissions()).map_err(|e| e.to_string())?;
+    // Permission changes modify metadata too; flush them before replacement.
+    staged.sync_all().map_err(|e| e.to_string())?;
+    let staged_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+    if !staged_metadata.is_file()
+        || is_link(&staged_metadata)
+        || staged_metadata.len() != bytes.len() as u64
+    {
+        return Err("Gecici dosya normal bir dosya degil veya uzunlugu degisti.".into());
+    }
+    drop(staged);
+    let mut staged_readback = Vec::new();
+    File::open(&stage_path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut staged_readback)
+        .map_err(|e| e.to_string())?;
+    if staged_readback.len() != bytes.len() || sha(&staged_readback) != sha(bytes) {
+        return Err("Gecici dosya diskte dogrulanamadi; hedef degistirilmedi.".into());
+    }
+
+    #[cfg(test)]
+    if step.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_RESTORE_STAGE_KILL_PROJECT").is_some()
+    {
+        let signal = root.join(".fiko_test_restore_stage_ready");
+        let mut file = File::create(signal).map_err(|e| e.to_string())?;
+        file.write_all(b"ready").map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Stage test child should have been terminated.".into());
+    }
+
+    // Recheck before replacement. This narrows, but does not fully close,
+    // the race between inspection and renaming the staged file.
+    let marker = read_marker(root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+    if sha(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?) != expected_fingerprint {
+        return Err("Kurtarma kaydi gecici dosya hazirlanirken degisti.".into());
+    }
+    if discovery::resolve_existing(root, &step.relative)? != step.target
+        || file_state(
+            root,
+            &step.relative,
+            step.original_sha256.as_deref(),
+            &step.updated_sha256,
+        ) != "updated"
+    {
+        return Err("Hedef gecici dosya hazirlanirken degisti; degisiklik durduruldu.".into());
+    }
+    // Release the source handle before rename, especially on Windows.
+    drop(opened);
+    fs::rename(&stage_path, &step.target)
+        .map_err(|e| format!("Gecici dosya hedefin yerine konulamadi: {e}"))?;
+    cleanup.0 = None;
+    Ok(())
+}
+
 /// Trusted HOST API for recovery after a separately collected, explicit local
 /// terminal approval. Not a model tool. This method NEVER asks for approval:
 /// callers must perform the human prompt and pass the exact marker fingerprint.
@@ -570,10 +692,6 @@ pub fn restore_after_explicit_approval(
                         step.relative
                     ));
                 }
-                let bytes = step
-                    .backup_bytes
-                    .as_ref()
-                    .ok_or("Geri yukleme yedegi kayip.")?;
                 let mut handle = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -603,10 +721,7 @@ pub fn restore_after_explicit_approval(
                         step.relative
                     ));
                 }
-                handle.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                handle.set_len(0).map_err(|e| e.to_string())?;
-                handle.write_all(bytes).map_err(|e| e.to_string())?;
-                handle.sync_all().map_err(|e| e.to_string())?;
+                stage_original_and_replace(&root, step, handle, &opened, fingerprint)?;
             }
             "remove_created_candidate" => {
                 fs::remove_file(&step.target).map_err(|e| format!("{}: {e}", step.relative))?;
@@ -1212,6 +1327,163 @@ mod tests {
         );
         assert!(!project.0.join("src/c.rs").exists());
         assert!(!marker_path.exists());
+    }
+
+    #[test]
+    #[ignore = "only invoked by the isolated staged-restore kill test"]
+    fn staged_restore_child_waits_before_replace() {
+        let Some(root) = std::env::var_os("FIKO_TEST_RESTORE_STAGE_KILL_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let result = restore_after_explicit_approval(&root, &fingerprint);
+        panic!("stage child reached completion without forced termination: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "dedicated cross-platform process kill regression"]
+    fn process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Fixture::new("restore_staged_process_kill");
+        let plan = project.plan();
+        let record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let marker_before = fs::read(&marker).unwrap();
+        let signal = project.0.join(".fiko_test_restore_stage_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::staged_restore_child_waits_before_replace",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_RESTORE_STAGE_KILL_PROJECT", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot launch staged restore child");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "staged restore child exited before kill point ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "staged restore child did not emit signal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child
+            .kill()
+            .expect("failed to terminate staged restore child");
+        let child_output = child.wait_with_output().unwrap();
+        assert!(!child_output.status.success());
+
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(
+            preview["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
+
+        let stage_count = fs::read_dir(project.0.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_restore_stage_")
+            })
+            .count();
+        assert_eq!(stage_count, 1, "killed child should leave one staged copy");
+
+        // A fresh, separately approved host recovery can safely finish despite
+        // the orphan stage. It does not silently delete orphan evidence.
+        restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0)).unwrap();
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_restore_does_not_modify_external_hard_link() {
+        let project = Fixture::new("restore_hardlink");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let external = project.0.parent().unwrap().join(format!(
+            "fiko_external_hardlink_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::hard_link(project.0.join("src/a.rs"), &external).unwrap();
+        assert_eq!(
+            fs::read_to_string(&external).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        let result = restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0));
+        let outside_content = fs::read_to_string(&external).unwrap();
+        let _ = fs::remove_file(&external);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert_eq!(outside_content, "pub fn a() -> u8 { 2 }\n");
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
+    #[test]
+    fn staged_restore_preserves_source_permissions_when_supported() {
+        let project = Fixture::new("restore_permissions");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let source = project.0.join("src/a.rs");
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(project.0.join("src/a.rs"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
     }
 
     #[test]
