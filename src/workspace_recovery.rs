@@ -1021,7 +1021,10 @@ mod tests {
         let outside_target = project.0.parent().unwrap().join(format!(
             "fiko_recovery_external_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::write(&outside_target, "do-not-touch\n").unwrap();
         fs::remove_file(&original_target).unwrap();
@@ -1030,7 +1033,10 @@ mod tests {
         let restore_result = restore_after_explicit_approval(&project.0, &fingerprint);
         let external_bytes = fs::read(&outside_target).unwrap();
         let _ = fs::remove_file(&outside_target);
-        assert!(restore_result.is_err(), "symlink replacement must be blocked");
+        assert!(
+            restore_result.is_err(),
+            "symlink replacement must be blocked"
+        );
         assert_eq!(external_bytes, b"do-not-touch\n");
         assert!(project.0.join(".fiko_backups").join(MARKER).exists());
         assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
