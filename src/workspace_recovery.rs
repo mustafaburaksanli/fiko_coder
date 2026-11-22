@@ -4,7 +4,7 @@
 //! It never restores files automatically and never grants write authorization.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -454,6 +454,108 @@ fn verified_backup_bytes(root: &Path, entry: &Value) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
+/// A file is staged as a sibling on the same filesystem and synced BEFORE
+/// replacing the candidate. On process termination during staging, the target
+/// remains untouched and the recovery marker stays pending.
+///
+/// This is not a whole-workspace transaction, a power-loss guarantee, or a
+/// defense against a malicious concurrent filesystem writer.
+fn stage_original_and_replace(
+    root: &Path,
+    step: &RestoreStep,
+    opened: File,
+    opened_metadata: &fs::Metadata,
+    expected_fingerprint: &str,
+) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let bytes = step
+        .backup_bytes
+        .as_ref()
+        .ok_or("Geri yukleme yedegi kayip.")?;
+    if step.original_sha256.as_deref() != Some(sha(bytes).as_str()) {
+        return Err("Geri yukleme icerigi orijinal SHA256 ile uyusmuyor.".into());
+    }
+    let parent = step.target.parent().ok_or("Hedef ebeveyn klasoru yok.")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mut created = None;
+    for attempt in 0..16 {
+        let name = format!(
+            ".fiko_restore_stage_{}_{}_{}.tmp",
+            std::process::id(),
+            stamp,
+            attempt
+        );
+        let path = parent.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                created = Some((file, path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Geri yukleme gecici dosyasi olusturulamadi: {e}")),
+        }
+    }
+    let (mut staged, stage_path) = created.ok_or("Gecici dosya adlari kullaniliyor.")?;
+    // If the process dies, Drop is not invoked and an orphan staging file may
+    // remain for manual review. On ordinary failures, clean up our own file.
+    struct StageCleanup(PathBuf);
+    impl Drop for StageCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let cleanup = StageCleanup(stage_path.clone());
+    staged.write_all(bytes).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    // Preserve source permissions, including Unix executable bits. Timestamp
+    // metadata may change and is not guaranteed to be preserved.
+    fs::set_permissions(&stage_path, opened_metadata.permissions())
+        .map_err(|e| e.to_string())?;
+    let staged_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+    if !staged_metadata.is_file() || is_link(&staged_metadata) {
+        return Err("Gecici dosya normal bir dosya degil.".into());
+    }
+    drop(staged);
+
+    #[cfg(test)]
+    if step.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_RESTORE_STAGE_KILL_PROJECT").is_some()
+    {
+        let signal = root.join(".fiko_test_restore_stage_ready");
+        let mut file = File::create(signal).map_err(|e| e.to_string())?;
+        file.write_all(b"ready").map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Stage test child should have been terminated.".into());
+    }
+
+    // Recheck before replacement. This narrows, but does not fully close,
+    // the race between inspection and renaming the staged file.
+    let marker = read_marker(root)?.ok_or("Kurtarma kaydi kayboldu.")?;
+    if sha(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?)
+        != expected_fingerprint
+    {
+        return Err("Kurtarma kaydi gecici dosya hazirlanirken degisti.".into());
+    }
+    if discovery::resolve_existing(root, &step.relative)? != step.target
+        || file_state(root, &step.relative, step.original_sha256.as_deref(), &step.updated_sha256)
+            != "updated"
+    {
+        return Err("Hedef gecici dosya hazirlanirken degisti; degisiklik durduruldu.".into());
+    }
+    // Release the source handle before rename, especially on Windows.
+    drop(opened);
+    fs::rename(&stage_path, &step.target)
+        .map_err(|e| format!("Gecici dosya hedefin yerine konulamadi: {e}"))?;
+    drop(cleanup);
+    Ok(())
+}
+
 /// Trusted HOST API for recovery after a separately collected, explicit local
 /// terminal approval. Not a model tool. This method NEVER asks for approval:
 /// callers must perform the human prompt and pass the exact marker fingerprint.
@@ -603,10 +705,7 @@ pub fn restore_after_explicit_approval(
                         step.relative
                     ));
                 }
-                handle.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                handle.set_len(0).map_err(|e| e.to_string())?;
-                handle.write_all(bytes).map_err(|e| e.to_string())?;
-                handle.sync_all().map_err(|e| e.to_string())?;
+                stage_original_and_replace(&root, step, handle, &opened, fingerprint)?;
             }
             "remove_created_candidate" => {
                 fs::remove_file(&step.target).map_err(|e| format!("{}: {e}", step.relative))?;
