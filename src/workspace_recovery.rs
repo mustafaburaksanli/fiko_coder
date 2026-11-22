@@ -465,10 +465,12 @@ pub fn restore_after_explicit_approval(
     approved_fingerprint: &str,
 ) -> Result<String, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let preview: Value = serde_json::from_str(&restoration_preview(&root)?)
-        .map_err(|e| e.to_string())?;
+    let preview: Value =
+        serde_json::from_str(&restoration_preview(&root)?).map_err(|e| e.to_string())?;
     if preview["status"] != "pending" || preview["eligible_for_review"] != true {
-        return Err("Kurtarma plani manuel inceleme istiyor veya kayit yok; yazma reddedildi.".into());
+        return Err(
+            "Kurtarma plani manuel inceleme istiyor veya kayit yok; yazma reddedildi.".into(),
+        );
     }
     let fingerprint = preview["marker_fingerprint_sha256"]
         .as_str()
@@ -480,8 +482,12 @@ pub fn restore_after_explicit_approval(
     if sha(&serde_json::to_vec(&marker).map_err(|e| e.to_string())?) != fingerprint {
         return Err("Kurtarma kaydi onaydan sonra degisti.".into());
     }
-    let source_files = marker["files"].as_array().ok_or("Kurtarma listesi gecersiz.")?;
-    let planned_files = preview["files"].as_array().ok_or("Kurtarma onizlemesi gecersiz.")?;
+    let source_files = marker["files"]
+        .as_array()
+        .ok_or("Kurtarma listesi gecersiz.")?;
+    let planned_files = preview["files"]
+        .as_array()
+        .ok_or("Kurtarma onizlemesi gecersiz.")?;
     if source_files.len() != planned_files.len() {
         return Err("Kurtarma listesi onaydan sonra degisti.".into());
     }
@@ -496,8 +502,12 @@ pub fn restore_after_explicit_approval(
         }
         let target = discovery::resolve_target(&root, relative)?;
         let original = entry["original_sha256"].as_str();
-        let updated = entry["updated_sha256"].as_str().ok_or("Aday SHA256 eksik.")?;
-        let action = proposal["proposed_action"].as_str().ok_or("Kurtarma eylemi eksik.")?;
+        let updated = entry["updated_sha256"]
+            .as_str()
+            .ok_or("Aday SHA256 eksik.")?;
+        let action = proposal["proposed_action"]
+            .as_str()
+            .ok_or("Kurtarma eylemi eksik.")?;
         let required_state = match action {
             "restore_original_from_backup" | "remove_created_candidate" => "updated",
             "already_original" => "original",
@@ -505,7 +515,9 @@ pub fn restore_after_explicit_approval(
             _ => return Err("Manuel inceleme gerektiren kurtarma eylemi reddedildi.".into()),
         };
         if file_state(&root, relative, original, updated) != required_state {
-            return Err(format!("{relative}: Dosya onaydan once degisti; geri yukleme reddedildi."));
+            return Err(format!(
+                "{relative}: Dosya onaydan once degisti; geri yukleme reddedildi."
+            ));
         }
         let backup_bytes = if action == "restore_original_from_backup" {
             Some(verified_backup_bytes(&root, entry)?)
@@ -535,16 +547,25 @@ pub fn restore_after_explicit_approval(
             _ => return Err("Bilinmeyen kurtarma eylemi.".into()),
         };
         if observed != expected {
-            return Err(format!("{}: Dis degisiklik tespit edildi; kurtarma durduruldu, kayit korundu.", step.relative));
+            return Err(format!(
+                "{}: Dis degisiklik tespit edildi; kurtarma durduruldu, kayit korundu.",
+                step.relative
+            ));
         }
 
         match step.action.as_str() {
             "restore_original_from_backup" => {
                 let meta = fs::symlink_metadata(&step.target).map_err(|e| e.to_string())?;
                 if !meta.is_file() || is_link(&meta) || meta.len() > MAX_FILE_BYTES as u64 {
-                    return Err(format!("{}: Geri yuklenecek hedef guvenli degil.", step.relative));
+                    return Err(format!(
+                        "{}: Geri yuklenecek hedef guvenli degil.",
+                        step.relative
+                    ));
                 }
-                let bytes = step.backup_bytes.as_ref().ok_or("Geri yukleme yedegi kayip.")?;
+                let bytes = step
+                    .backup_bytes
+                    .as_ref()
+                    .ok_or("Geri yukleme yedegi kayip.")?;
                 let mut handle = OpenOptions::new()
                     .write(true)
                     .open(&step.target)
@@ -560,9 +581,16 @@ pub fn restore_after_explicit_approval(
             _ => return Err("Bilinmeyen kurtarma eylemi.".into()),
         }
         let final_state = file_state(&root, &step.relative, original, &step.updated_sha256);
-        let desired = if original.is_some() { "original" } else { "original_absent" };
+        let desired = if original.is_some() {
+            "original"
+        } else {
+            "original_absent"
+        };
         if final_state != desired {
-            return Err(format!("{}: Geri yukleme sonrasi hash farkli; kayit korundu.", step.relative));
+            return Err(format!(
+                "{}: Geri yukleme sonrasi hash farkli; kayit korundu.",
+                step.relative
+            ));
         }
     }
 
@@ -572,13 +600,18 @@ pub fn restore_after_explicit_approval(
         return Err("Kurtarma kaydi degisti; kayit korunuyor.".into());
     }
     for (step, entry) in steps.iter().zip(source_files) {
-        let desired = if step.original_sha256.is_some() { "original" } else { "original_absent" };
+        let desired = if step.original_sha256.is_some() {
+            "original"
+        } else {
+            "original_absent"
+        };
         if file_state(
             &root,
             &step.relative,
             step.original_sha256.as_deref(),
             &step.updated_sha256,
-        ) != desired || !matches!(backup_state(&root, entry), "intact" | "not_required")
+        ) != desired
+            || !matches!(backup_state(&root, entry), "intact" | "not_required")
         {
             return Err("Geri yuklenen dosyalar tekrar dogrulanamadi; kayit korundu.".into());
         }
@@ -848,7 +881,10 @@ mod tests {
 
     fn approved_fingerprint(root: &Path) -> String {
         let preview: Value = serde_json::from_str(&restoration_preview(root).unwrap()).unwrap();
-        preview["marker_fingerprint_sha256"].as_str().unwrap().to_owned()
+        preview["marker_fingerprint_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
@@ -911,7 +947,8 @@ mod tests {
                     content: "new\n".into(),
                 },
             ],
-        ).unwrap();
+        )
+        .unwrap();
         let _record = workspace_patch::apply(&project.0, &plan).unwrap();
         let fingerprint = approved_fingerprint(&project.0);
         fs::write(project.0.join("src/new.rs"), "external edit\n").unwrap();
@@ -943,10 +980,12 @@ mod tests {
                     content: "new\n".into(),
                 },
             ],
-        ).unwrap();
+        )
+        .unwrap();
         let _record = workspace_patch::apply(&project.0, &plan).unwrap();
         fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 1 }\n").unwrap();
-        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], true);
         assert_eq!(preview["files"][0]["proposed_action"], "already_original");
         let fingerprint = approved_fingerprint(&project.0);
