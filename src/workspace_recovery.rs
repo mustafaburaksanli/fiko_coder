@@ -502,13 +502,15 @@ fn stage_original_and_replace(
     let (mut staged, stage_path) = created.ok_or("Gecici dosya adlari kullaniliyor.")?;
     // If the process dies, Drop is not invoked and an orphan staging file may
     // remain for manual review. On ordinary failures, clean up our own file.
-    struct StageCleanup(PathBuf);
+    struct StageCleanup(Option<PathBuf>);
     impl Drop for StageCleanup {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
         }
     }
-    let cleanup = StageCleanup(stage_path.clone());
+    let mut cleanup = StageCleanup(Some(stage_path.clone()));
     staged.write_all(bytes).map_err(|e| e.to_string())?;
     staged.sync_all().map_err(|e| e.to_string())?;
     // Preserve source permissions, including Unix executable bits. Timestamp
@@ -552,7 +554,7 @@ fn stage_original_and_replace(
     drop(opened);
     fs::rename(&stage_path, &step.target)
         .map_err(|e| format!("Gecici dosya hedefin yerine konulamadi: {e}"))?;
-    drop(cleanup);
+    cleanup.0 = None;
     Ok(())
 }
 
@@ -672,10 +674,6 @@ pub fn restore_after_explicit_approval(
                         step.relative
                     ));
                 }
-                let bytes = step
-                    .backup_bytes
-                    .as_ref()
-                    .ok_or("Geri yukleme yedegi kayip.")?;
                 let mut handle = OpenOptions::new()
                     .read(true)
                     .write(true)
