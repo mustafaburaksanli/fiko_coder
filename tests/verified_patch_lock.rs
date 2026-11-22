@@ -206,7 +206,11 @@ async fn kilit_izin_verilince_guvenli_akis_calisir() {
         .map(|entry| entry.unwrap().path())
         .filter(|path| path != &backup_dir.join("workspace.operation.lock"))
         .collect();
-    assert_eq!(backups, vec![record.backup_path.clone()], "tek gercek yedek beklenir");
+    assert_eq!(
+        backups,
+        vec![record.backup_path.clone()],
+        "tek gercek yedek beklenir"
+    );
     assert_eq!(fs::read_to_string(&record.backup_path).unwrap(), MINI_MAIN);
 
     let _ = fs::remove_dir_all(&root);
