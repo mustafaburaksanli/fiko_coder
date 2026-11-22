@@ -990,6 +990,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_single_file_rollback_respects_cooperative_lock() {
+        let project = Fixture::new("single_rollback_lock");
+        let root = project.0.canonicalize().unwrap();
+        let plan = crate::tools::prepare_patch(
+            &root,
+            "src/a.rs",
+            "pub fn a() -> u8 { 1 }",
+            "pub fn a() -> u8 { 3 }",
+        )
+        .unwrap();
+        let record = crate::tools::apply_approved_patch(&root, plan).unwrap();
+        let lock = try_lock_operation(&root).unwrap();
+        let err = crate::tools::rollback_patch(&record).unwrap_err();
+        assert!(err.contains("Baska bir FIKO"), "{err}");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 3 }\n"
+        );
+        drop(lock);
+        crate::tools::rollback_patch(&record).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+    }
+
+    #[test]
     #[ignore = "isolated child only; parent test owns the process lifetime"]
     fn operation_lock_child_holds_until_killed() {
         let Some(project) = std::env::var_os("FIKO_TEST_WORKSPACE_LOCK_CHILD") else {
