@@ -151,6 +151,7 @@ pub fn try_lock_operation(root: &Path) -> Result<WorkspaceOperationGuard, String
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|e| format!("Islem kilidi acilamadi: {e}"))?;
     let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
