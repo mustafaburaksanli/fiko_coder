@@ -94,6 +94,12 @@ A dedicated Windows/Linux CI regression terminates a real isolated process **aft
 
 This is process termination after a controlled partial write, not sudden power loss or evidence of whole-workspace crash atomicity. Orphan staging files are retained for review rather than trusted or automatically deleted.
 
+### Last staging-file integrity gate
+
+Immediately before replacing a candidate source, the restore implementation reads the sibling staged file again and checks its type, length, symlink status, and SHA-256 against the verified original. If the staged file was altered during the earlier marker/source checks, restoration stops, preserves the pending marker, and leaves the candidate unchanged. The ordinary failure path removes only that operation's temporary staged file.
+
+Tests include same-length staged-content tampering and a dedicated isolated-process tampering scenario. This narrows the race but **does not** provide an OS-wide exclusive file lock or prevent hostile races between the final check and rename.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.
