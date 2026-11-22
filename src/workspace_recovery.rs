@@ -540,6 +540,101 @@ mod tests {
     }
 
     #[test]
+    fn restoration_preview_is_read_only_and_classifies_edit_and_create() {
+        let project = Fixture::new("preview");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "pub fn new_file() {}\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let before = fs::read(&marker).unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["status"], "pending");
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["automatic_restore"], false);
+        assert_eq!(preview["requires_explicit_user_approval"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "restore_original_from_backup");
+        assert_eq!(preview["files"][1]["proposed_action"], "remove_created_candidate");
+        assert_eq!(preview["files"][1]["backup_state"], "not_required");
+        assert_eq!(fs::read(&marker).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(project.0.join("src/new.rs").is_file());
+    }
+
+    #[test]
+    fn restoration_preview_requires_review_for_external_modification_or_corrupt_backup() {
+        let project = Fixture::new("drift_preview");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let backup = record.files[0].backup_path.as_ref().unwrap();
+        fs::write(project.0.join("src/a.rs"), "external modification\n").unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["target_state"], "unexpected");
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
+
+        fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 2 }\n").unwrap();
+        fs::write(backup, "tampered backup\n").unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["backup_state"], "mismatch");
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
+    }
+
+    #[test]
+    fn restoration_preview_flags_duplicate_and_forged_hash_records() {
+        let project = Fixture::new("duplicate_preview");
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let path = project.0.join(".fiko_backups").join(MARKER);
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let duplicated = manifest["files"][0].clone();
+        manifest["files"].as_array_mut().unwrap().push(duplicated);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][1]["target_state"], "invalid_or_duplicate_target");
+        assert_eq!(preview["files"][1]["proposed_action"], "manual_review");
+
+        manifest["files"].as_array_mut().unwrap().pop();
+        manifest["files"][0]["updated_sha256"] = json!("forged");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["target_state"], "invalid_or_duplicate_target");
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn restoration_preview_marks_original_and_missing_marker_without_mutation() {
+        let project = Fixture::new("preview_original");
+        let absent: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(absent["status"], "no_pending");
+        assert_eq!(absent["eligible_for_review"], false);
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 1 }\n").unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_original");
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+        // A plan never removes the marker or alters its backup.
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
+    #[test]
     fn unclosed_marker_blocks_second_transaction() {
         let project = Fixture::new("blocked");
         let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
