@@ -199,11 +199,18 @@ async fn kilit_izin_verilince_guvenli_akis_calisir() {
     // Gercek dosya degisti, yedek alindi, geri alma kaydi var.
     let content = main_rs(&root);
     assert!(content.contains(MINI_GOOD), "{content}");
-    let backups: Vec<_> = fs::read_dir(root.join(".fiko_backups"))
-        .expect("yedek klasoru olusmali")
-        .collect();
-    assert_eq!(backups.len(), 1, "tek yedek beklenir");
     let record = session.last_patch.as_ref().expect("geri alma kaydi");
+    let backup_dir = root.join(".fiko_backups");
+    let backups: Vec<_> = fs::read_dir(&backup_dir)
+        .expect("yedek klasoru olusmali")
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path != &backup_dir.join("workspace.operation.lock"))
+        .collect();
+    assert_eq!(
+        backups,
+        vec![record.backup_path.clone()],
+        "tek gercek yedek beklenir"
+    );
     assert_eq!(fs::read_to_string(&record.backup_path).unwrap(), MINI_MAIN);
 
     let _ = fs::remove_dir_all(&root);

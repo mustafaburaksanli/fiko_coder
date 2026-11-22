@@ -857,8 +857,14 @@ pub fn save_backup(root: &Path, file: &Path, original: &str) -> Result<PathBuf, 
 /// Hedef dosyaya yazim atomik degildir (Windows'ta rename/kilit davranislari
 /// farklidir); kurtarma mekanizmasi yedek dosyasi ve geri okuma kontroludur.
 pub fn apply_approved_patch(root: &Path, plan: PatchPlan) -> Result<PatchRecord, String> {
-    // An interrupted multi-file transaction must also block single-file edits.
-    // This check runs before any additional backup or target write.
+    // Read-only preflight must not create lock/backup artifacts on stale input.
+    crate::workspace_recovery::ensure_clear(root)?;
+    let current = fs::read_to_string(&plan.path).map_err(|e| e.to_string())?;
+    if current != plan.original {
+        return Err("Dosya onay beklenirken degisti; patch iptal edildi.".into());
+    }
+    // Coordinate all FIKO writers and revalidate under the same lock.
+    let _operation_lock = crate::workspace_recovery::try_lock_operation(root)?;
     crate::workspace_recovery::ensure_clear(root)?;
     let current = fs::read_to_string(&plan.path).map_err(|e| e.to_string())?;
     if current != plan.original {
@@ -889,6 +895,19 @@ pub fn apply_approved_patch(root: &Path, plan: PatchPlan) -> Result<PatchRecord,
 }
 
 pub fn rollback_patch(record: &PatchRecord) -> Result<(), String> {
+    let root = record
+        .backup_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Patch yedegi proje kokune baglanamadi.")?;
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    // Read-only checks first; then recheck under the same lock used by apply.
+    let current = fs::read_to_string(&record.path).map_err(|e| e.to_string())?;
+    if current != record.updated {
+        return Err("Dosya patch sonrasinda degismis; otomatik geri alma reddedildi.".into());
+    }
+    let _operation_lock = crate::workspace_recovery::try_lock_operation(&root)?;
+    crate::workspace_recovery::ensure_clear(&root)?;
     let current = fs::read_to_string(&record.path).map_err(|e| e.to_string())?;
     if current != record.updated {
         return Err("Dosya patch sonrasinda degismis; otomatik geri alma reddedildi.".into());
