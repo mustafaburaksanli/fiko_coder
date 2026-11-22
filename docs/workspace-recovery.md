@@ -36,7 +36,19 @@ The command prints a machine-readable JSON review plan with target and backup st
 
 `eligible_for_review: true` means all entries have expected hashes and usable backups **at the time they were read**. It is not permission to restore, an atomic snapshot, or a safety certification. The preview is deliberately read-only: it does not restore, clear the marker, or start Cargo/Ollama/PostgreSQL. An invalid duplicate target, forged hash, modified file, unsafe path, or corrupted backup produces `manual_review` and `eligible_for_review: false`.
 
-Before any future restore operation, the host must recheck both the marker fingerprint and actual target/backup hashes, and require an explicit user approval. **This preview does not yet implement that write operation.**
+## Explicitly approved restore (v1.3 experimental)
+
+**Make an independent copy of the project and `.fiko_backups` first.** Review the JSON plan and all changed files. If `eligible_for_review` is `true` and you explicitly want to discard candidate edits and return to original code, run the following from the affected project directory using an independently built executable:
+
+```powershell
+& "C:\path\to\fiko_coder.exe" --recovery-restore
+```
+
+The command requires an **interactive local terminal** (piped input and unattended authorization are refused). It prints the current plan, then requires typing `RESTORE` followed by the **entire** 64-character marker fingerprint. The tool rechecks marker identity, all target and backup hashes, and each target again immediately before changing it. Successful recovery restores original source bytes from validated backups, deletes only candidate-created files that still have their expected contents, verifies final hashes, and only then clears the pending marker. No Cargo checks or model tools are run.
+
+On an unexpected file, changed/invalid backup, wrong approval, broken marker, partial write, or external modification, recovery refuses or stops and **keeps the marker**. Some preceding files may have been restored before an error; inspect `--recovery-plan` again and take an independent snapshot before a retry. Resume only after new interactive approval. The operation is **not atomic** and does not provide an operating-system-wide lock or protection against malicious concurrent writers, abrupt power loss, or races between each read and write.
+
+The host's restore routine is not available as an agent tool: it must never infer the user's approval from model output, an old conversation, or the plan's `eligible_for_review` flag.
 
 ## Incident response (no automatic restore)
 
@@ -63,4 +75,4 @@ The parent test kills a dedicated child process **after two workspace files have
 - The marker does not guarantee directory durability, absence of power-loss corruption or process isolation.
 - SHA-256 matches demonstrate byte integrity relative to the marker, not authenticity or approval.
 - Candidate verification via Cargo is **not sandboxed**, even in a temporary workspace.
-- Full crash recovery with user-approved file restoration is not yet implemented.
+- User-confirmed restoration is fail-closed and resumable for already-original / already-absent targets, but is **not** a filesystem transaction and cannot guarantee crash atomicity.
