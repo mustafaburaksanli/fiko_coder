@@ -24,6 +24,20 @@ The audit does not call Ollama, PostgreSQL or Cargo. Avoid running `cargo run` i
 
 **Pending marker write lock:** Both `apply_workspace` and single-file `apply_patch` reject new writes when an unresolved workspace marker exists. This does not freeze unrelated external processes or replace user-reviewed recovery.
 
+## Structured restoration preview (read-only)
+
+From the project directory, use an independently built FİKO CODER executable:
+
+```powershell
+& "C:\path\to\fiko_coder.exe" --recovery-plan
+```
+
+The command prints a machine-readable JSON review plan with target and backup states, a marker fingerprint, and a proposed action for each file: `restore_original_from_backup`, `remove_created_candidate`, `already_original`, `already_absent`, or `manual_review`.
+
+`eligible_for_review: true` means all entries have expected hashes and usable backups **at the time they were read**. It is not permission to restore, an atomic snapshot, or a safety certification. The preview is deliberately read-only: it does not restore, clear the marker, or start Cargo/Ollama/PostgreSQL. An invalid duplicate target, forged hash, modified file, unsafe path, or corrupted backup produces `manual_review` and `eligible_for_review: false`.
+
+Before any future restore operation, the host must recheck both the marker fingerprint and actual target/backup hashes, and require an explicit user approval. **This preview does not yet implement that write operation.**
+
 ## Incident response (no automatic restore)
 
 1. Stop new writes and make an **independent copy** of the project and its `.fiko_backups` directory.
