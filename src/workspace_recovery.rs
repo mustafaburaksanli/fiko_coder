@@ -434,7 +434,9 @@ mod tests {
             "pub fn a() -> u8 { 3 }",
         )
         .unwrap();
-        let error = crate::tools::apply_approved_patch(&project.0, single).unwrap_err();
+        let error = crate::tools::apply_approved_patch(&project.0, single)
+            .err()
+            .expect("pending marker must reject single-file write");
         assert!(error.contains("belirsiz"), "{error}");
         assert_eq!(fs::read_dir(&backups).unwrap().count(), entries_before);
         assert_eq!(
@@ -473,7 +475,9 @@ mod tests {
             "pub fn a() -> u8 { 3 }",
         )
         .unwrap();
-        let error = crate::tools::apply_approved_patch(&project.0, single).unwrap_err();
+        let error = crate::tools::apply_approved_patch(&project.0, single)
+            .err()
+            .expect("pending marker must reject single-file write");
         assert!(error.contains("belirsiz"), "{error}");
         assert_eq!(fs::read_dir(&backups).unwrap().count(), 1);
         assert_eq!(
