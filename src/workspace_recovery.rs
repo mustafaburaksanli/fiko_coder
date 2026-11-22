@@ -113,6 +113,56 @@ fn matching_marker(root: &Path, record: &WorkspaceRecord) -> Result<bool, String
     Ok(true)
 }
 
+/// OS-backed advisory lock, shared by FIKO's single-file edits, workspace
+/// apply and explicitly approved recovery. The file stays on disk on purpose:
+/// deleting a lock file can let two processes lock different inodes.
+pub struct WorkspaceOperationGuard {
+    _locked_file: File,
+}
+
+/// Non-blocking exclusive lock. A killed process releases its OS handle; a
+/// pending marker remains separately responsible for crash recovery.
+///
+/// This coordinates cooperating FIKO processes only; it does not stop external
+/// editors or offer sandboxing or multi-file atomicity.
+pub fn try_lock_operation(root: &Path) -> Result<WorkspaceOperationGuard, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    if !root.is_dir() {
+        return Err("Proje koku bir dizin olmali.".into());
+    }
+    let directory = root.join(".fiko_backups");
+    match fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("Kilit klasoru olusturulamadi: {error}")),
+    }
+    // Reject substituted directory symlinks / Windows junctions.
+    let _ = marker_path(&root)?;
+    let path = directory.join("workspace.operation.lock");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.is_file() || is_link(&meta) => {
+            return Err("Islem kilidi normal bir dosya degil.".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| format!("Islem kilidi acilamadi: {e}"))?;
+    let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || is_link(&meta) {
+        return Err("Islem kilidi son kontrolu basarisiz; yazma reddedildi.".into());
+    }
+    file.try_lock()
+        .map_err(|error| format!("Baska bir FIKO yazma/kurtarma islemi devam ediyor: {error}"))?;
+    // Never unlink the lock file; closing the handle releases the OS lock.
+    Ok(WorkspaceOperationGuard { _locked_file: file })
+}
+
 /// Reject new writes before creating backup artifacts when a previous transaction is unresolved.
 pub fn ensure_clear(root: &Path) -> Result<(), String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
@@ -617,6 +667,7 @@ pub fn restore_after_explicit_approval(
     approved_fingerprint: &str,
 ) -> Result<String, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let _operation_lock = try_lock_operation(&root)?;
     let preview: Value =
         serde_json::from_str(&restoration_preview(&root)?).map_err(|e| e.to_string())?;
     if preview["status"] != "pending" || preview["eligible_for_review"] != true {
