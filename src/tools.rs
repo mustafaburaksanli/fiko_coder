@@ -857,10 +857,14 @@ pub fn save_backup(root: &Path, file: &Path, original: &str) -> Result<PathBuf, 
 /// Hedef dosyaya yazim atomik degildir (Windows'ta rename/kilit davranislari
 /// farklidir); kurtarma mekanizmasi yedek dosyasi ve geri okuma kontroludur.
 pub fn apply_approved_patch(root: &Path, plan: PatchPlan) -> Result<PatchRecord, String> {
-    // Coordinate all FIKO writers before checking the pending marker,
-    // creating backups, or touching the approved single-file target.
+    // Read-only preflight must not create lock/backup artifacts on stale input.
+    crate::workspace_recovery::ensure_clear(root)?;
+    let current = fs::read_to_string(&plan.path).map_err(|e| e.to_string())?;
+    if current != plan.original {
+        return Err("Dosya onay beklenirken degisti; patch iptal edildi.".into());
+    }
+    // Coordinate all FIKO writers and revalidate under the same lock.
     let _operation_lock = crate::workspace_recovery::try_lock_operation(root)?;
-    // An interrupted multi-file transaction must also block single-file edits.
     crate::workspace_recovery::ensure_clear(root)?;
     let current = fs::read_to_string(&plan.path).map_err(|e| e.to_string())?;
     if current != plan.original {
