@@ -846,6 +846,133 @@ mod tests {
         assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
     }
 
+    fn approved_fingerprint(root: &Path) -> String {
+        let preview: Value = serde_json::from_str(&restoration_preview(root).unwrap()).unwrap();
+        preview["marker_fingerprint_sha256"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn explicit_approval_restores_original_and_removes_created_file() {
+        let project = Fixture::new("approved_restore");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "pub fn new_file() {}\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let outcome = restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(outcome.contains("RECOVERY_RESTORED"));
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert!(!project.0.join("src/new.rs").exists());
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn incorrect_approval_never_mutates_targets() {
+        let project = Fixture::new("wrong_approval");
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let error = restore_after_explicit_approval(&project.0, "not-the-approved-fingerprint")
+            .unwrap_err();
+        assert!(error.contains("parmak iziyle eslesmiyor"), "{error}");
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn external_change_in_one_target_refuses_entire_recovery() {
+        let project = Fixture::new("restore_drift");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "new\n".into(),
+                },
+            ],
+        ).unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        fs::write(project.0.join("src/new.rs"), "external edit\n").unwrap();
+        assert!(restore_after_explicit_approval(&project.0, &fingerprint).is_err());
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/new.rs")).unwrap(),
+            "external edit\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn partially_restored_targets_can_resume_after_new_explicit_approval() {
+        let project = Fixture::new("restore_resume");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "new\n".into(),
+                },
+            ],
+        ).unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        fs::write(project.0.join("src/a.rs"), "pub fn a() -> u8 { 1 }\n").unwrap();
+        let preview: Value = serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_original");
+        let fingerprint = approved_fingerprint(&project.0);
+        restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(!project.0.join("src/new.rs").exists());
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn changed_marker_invalidates_prior_approval_without_writes() {
+        let project = Fixture::new("restore_marker_changed");
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let fingerprint = approved_fingerprint(&project.0);
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let mut json: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        json["comment"] = json!("modified marker after approval");
+        fs::write(&marker, serde_json::to_vec(&json).unwrap()).unwrap();
+        let error = restore_after_explicit_approval(&project.0, &fingerprint).unwrap_err();
+        assert!(error.contains("parmak iziyle eslesmiyor"), "{error}");
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(marker.exists());
+    }
+
     #[test]
     fn unclosed_marker_blocks_second_transaction() {
         let project = Fixture::new("blocked");
