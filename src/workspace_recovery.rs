@@ -1631,6 +1631,90 @@ mod tests {
     }
 
     #[test]
+    fn staged_copy_integrity_detects_same_length_corruption() {
+        let project = Fixture::new("staging_hash");
+        let stage = project.0.join("src/.staged.tmp");
+        fs::write(&stage, b"good").unwrap();
+        assert!(verify_staged_copy(&stage, b"good").is_ok());
+        fs::write(&stage, b"evil").unwrap();
+        assert!(verify_staged_copy(&stage, b"good").is_err());
+        fs::write(&stage, b"oversized").unwrap();
+        assert!(verify_staged_copy(&stage, b"good").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_copy_integrity_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+        let project = Fixture::new("staging_symlink");
+        let safe = project.0.join("src/a.rs");
+        let stage = project.0.join("src/.staged.tmp");
+        symlink(&safe, &stage).unwrap();
+        let original = fs::read(&safe).unwrap();
+        assert!(verify_staged_copy(&stage, &original).is_err());
+    }
+
+    #[test]
+    #[ignore = "only invoked as an isolated test subprocess"]
+    fn staged_tamper_child_rejects_precommit_corruption() {
+        let Some(root) = std::env::var_os("FIKO_TEST_TAMPER_STAGED_COPY") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let err = restore_after_explicit_approval(&root, &fingerprint).unwrap_err();
+        assert!(err.contains("SHA256"), "{err}");
+    }
+
+    #[test]
+    fn tampered_stage_rejects_replacement_and_preserves_pending_marker() {
+        use std::process::Command;
+
+        let project = Fixture::new("stage_tampered_precommit");
+        let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let source = project.0.join("src/a.rs");
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let original_source = fs::read(&source).unwrap();
+        let original_marker = fs::read(&marker).unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::staged_tamper_child_rejects_precommit_corruption",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_TAMPER_STAGED_COPY", &project.0)
+            .output()
+            .expect("cannot start dedicated tamper child");
+        assert!(
+            output.status.success(),
+            "tamper child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&source).unwrap(), original_source);
+        assert_eq!(fs::read(&marker).unwrap(), original_marker);
+        assert_eq!(
+            fs::read_dir(project.0.join("src"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_restore_stage_"))
+                .count(),
+            0
+        );
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(
+            preview["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
+    }
+
+    #[test]
     fn changed_marker_invalidates_prior_approval_without_writes() {
         let project = Fixture::new("restore_marker_changed");
         let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
