@@ -644,7 +644,10 @@ mod tests {
         assert!(path.is_file());
 
         manifest["files"][0]["updated_sha256"] = json!(sha(b"pub fn a() -> u8 { 2 }\n"));
-        manifest["files"][0].as_object_mut().unwrap().remove("backup_name");
+        manifest["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("backup_name");
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         let preview: Value =
             serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
