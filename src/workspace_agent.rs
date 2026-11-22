@@ -8,6 +8,7 @@ use crate::execution::TaskPhase;
 use crate::repair_controller::{RepairController, VerifyMode};
 use crate::verification::{self, VerificationKind};
 use crate::workspace_patch::{self, FileChange, WorkspacePlan};
+use crate::workspace_recovery;
 
 /// JSON yalnizca aday tanimidir; dosya ve proje durumu prepare ile dogrulanir.
 pub(crate) fn parse_changes(args: &Value) -> Result<Vec<FileChange>, String> {
@@ -371,6 +372,20 @@ pub(crate) async fn apply<P: Prompter>(
             && fs::read_to_string(&file.path).ok().as_ref() == Some(&file.updated)
     });
     if passed && targets_unchanged {
+        // No PATCH_VERIFIED while the on-disk recovery marker remains unresolved.
+        if let Err(error) = workspace_recovery::finish_verified(&session.root, &record) {
+            repair.mark_workspace_failed(&plan);
+            repair.enter(TaskPhase::Failed);
+            return Ok(ToolOutcome::stop(
+                format!(
+                    "WORKSPACE_RECOVERY_PENDING: {error}. Kayit ve kaynak dosyalar korunuyor; --recovery-audit ile inceleyin."
+                ),
+                "Workspace disk kurtarma kaydi kapanamadi.",
+            )
+            .with_patch_effect(PatchEffect::Uncertain)
+            .with_modified_paths(modified_paths)
+            .with_processes(processes));
+        }
         session.last_patch = None;
         session.last_workspace = Some(record);
         repair.enter(TaskPhase::Completed);

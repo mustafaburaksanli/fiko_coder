@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{discovery, tools};
+use crate::{discovery, tools, workspace_recovery};
 
 pub const MAX_WORKSPACE_FILES: usize = 16;
 pub const MAX_FILE_BYTES: usize = 128_000;
@@ -405,6 +405,7 @@ fn apply_with(
 ) -> Result<WorkspaceRecord, ApplyError> {
     let root = root_path(root).map_err(before_write_error)?;
     revalidate(&root, plan).map_err(before_write_error)?;
+    workspace_recovery::ensure_clear(&root).map_err(before_write_error)?;
     let mut record = WorkspaceRecord {
         files: Vec::with_capacity(plan.files.len()),
     };
@@ -422,6 +423,9 @@ fn apply_with(
             written: None,
         });
     }
+    // The durable marker is written before the first target mutation.
+    // If a previous crash left one behind, the new transaction fails closed.
+    workspace_recovery::start(&root, &record).map_err(before_write_error)?;
     for index in 0..record.files.len() {
         let result = before_write(index, &record.files[index].file)
             .and_then(|_| revalidate_file(&root, &record.files[index].file))
@@ -586,6 +590,7 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
 /// yedekler temizlenmez; belirsiz durumda kullaniciya kurtarma kaniti kalir.
 pub fn rollback(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
     let root = root_path(root)?;
+    workspace_recovery::assert_rollback_record(&root, record)?;
     let mut errors = Vec::new();
     for file in record.files.iter().rev() {
         if let Err(error) = rollback_file(&root, file) {
@@ -593,7 +598,7 @@ pub fn rollback(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
         }
     }
     if errors.is_empty() {
-        Ok(())
+        workspace_recovery::finish_rollback(&root, record)
     } else {
         Err(errors.join("\n"))
     }

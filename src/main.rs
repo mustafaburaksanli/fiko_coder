@@ -42,6 +42,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let root = std::env::current_dir()?.canonicalize()?;
+    if model == "--recovery-audit" {
+        match fiko_coder::workspace_recovery::audit(&root) {
+            Ok(report) => println!("{report}"),
+            Err(error) => {
+                eprintln!("[RECOVERY] {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let client = reqwest::Client::new();
     let mut session = Session::new(root.clone());
     match fiko_coder::memory::MemoryConfig::from_env() {
