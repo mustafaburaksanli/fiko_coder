@@ -113,6 +113,18 @@ fn matching_marker(root: &Path, record: &WorkspaceRecord) -> Result<bool, String
     Ok(true)
 }
 
+/// Reject new writes before creating backup artifacts when a previous transaction is unresolved.
+pub fn ensure_clear(root: &Path) -> Result<(), String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    if marker_path(&root)?.is_some() {
+        return Err(
+            "Onceki workspace islemi belirsiz: --recovery-audit calistirin; yeni yazma reddedildi."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Called after all original-file backups are written, before the first target write.
 /// create_new prevents a second workspace transaction from overwriting an unresolved marker.
 pub fn start(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
@@ -128,7 +140,7 @@ pub fn start(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
         fs::create_dir(&directory).map_err(|e| format!("Kurtarma klasoru olusturulamadi: {e}"))?;
     }
     // Recheck the directory after creating it; never follow a substituted link.
-    marker_path(&root)?;
+    let _ = marker_path(&root)?;
     let bytes = serde_json::to_vec_pretty(&manifest(record)).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err("Kurtarma kaydi boyut sinirini asiyor.".into());
@@ -310,7 +322,7 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).ok();
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
