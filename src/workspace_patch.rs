@@ -495,17 +495,15 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn is_link(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return true;
-        }
+        metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
     }
-    false
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn backup_content(root: &Path, record: &RecordedFile) -> Result<Vec<u8>, String> {
