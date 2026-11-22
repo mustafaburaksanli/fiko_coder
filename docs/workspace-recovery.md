@@ -106,7 +106,7 @@ FIKO's single-file apply, multi-file workspace apply/rollback and explicitly app
 
 The OS releases the lock handle when the owning process terminates, including a forced termination. The pending `workspace.pending.json` marker is independent and **must still block new writes after an interrupted transaction**. The lock never authorizes automatic recovery or bypasses the interactive restore approval.
 
-The lock coordinates **cooperating FIKO callers only**. External editors, malware, filesystem path substitution and all other programs that ignore the lock can still race source reads and writes. It is not a sandbox, an exclusive OS-wide project lock, or an atomic multi-file transaction. The legacy standalone single-file rollback API and independent post-write verification are not yet all covered by a single continuous lock lifetime.
+The lock coordinates **cooperating FIKO callers only**. External editors, malware, filesystem path substitution and all other programs that ignore the lock can still race source reads and writes. It is not a sandbox, an exclusive OS-wide project lock, or an atomic multi-file transaction. Standalone single-file rollback now also acquires the cooperative lock, but independent post-write verification is not yet covered by a continuous lock lifetime.
 
 ## Limitations
 
