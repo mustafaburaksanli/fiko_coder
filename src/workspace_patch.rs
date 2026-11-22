@@ -436,7 +436,7 @@ fn apply_with(
     for index in 0..record.files.len() {
         let result = before_write(index, &record.files[index].file)
             .and_then(|_| revalidate_file(&root, &record.files[index].file))
-            .and_then(|_| write_file(&mut record.files[index]));
+            .and_then(|_| write_file(&root, &mut record.files[index]));
         if let Err(error) = result {
             // The apply path already owns the OS lock; do not lock recursively.
             let recovery = rollback_without_operation_lock(&root, &record);
@@ -457,7 +457,113 @@ fn apply_with(
     Ok(record)
 }
 
-fn write_file(record: &mut RecordedFile) -> Result<(), String> {
+/// For EXISTING files, stage the updated content on the same filesystem
+/// before replacing the approved source. A hard kill during the staged write
+/// cannot truncate the existing source. New-file creation remains a separate
+/// (currently non-atomic) path.
+fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let file = &record.file;
+    if file.original.is_none() {
+        return Err("Staged edit requires an existing source.".into());
+    }
+    revalidate_file(root, file)?;
+    let current_metadata = fs::symlink_metadata(&file.path).map_err(|e| e.to_string())?;
+    if !current_metadata.is_file() || is_link(&current_metadata) {
+        return Err(format!("{}: Source is not a normal file.", file.relative));
+    }
+
+    let parent = file.path.parent().ok_or("Source parent directory is missing.")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mut created = None;
+    for attempt in 0..16 {
+        let stage_path = parent.join(format!(
+            ".fiko_apply_stage_{}_{}_{}.tmp",
+            std::process::id(),
+            stamp,
+            attempt
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&stage_path) {
+            Ok(stage_file) => {
+                created = Some((stage_file, stage_path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: Staging failed: {e}", file.relative)),
+        }
+    }
+    let (stage_handle, stage_path) = created.ok_or("No available staged edit filename.")?;
+    // Guard must be declared before staged handle to allow Windows cleanup.
+    struct StageCleanup(Option<PathBuf>);
+    impl Drop for StageCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = StageCleanup(Some(stage_path.clone()));
+    let mut staged = stage_handle;
+    let bytes = file.updated.as_bytes();
+
+    // Test-only child waits while an incomplete staged file exists. This
+    // branch is absent from production builds.
+    #[cfg(test)]
+    if file.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_APPLY_PARTIAL_STAGE_PROJECT").is_some()
+    {
+        let partial_len = (bytes.len() / 2).max(1);
+        staged
+            .write_all(&bytes[..partial_len])
+            .map_err(|e| e.to_string())?;
+        staged.sync_all().map_err(|e| e.to_string())?;
+        let signal = root.join(".fiko_test_apply_partial_stage_ready");
+        let mut ready = File::create(signal).map_err(|e| e.to_string())?;
+        ready.write_all(b"ready").map_err(|e| e.to_string())?;
+        ready.sync_all().map_err(|e| e.to_string())?;
+        drop(ready);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Partial-stage apply child should have been killed.".into());
+    }
+
+    staged.write_all(bytes).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    fs::set_permissions(&stage_path, current_metadata.permissions()).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    drop(staged);
+
+    let stage_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+    if !stage_metadata.is_file() || is_link(&stage_metadata) || stage_metadata.len() != bytes.len() as u64 {
+        return Err(format!("{}: Staged file metadata changed.", file.relative));
+    }
+    if read_bytes(&stage_path)? != bytes {
+        return Err(format!("{}: Staged file contents do not match.", file.relative));
+    }
+    revalidate_file(root, file)?;
+    // Recheck the staged copy as late as possible before replacement.
+    if read_bytes(&stage_path)? != bytes {
+        return Err(format!("{}: Staged file changed before replacement.", file.relative));
+    }
+    fs::rename(&stage_path, &file.path)
+        .map_err(|e| format!("{}: Could not replace source: {e}", file.relative))?;
+    cleanup.0 = None;
+    // Important: record the mutation before post-write checks so failure can
+    // safely enter rollback. A killed process still leaves a pending marker.
+    record.written = Some(bytes.to_vec());
+    if read_bytes(&file.path)? != bytes {
+        return Err(format!("{}: Source did not match staged contents.", file.relative));
+    }
+    Ok(())
+}
+
+fn write_file(root: &Path, record: &mut RecordedFile) -> Result<(), String> {
+    if record.file.original.is_some() {
+        return write_existing_staged(root, record);
+    }
     let file = &record.file;
     let mut options = OpenOptions::new();
     options.write(true);
