@@ -435,7 +435,8 @@ fn apply_with(
             .and_then(|_| revalidate_file(&root, &record.files[index].file))
             .and_then(|_| write_file(&mut record.files[index]));
         if let Err(error) = result {
-            let recovery = rollback(&root, &record);
+            // The apply path already owns the OS lock; do not lock recursively.
+            let recovery = rollback_without_operation_lock(&root, &record);
             let restored = recovery.is_ok();
             let message = match recovery {
                 Ok(()) => format!("Uygulama basarisiz: {error}. Tum hedef yazimlari geri alindi."),
@@ -594,7 +595,12 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
 /// yedekler temizlenmez; belirsiz durumda kullaniciya kurtarma kaniti kalir.
 pub fn rollback(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
     let root = root_path(root)?;
-    workspace_recovery::assert_rollback_record(&root, record)?;
+    let _operation_lock = workspace_recovery::try_lock_operation(&root)?;
+    rollback_without_operation_lock(&root, record)
+}
+
+fn rollback_without_operation_lock(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
+    workspace_recovery::assert_rollback_record(root, record)?;
     let mut errors = Vec::new();
     for file in record.files.iter().rev() {
         if let Err(error) = rollback_file(&root, file) {
