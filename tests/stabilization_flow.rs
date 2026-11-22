@@ -1,9 +1,10 @@
 //! Intent kararinin gercek orkestrator yetkisine ve arac kapisina yansimasi.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fiko_coder::agent::{Prompter, Session};
@@ -44,17 +45,21 @@ impl Prompter for NoPrompts {
     }
 }
 
+// Nanosecond timestamps alone can alias across parallel tests on Windows.
+static NEXT_PROJECT_ID: AtomicU64 = AtomicU64::new(0);
+
 struct Project(PathBuf);
 
 impl Project {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "fiko_stabilization_it_{}_{}",
+            "fiko_stabilization_it_{}_{}_{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_PROJECT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -95,16 +100,40 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        let temporary_root = std::env::temp_dir().canonicalize().unwrap();
-        assert!(self.0.starts_with(temporary_root));
-        assert!(
-            self.0
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("fiko_stabilization_it_")
-        );
-        fs::remove_dir_all(&self.0).unwrap();
+        // Never panic from Drop while a test is already unwinding: on Windows,
+        // a second panic can abort the whole test process (0xc0000409).
+        let Ok(temporary_root) = std::env::temp_dir().canonicalize() else {
+            eprintln!("stabilization fixture: cannot resolve temporary root for cleanup");
+            return;
+        };
+        let trusted_name = self
+            .0
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("fiko_stabilization_it_"));
+        if self.0.parent() != Some(temporary_root.as_path()) || !trusted_name {
+            eprintln!("stabilization fixture: refusing cleanup outside expected temp root");
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            eprintln!("stabilization fixture: cleanup failed: {error}");
+        }
+    }
+}
+
+#[test]
+fn parallel_fixture_paths_are_distinct() {
+    let projects = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16).map(|_| scope.spawn(Project::new)).collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let distinct: BTreeSet<_> = projects.iter().map(|project| project.0.clone()).collect();
+    assert_eq!(distinct.len(), projects.len());
+    for project in &projects {
+        assert!(project.0.join("src/main.rs").is_file());
     }
 }
 
