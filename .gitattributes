@@ -1,8 +1,8 @@
-# Preserve source line endings for byte-exact patch verification.
-# Do not renormalize existing files as part of a functional fix.
-*.rs text -eol
-*.toml text -eol
-*.lock text -eol
-*.sql text -eol
-*.md text -eol
-*.yml text -eol
+# Preserve byte-exact line endings for Rust patch matching and SHA checks.
+# Do not bulk-renormalize existing files.
+*.rs -text
+*.toml -text
+Cargo.lock -text
+*.sql -text
+*.md text eol=lf
+*.yml text eol=lf
