@@ -1077,7 +1077,12 @@ mod tests {
             "pub fn b() -> u8 { 2 }\n"
         );
         assert!(!project.0.join("src/c.rs").exists());
-        assert!(project.0.join(".fiko_backups/workspace.pending.json").is_file());
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
         let audit = workspace_recovery::audit(&project.0).unwrap();
         assert!(audit.contains("src/a.rs\": unexpected"), "{audit}");
         assert!(audit.contains("src/b.rs\": original"), "{audit}");
