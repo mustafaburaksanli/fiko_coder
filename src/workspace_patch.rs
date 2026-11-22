@@ -197,12 +197,39 @@ fn check_shape(plan: &WorkspacePlan) -> Result<(), String> {
 }
 
 pub fn prepare(root: &Path, changes: &[FileChange]) -> Result<WorkspacePlan, String> {
+    let options: Vec<_> = changes
+        .iter()
+        .take(MAX_WORKSPACE_FILES)
+        .map(|_| tools::PatchMatchOptions::default())
+        .collect();
+    prepare_with_options(root, changes, &options)
+}
+
+/// Paylasilan eslesme tanisina yalniz degisiklik dizisinin Rust indeksini ekler.
+pub(crate) fn error_for_change(message: String, change_index: usize) -> String {
+    if let Ok(mut diagnostic) = serde_json::from_str::<serde_json::Value>(&message)
+        && diagnostic.is_object()
+    {
+        diagnostic["change_index"] = serde_json::json!(change_index);
+        return diagnostic.to_string();
+    }
+    message
+}
+
+pub fn prepare_with_options(
+    root: &Path,
+    changes: &[FileChange],
+    options: &[tools::PatchMatchOptions],
+) -> Result<WorkspacePlan, String> {
     if changes.is_empty() || changes.len() > MAX_WORKSPACE_FILES {
         return Err(format!("Plan 1-{MAX_WORKSPACE_FILES} dosya icermeli."));
     }
+    if options.len() != changes.len() {
+        return Err("Her degisiklik icin tam bir eslesme secenegi gerekir.".into());
+    }
     let root = root_path(root)?;
     let mut files = Vec::with_capacity(changes.len());
-    for change in changes {
+    for (change_index, (change, options)) in changes.iter().zip(options).enumerate() {
         let (path, original, updated) = match change {
             FileChange::Edit {
                 path,
@@ -220,18 +247,18 @@ pub fn prepare(root: &Path, changes: &[FileChange]) -> Result<WorkspacePlan, Str
                 }
                 let full = discovery::resolve_existing(&root, path)?;
                 let original = read_text(&full)?;
-                let matches = tools::exact_line_block_locations(&original, old_text);
-                if matches.len() != 1 {
-                    return Err(format!(
-                        "{path}: Eski metin tam satir/blok olarak tam bir kez bulunmali."
-                    ));
-                }
-                let mut updated = original.clone();
-                let start = matches[0];
-                updated.replace_range(start..start + old_text.len(), new_text);
+                let updated = tools::replace_line_block(&original, old_text, new_text, options)
+                    .map_err(|error| error_for_change(error, change_index))?;
                 (full, Some(original), updated)
             }
             FileChange::Create { path, content } => {
+                if options.mode != tools::PatchMatchMode::Exact || options.expected_sha256.is_some()
+                {
+                    return Err(
+                        "Yeni dosya olustururken eslesme modu veya kaynak SHA256 kullanilamaz."
+                            .into(),
+                    );
+                }
                 if content.len() > MAX_CHANGE_BYTES {
                     return Err(format!(
                         "Yeni dosya icerigi {MAX_CHANGE_BYTES} byte sinirini asiyor."
@@ -310,6 +337,37 @@ pub struct RecordedFile {
 #[derive(Debug, Clone)]
 pub struct WorkspaceRecord {
     pub files: Vec<RecordedFile>,
+}
+
+impl WorkspaceRecord {
+    /// Yalniz bu islemin gercekte yazdigi byte'lar; model hedef listesinden turetilmez.
+    pub(crate) fn modified_paths(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|record| {
+                record.written.as_ref().is_some_and(|written| {
+                    record
+                        .file
+                        .original
+                        .as_ref()
+                        .is_none_or(|original| written != original.as_bytes())
+                })
+            })
+            .map(|record| record.file.relative.clone())
+            .collect()
+    }
+    /// Geri alma raporu, yazma baslamadan olusan hatayi uygulama saymaz.
+    pub(crate) fn has_writes(&self) -> bool {
+        self.files.iter().any(|record| {
+            record.written.as_ref().is_some_and(|written| {
+                record
+                    .file
+                    .original
+                    .as_ref()
+                    .is_none_or(|original| written != original.as_bytes())
+            })
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -615,6 +673,208 @@ mod tests {
         )
     }
 
+    fn line_ending_options(source: &str) -> tools::PatchMatchOptions {
+        use sha2::Digest;
+        tools::PatchMatchOptions {
+            mode: tools::PatchMatchMode::LineEndings,
+            expected_sha256: Some(format!("{:x}", sha2::Sha256::digest(source.as_bytes()))),
+        }
+    }
+
+    #[test]
+    fn optin_mixed_eol_ve_yeni_dosya_somut_bytelarla_uygulanip_geri_alinmali() {
+        let project = Project::new();
+        let original = "// prefix\nfn a() {\r\n    1\n}\r\n// tail\r\n";
+        let old_text = "fn a() {\n    1\n}\n";
+        let new_text = "fn a() {\r\n    3\r\n}\n";
+        fs::write(project.0.join("src/a.rs"), original).unwrap();
+        let changes = [
+            edit("src/a.rs", old_text, new_text),
+            create("src/c.rs", "pub fn c() {}\r\n"),
+        ];
+        assert!(prepare(&project.0, &changes).is_err());
+        let plan = prepare_with_options(
+            &project.0,
+            &changes,
+            &[
+                line_ending_options(original),
+                tools::PatchMatchOptions::default(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.files[0].original.as_deref(), Some(original));
+        assert_eq!(
+            plan.files[0].updated,
+            format!("// prefix\n{new_text}// tail\r\n")
+        );
+        assert_eq!(plan.files[1].updated, "pub fn c() {}\r\n");
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            original.as_bytes()
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+        assert!(!project.0.join(".fiko_backups").exists());
+        let record = apply(&project.0, &plan).unwrap();
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            plan.files[0].updated.as_bytes()
+        );
+        assert_eq!(
+            fs::read(project.0.join("src/c.rs")).unwrap(),
+            b"pub fn c() {}\r\n"
+        );
+        rollback(&project.0, &record).unwrap();
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            original.as_bytes()
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+    }
+
+    #[test]
+    fn optin_gecersiz_ikinci_dosya_ve_eski_sha_tum_plani_yazmadan_reddetmeli() {
+        let project = Project::new();
+        let original = "fn a() {\r\n    1\n}\r\n";
+        let second = read_text(&project.0.join("src/b.rs")).unwrap();
+        fs::write(project.0.join("src/a.rs"), original).unwrap();
+        let error = prepare_with_options(
+            &project.0,
+            &[
+                edit("src/a.rs", "fn a() {\n    1\n}\n", "fn changed() {}\n"),
+                edit("src/b.rs", "fn absent() {}", "fn replacement() {}"),
+            ],
+            &[line_ending_options(original), line_ending_options(&second)],
+        )
+        .unwrap_err();
+        let diagnostic: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(diagnostic["change_index"], 1);
+        assert_eq!(diagnostic["field"], "old_text");
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            original.as_bytes()
+        );
+        assert_eq!(read_text(&project.0.join("src/b.rs")).unwrap(), second);
+        assert!(!project.0.join(".fiko_backups").exists());
+        let stale_options = line_ending_options(original);
+        let drifted = format!("{original}// user drift\n");
+        fs::write(project.0.join("src/a.rs"), &drifted).unwrap();
+        let error = prepare_with_options(
+            &project.0,
+            &[edit(
+                "src/a.rs",
+                "fn a() {\n    1\n}\n",
+                "fn changed() {}\n",
+            )],
+            &[stale_options],
+        )
+        .unwrap_err();
+        let diagnostic: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(diagnostic["change_index"], 0);
+        assert_eq!(diagnostic["field"], "expected_sha256");
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            drifted.as_bytes()
+        );
+        assert!(!project.0.join(".fiko_backups").exists());
+    }
+
+    #[test]
+    fn workspace_eslesme_secenekleri_islemlerle_birebir_ve_create_icin_default_olmali() {
+        let project = Project::new();
+        assert!(prepare_with_options(&project.0, &[edit_a()], &[]).is_err());
+        assert!(
+            prepare_with_options(
+                &project.0,
+                &[create("src/c.rs", "new")],
+                &[line_ending_options("unused")]
+            )
+            .is_err()
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+        assert!(!project.0.join(".fiko_backups").exists());
+        assert_eq!(
+            read_text(&project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+    }
+
+    #[test]
+    fn tek_ve_cok_dosyali_prepare_ayni_patch_match_tanisini_yazmadan_vermeli() {
+        let project = Project::new();
+        let cases = [
+            ("fn demo() {}\n", "fn absent() {}", "not_found"),
+            ("    let value = 1;\n", "let value = 1", "partial_line"),
+            ("fn demo() {}\n", "fn demo() {", "partial_line"),
+            ("fn demo() {}\nfn demo() {}\n", "fn demo() {}", "ambiguous"),
+            (
+                "fn a() {}\r\nfn b() {}\r\n",
+                "fn a() {}\nfn b() {}\n",
+                "line_endings_mismatch",
+            ),
+            (
+                "fn a() {}\nfn b() {}\n",
+                "fn a() {}\r\nfn b() {}\r\n",
+                "line_endings_mismatch",
+            ),
+            (
+                "fn a() {}\nfn b() {}\n",
+                "fn a() {}\nfn b()",
+                "partial_line",
+            ),
+        ];
+        for (content, old_text, reason) in cases {
+            fs::write(project.0.join("src/a.rs"), content).unwrap();
+            let single =
+                tools::prepare_patch(&project.0, "src/a.rs", old_text, "fn replacement() {}")
+                    .err()
+                    .unwrap();
+            let multi = prepare(
+                &project.0,
+                &[edit("src/a.rs", old_text, "fn replacement() {}")],
+            )
+            .err()
+            .unwrap();
+            let diagnostic: serde_json::Value = serde_json::from_str(&single).unwrap();
+            let mut workspace_diagnostic: serde_json::Value = serde_json::from_str(&multi).unwrap();
+            assert_eq!(workspace_diagnostic["change_index"], 0);
+            workspace_diagnostic
+                .as_object_mut()
+                .unwrap()
+                .remove("change_index");
+            assert_eq!(diagnostic, workspace_diagnostic);
+            assert!(diagnostic.get("change_index").is_none());
+            assert_eq!(diagnostic["error"], "PATCH_MATCH");
+            assert_eq!(diagnostic["reason"], reason);
+            assert_eq!(
+                fs::read(project.0.join("src/a.rs")).unwrap(),
+                content.as_bytes()
+            );
+            assert!(!project.0.join(".fiko_backups").exists());
+        }
+    }
+
+    #[test]
+    fn tek_ve_cok_dosyali_prepare_ayni_unique_anchor_ve_byte_bicimini_korumali() {
+        let project = Project::new();
+        for ending in ["\n", "\r\n"] {
+            let content = format!("fn demo() {{{ending}    let value = 1;{ending}}}{ending}");
+            fs::write(project.0.join("src/a.rs"), &content).unwrap();
+            let old_text = "let value = 1;";
+            let new_text = format!("let value = 2;{ending}    let appended = 3;");
+            let single = tools::prepare_patch(&project.0, "src/a.rs", old_text, &new_text).unwrap();
+            let multi = prepare(&project.0, &[edit("src/a.rs", old_text, &new_text)]).unwrap();
+            assert_eq!(single.original, content);
+            assert_eq!(multi.files[0].original.as_ref(), Some(&single.original));
+            assert_eq!(multi.files[0].updated, single.updated);
+            assert_eq!(single.updated, content.replace(old_text, &new_text));
+            assert_eq!(
+                fs::read(project.0.join("src/a.rs")).unwrap(),
+                content.as_bytes()
+            );
+            assert!(!project.0.join(".fiko_backups").exists());
+        }
+    }
+
     #[test]
     fn iki_dosya_ve_yeni_dosya_birlikte_uygulanip_geri_alinmali() {
         let project = Project::new();
@@ -666,7 +926,16 @@ mod tests {
     fn gecersiz_ikinci_dosya_tum_plani_yazmadan_reddetmeli() {
         let project = Project::new();
         let before = read_text(&project.0.join("src/a.rs")).unwrap();
-        assert!(prepare(&project.0, &[edit_a(), edit("src/b.rs", "yok", "baska")]).is_err());
+        let error = prepare(&project.0, &[edit_a(), edit("src/b.rs", "yok", "baska")])
+            .err()
+            .unwrap();
+        let diagnostic: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(diagnostic["error"], "PATCH_MATCH");
+        assert_eq!(diagnostic["field"], "old_text");
+        assert_eq!(diagnostic["change_index"], 1);
+        assert_eq!(diagnostic["reason"], "not_found");
+        assert!(!error.contains("src/b.rs"));
+        assert!(!error.contains("yok"));
         assert_eq!(read_text(&project.0.join("src/a.rs")).unwrap(), before);
         assert!(!project.0.join(".fiko_backups").exists());
         assert!(prepare(&project.0, &[create("src/a.rs", "ezme")]).is_err());

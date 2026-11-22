@@ -13,10 +13,15 @@
 //! - agent: Ollama dongusu, arac secimi, kullanici onayi
 
 pub mod agent;
+pub mod context;
 pub mod discovery;
 pub mod execution;
 pub mod intent;
+pub mod memory;
+pub mod memory_retrieval;
+pub mod memory_store;
 pub mod orchestrator;
+pub mod planning;
 pub mod repair_controller;
 pub mod tools;
 pub mod verification;

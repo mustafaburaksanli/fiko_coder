@@ -1,0 +1,8 @@
+# Preserve byte-exact line endings for Rust patch matching and SHA checks.
+# Do not bulk-renormalize existing files.
+*.rs -text
+*.toml -text
+Cargo.lock -text
+*.sql -text
+*.md text eol=lf
+*.yml text eol=lf

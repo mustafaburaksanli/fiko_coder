@@ -10,6 +10,7 @@ pub const MAX_SEARCH_FILES: usize = 150;
 const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 4 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16_000;
+const READ_LINES_METADATA_BYTES: usize = 512;
 const MAX_DIRECTORY_ENTRIES: usize = 2_000;
 
 /// Gizli/hedef/anahtar dosyalari ile Windows ADS ve isim takma yollarini engeller.
@@ -231,37 +232,107 @@ impl Lines {
     }
 }
 
+fn line_range_error(
+    code: &str,
+    message: &str,
+    start: usize,
+    end: usize,
+    total_lines: Option<usize>,
+) -> String {
+    let suggested_range = total_lines.filter(|total| *total > 0).map(|total| {
+        serde_json::json!({
+            "start_line": if start <= total { start } else { total.saturating_sub(59).max(1) },
+            "end_line": total,
+        })
+    });
+    serde_json::json!({
+        "status":"error", "error":code, "message":message,
+        "requested_range":{"start_line":start,"end_line":end},
+        "returned_range":null, "total_lines":total_lines,
+        "suggested_range":suggested_range, "range_adjusted":false,
+    })
+    .to_string()
+}
+
 pub fn read_lines(root: &Path, relative: &str, start: usize, end: usize) -> Result<String, String> {
     if start == 0 || end < start || end - start >= 60 {
-        return Err("Satir araligi 1 tabanli olmali ve en fazla 60 satir icermeli.".into());
+        return Err(line_range_error(
+            "invalid_range",
+            "Satir araligi 1 tabanli olmali ve en fazla 60 satir icermeli.",
+            start,
+            end,
+            None,
+        ));
     }
-    let mut lines = Lines::new(open_source(root, relative)?, MAX_SCAN_BYTES);
+    let file = open_source(root, relative)?;
+    let small_file = file.metadata().map_err(|error| error.to_string())?.len() <= 64_000;
+    let mut lines = Lines::new(file, MAX_SCAN_BYTES);
     let mut output = String::new();
+    let mut returned_end = start;
+    let mut output_truncated = false;
+    let mut line_truncated = false;
     for number in 1..=end {
-        let Some((text, truncated)) = lines.next()? else {
-            return Err(format!(
-                "Dosya {} satir; istenen aralik {start}-{end}.",
-                number - 1
+        let Some((text, truncated)) = lines
+            .next()
+            .map_err(|message| line_range_error("read_incomplete", &message, start, end, None))?
+        else {
+            return Err(line_range_error(
+                "range_exceeds_eof",
+                "Istenen aralik dosyanin sonunu asiyor; suggested_range ile yeniden okuyun.",
+                start,
+                end,
+                Some(number - 1),
             ));
         };
-        if number >= start {
+        if number >= start && !output_truncated {
+            line_truncated |= truncated;
             let suffix = if truncated {
                 " [SATIR KISALTILDI; ilk 4096 byte]"
             } else {
                 ""
             };
             let entry = format!("{number:>4} | {text}{suffix}");
-            if output.len() + entry.len() + 1 > MAX_OUTPUT_BYTES - 100 {
+            if output.len() + entry.len() + 1 > MAX_OUTPUT_BYTES - READ_LINES_METADATA_BYTES - 100 {
                 output.push_str("\n[CIKTI KISALTILDI; kalan satirlar icin daha dar aralik okuyun]");
-                break;
+                output_truncated = true;
+                // Istenen araligin kalani EOF'yi asiyorsa kisaltilmis ciktiyi
+                // basarili okuma olarak sunma. Tarama yine 8 MiB ile sinirli.
+                continue;
             }
             if !output.is_empty() {
                 output.push('\n');
             }
             output.push_str(&entry);
+            returned_end = number;
         }
     }
-    Ok(output)
+    // Yalniz kucuk kaynakta ayni reader ile kalan satirlari say. Bu govdeler
+    // modele verilmez. Dosya buyurse/okunamazsa toplam bilinmez; istenen ve
+    // basariyla okunan aralik korunur. Buyuk dosyaya tam tarama eklenmez.
+    let mut total_lines = None;
+    if small_file && lines.scanned <= 64_000 {
+        lines.limit = 64_000;
+        let mut count = end;
+        loop {
+            match lines.next() {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => {
+                    total_lines = Some(count);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let metadata = serde_json::json!({
+        "status":"ok", "requested_range":{"start_line":start,"end_line":end},
+        "returned_range":{"start_line":start,"end_line":returned_end},
+        "total_lines":total_lines,
+        "total_lines_source": if total_lines.is_some() { "bounded_full_scan" } else { "not_fully_scanned" },
+        "range_adjusted":false, "output_truncated":output_truncated,
+        "line_truncated":line_truncated,
+    });
+    Ok(format!("[READ_LINES] {metadata}\n{output}"))
 }
 
 fn entries(
@@ -479,6 +550,170 @@ mod tests {
         }
     }
 
+    fn line_response(output: &str) -> (serde_json::Value, &str) {
+        let (header, content) = output.split_once('\n').unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(header.strip_prefix("[READ_LINES] ").unwrap()).unwrap();
+        assert_eq!(metadata["status"], "ok");
+        (metadata, content)
+    }
+
+    #[test]
+    fn eof_aralik_hatasi_dogru_toplam_ve_guvenli_kurtarma_onermeli() {
+        let project = Project::new();
+        let source = (1..=24)
+            .map(|line| format!("source {line}\n"))
+            .collect::<String>();
+        fs::write(project.root.join("src/range.rs"), source).unwrap();
+        let error: serde_json::Value =
+            serde_json::from_str(&read_lines(&project.root, "src/range.rs", 21, 30).unwrap_err())
+                .unwrap();
+        assert_eq!(error["status"], "error");
+        assert_eq!(error["error"], "range_exceeds_eof");
+        assert_eq!(
+            error["requested_range"],
+            serde_json::json!({"start_line":21,"end_line":30})
+        );
+        assert!(error["returned_range"].is_null());
+        assert_eq!(error["total_lines"], 24);
+        assert_eq!(
+            error["suggested_range"],
+            serde_json::json!({"start_line":21,"end_line":24})
+        );
+        assert_eq!(error["range_adjusted"], false);
+        let recovered = read_lines(&project.root, "src/range.rs", 21, 24).unwrap();
+        let (metadata, content) = line_response(&recovered);
+        assert_eq!(metadata["total_lines"], 24);
+        assert_eq!(metadata["total_lines_source"], "bounded_full_scan");
+        assert_eq!(
+            metadata["returned_range"],
+            serde_json::json!({"start_line":21,"end_line":24})
+        );
+        assert_eq!(
+            content,
+            "  21 | source 21\n  22 | source 22\n  23 | source 23\n  24 | source 24"
+        );
+        assert_eq!(metadata["output_truncated"], false);
+    }
+
+    #[test]
+    fn tamamen_aralik_disi_istek_son_en_fazla_altmis_satiri_onermeli() {
+        let project = Project::new();
+        fs::write(project.root.join("src/range.rs"), "line\n".repeat(100)).unwrap();
+        let error: serde_json::Value =
+            serde_json::from_str(&read_lines(&project.root, "src/range.rs", 200, 210).unwrap_err())
+                .unwrap();
+        assert_eq!(error["total_lines"], 100);
+        assert_eq!(
+            error["suggested_range"],
+            serde_json::json!({"start_line":41,"end_line":100})
+        );
+        let recovered = read_lines(&project.root, "src/range.rs", 41, 100).unwrap();
+        let (metadata, content) = line_response(&recovered);
+        assert_eq!(metadata["returned_range"], error["suggested_range"]);
+        assert_eq!(content.lines().count(), 60);
+    }
+
+    #[test]
+    fn gecersiz_bicim_ve_bos_dosya_olmayan_satirlari_onermemeli() {
+        let project = Project::new();
+        fs::write(project.root.join("src/empty.rs"), "").unwrap();
+        for (start, end) in [(0, 1), (2, 1), (1, 61)] {
+            let error: serde_json::Value = serde_json::from_str(
+                &read_lines(&project.root, "src/empty.rs", start, end).unwrap_err(),
+            )
+            .unwrap();
+            assert_eq!(error["error"], "invalid_range");
+            assert!(error["total_lines"].is_null());
+            assert!(error["suggested_range"].is_null());
+        }
+        let error: serde_json::Value =
+            serde_json::from_str(&read_lines(&project.root, "src/empty.rs", 1, 2).unwrap_err())
+                .unwrap();
+        assert_eq!(error["error"], "range_exceeds_eof");
+        assert_eq!(error["total_lines"], 0);
+        assert!(error["suggested_range"].is_null());
+    }
+
+    #[test]
+    fn karisik_satir_sonu_ve_son_yeni_satirsiz_icerik_dogru_sayilmali() {
+        let project = Project::new();
+        fs::write(project.root.join("src/mixed.rs"), "first\r\nsecond\nthird").unwrap();
+        let output = read_lines(&project.root, "src/mixed.rs", 1, 2).unwrap();
+        let (metadata, content) = line_response(&output);
+        assert_eq!(metadata["total_lines"], 3);
+        assert_eq!(content, "   1 | first\n   2 | second");
+        let output = read_lines(&project.root, "src/mixed.rs", 3, 3).unwrap();
+        let (metadata, content) = line_response(&output);
+        assert_eq!(metadata["total_lines"], 3);
+        assert_eq!(content, "   3 | third");
+    }
+
+    #[test]
+    fn buyuk_dosyaya_toplam_icin_ek_tarama_yapilmamali() {
+        let project = Project::new();
+        let mut bytes = b"head\n".to_vec();
+        bytes.extend(vec![b'x'; MAX_SCAN_BYTES + 1]);
+        fs::write(project.root.join("src/budget.rs"), bytes).unwrap();
+        let output = read_lines(&project.root, "src/budget.rs", 1, 1).unwrap();
+        let (metadata, content) = line_response(&output);
+        assert!(metadata["total_lines"].is_null());
+        assert_eq!(metadata["total_lines_source"], "not_fully_scanned");
+        assert_eq!(content, "   1 | head");
+        let error: serde_json::Value =
+            serde_json::from_str(&read_lines(&project.root, "src/budget.rs", 2, 2).unwrap_err())
+                .unwrap();
+        assert_eq!(error["error"], "read_incomplete");
+        assert!(error["message"].as_str().unwrap().contains("TARAMA SINIRI"));
+        assert!(error["total_lines"].is_null());
+        assert!(error["suggested_range"].is_null());
+    }
+
+    #[test]
+    fn toplam_sayilamayan_kucuk_dosyanin_gecerli_araligi_korunmali() {
+        let project = Project::new();
+        fs::write(project.root.join("src/tail.rs"), b"head\n\xff").unwrap();
+        let output = read_lines(&project.root, "src/tail.rs", 1, 1).unwrap();
+        let (metadata, content) = line_response(&output);
+        assert_eq!(content, "   1 | head");
+        assert_eq!(
+            metadata["returned_range"],
+            serde_json::json!({"start_line":1,"end_line":1})
+        );
+        assert!(metadata["total_lines"].is_null());
+        assert_eq!(metadata["total_lines_source"], "not_fully_scanned");
+    }
+
+    #[test]
+    fn cikti_kisalmasi_gecersiz_eof_araligini_basarili_yapmamali() {
+        let project = Project::new();
+        fs::write(
+            project.root.join("src/clipped.rs"),
+            format!("{}\n", "x".repeat(3_000)).repeat(10),
+        )
+        .unwrap();
+        let error: serde_json::Value =
+            serde_json::from_str(&read_lines(&project.root, "src/clipped.rs", 1, 30).unwrap_err())
+                .unwrap();
+        assert_eq!(error["error"], "range_exceeds_eof");
+        assert_eq!(error["total_lines"], 10);
+        assert!(error["returned_range"].is_null());
+        let output = read_lines(&project.root, "src/clipped.rs", 1, 10).unwrap();
+        let (metadata, content) = line_response(&output);
+        assert_eq!(
+            metadata["requested_range"],
+            serde_json::json!({"start_line":1,"end_line":10})
+        );
+        assert_eq!(
+            metadata["returned_range"],
+            serde_json::json!({"start_line":1,"end_line":5})
+        );
+        assert_eq!(metadata["output_truncated"], true);
+        assert_eq!(metadata["total_lines"], 10);
+        assert!(content.contains("CIKTI KISALTILDI"));
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+    }
+
     #[test]
     fn paths_traversal_hassas_dosya_ve_windows_takma_adlarini_reddetmeli() {
         for path in [
@@ -553,7 +788,15 @@ mod tests {
                 .contains("read_lines")
         );
         let lines = read_lines(&project.root, "src/large.rs", 8_000, 8_001).unwrap();
-        assert_eq!(lines, "8000 | source line 8000\n8001 | source line 8001");
+        let (metadata, content) = line_response(&lines);
+        assert_eq!(content, "8000 | source line 8000\n8001 | source line 8001");
+        assert_eq!(
+            metadata["requested_range"],
+            serde_json::json!({"start_line":8000,"end_line":8001})
+        );
+        assert_eq!(metadata["returned_range"], metadata["requested_range"]);
+        assert!(metadata["total_lines"].is_null());
+        assert_eq!(metadata["total_lines_source"], "not_fully_scanned");
         assert!(lines.len() < MAX_OUTPUT_BYTES);
         let hits = search_in_file(&project.root, "src/large.rs", "unique_late_token").unwrap();
         assert_eq!(hits, "src/large.rs:10001: unique_late_token");

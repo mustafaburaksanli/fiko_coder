@@ -1,4 +1,4 @@
-//! FIKO CODER v1.0 - MULTI-FILE WORKSPACE ENGINE
+//! FIKO CODER v1.2.1 - POSTGRESQL PERSISTENT MEMORY ENGINE
 //!
 //! Moduller:
 //! - tools: dosya araclari, cargo, patch hazirlama, yedekleme / geri alma
@@ -19,16 +19,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "qwen-code-local:9b".into());
+    if model == "--memory-migrate" || model == "--memory-check" {
+        let result = if model == "--memory-migrate" {
+            fiko_coder::memory::migrate_configured().await
+        } else {
+            fiko_coder::memory::check_configured().await
+        };
+        match result {
+            Ok(()) => println!(
+                "[HAFIZA] PostgreSQL {} basarili.",
+                if model == "--memory-migrate" {
+                    "migration"
+                } else {
+                    "baglanti/sema kontrolu"
+                }
+            ),
+            Err(error) => {
+                eprintln!("[HAFIZA] {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let root = std::env::current_dir()?.canonicalize()?;
     let client = reqwest::Client::new();
     let mut session = Session::new(root.clone());
+    match fiko_coder::memory::MemoryConfig::from_env() {
+        None => println!(
+            "[HAFIZA] FIKO_DATABASE_URL ayarli degil; kalici hafiza devre disi. Mevcut gorev akisi kullanilacak."
+        ),
+        Some(config) => match session.enable_memory(config).await {
+            Ok(()) => println!("[HAFIZA] PostgreSQL baglantisi ve proje kimligi hazir."),
+            Err(error) => println!(
+                "[HAFIZA] {error}. Kalici hafiza kullanilamiyor; mevcut gorev akisi devam ediyor."
+            ),
+        },
+    }
     let mut prompter = TerminalPrompter;
 
     let system: Value = json!({ "role": "system", "content": agent::system_prompt() });
     let mut messages: Vec<Value> = vec![system.clone()];
 
     println!("=================================");
-    println!("  FIKO CODER v1.0 - MULTI-FILE WORKSPACE ENGINE");
+    println!("  FIKO CODER v1.2.1 - POSTGRESQL PERSISTENT MEMORY ENGINE");
     println!("=================================");
     println!("Model: {model}");
     println!("Proje: {}", root.display());

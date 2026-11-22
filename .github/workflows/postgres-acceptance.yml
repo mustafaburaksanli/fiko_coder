@@ -1,0 +1,66 @@
+name: PostgreSQL acceptance (ephemeral)
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-acceptance:
+    name: PostgreSQL integration + agent acceptance (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # A GitHub-hosted runner starts a new, disposable PostgreSQL container.
+    # Trust authentication is used ONLY for this isolated test service: no
+    # real application passwords, credential URLs or GitHub secrets are used.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Create isolated, non-superuser test databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          PG_CONTAINER='${{ job.services.postgres.id }}'
+          # Only these two fresh databases are created. No production DB access.
+          docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE ROLE fiko_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;'
+          docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE fiko_memory_test OWNER fiko_test;'
+          docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE fiko_memory_test_upgrade OWNER fiko_test;'
+
+      - name: Real PostgreSQL integration tests (opt-in)
+        shell: bash
+        env:
+          FIKO_TEST_DATABASE_URL: postgresql://fiko_test@127.0.0.1:5432/fiko_memory_test
+          FIKO_TEST_UPGRADE_DATABASE_URL: postgresql://fiko_test@127.0.0.1:5432/fiko_memory_test_upgrade
+        run: |
+          set -euo pipefail
+          # Serial execution preserves the migration/upgrade fixture constraints.
+          cargo test --locked --test postgres_memory -- --ignored --test-threads=1
+
+      - name: Real PostgreSQL + controlled HTTP agent acceptance (opt-in)
+        shell: bash
+        env:
+          FIKO_TEST_DATABASE_URL: postgresql://fiko_test@127.0.0.1:5432/fiko_memory_test
+        run: |
+          set -euo pipefail
+          # Uses a local mock HTTP model; no live Ollama or external API.
+          cargo test --locked --lib postgres_agent_uc_dosyali_onay_hafiza_ret_ve_rollback -- --ignored --test-threads=1

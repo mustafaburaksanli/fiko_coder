@@ -20,7 +20,9 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::repair_controller::VerifyMode;
-use crate::tools::{ExecutionStatus, PatchPlan, TestResult, check_relative_path, run_cargo};
+use crate::tools::{
+    CommandObservation, ExecutionStatus, PatchPlan, TestResult, check_relative_path, run_cargo,
+};
 use crate::workspace_patch::WorkspacePlan;
 
 /// Ilk dogrulama bagimliliklari sifirdan derleyebilir; bu yuzden run_tests'ten uzun.
@@ -500,6 +502,7 @@ fn tail(text: &str, limit: usize) -> String {
 #[derive(Debug)]
 pub struct VerificationReport {
     pub success: bool,
+    pub processes: Vec<CommandObservation>,
     pub mode: String,
     pub relative_path: String,
     pub workspace: PathBuf,
@@ -844,6 +847,7 @@ pub async fn verify_candidate(
 
     Ok(VerificationReport {
         success,
+        processes: vec![result.observation()],
         mode: mode.to_string(),
         relative_path: relative.to_string_lossy().replace('\\', "/"),
         workspace: workspace_path,
@@ -1151,6 +1155,14 @@ mod tests {
         let plan = prepare_patch(&root, "src/main.rs", MINI_OLD, MINI_GOOD).unwrap();
         let report = verify_candidate(&root, &plan, "check").await.unwrap();
         assert!(report.success, "rapor: {}", report.render(1, 3));
+        assert_eq!(
+            report.processes,
+            vec![CommandObservation {
+                command: format!("{} check", crate::tools::cargo_bin()),
+                status: ExecutionStatus::Succeeded,
+                exit_code: Some(0),
+            }]
+        );
         assert_eq!(report.error_count, 0);
         assert_eq!(report.relative_path, "src/main.rs");
         assert!(report.render(1, 3).starts_with("VERIFY_OK"));

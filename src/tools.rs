@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
@@ -45,6 +46,14 @@ impl ExecutionStatus {
     }
 }
 
+/// Surec ciktisindan ayri, yalniz Rust gozlemini tasiyan sinirli metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandObservation {
+    pub command: String,
+    pub status: ExecutionStatus,
+    pub exit_code: Option<i32>,
+}
+
 const MAX_COMMAND_REPORT_CHARS: usize = 10_000;
 const OUTPUT_CLIP_MARKER: &str = "\n[CIKTI KISALTILDI; TAM CIKTI RUST BELLEGINDE]\n";
 
@@ -65,6 +74,14 @@ pub struct TestResult {
 }
 
 impl TestResult {
+    pub fn observation(&self) -> CommandObservation {
+        CommandObservation {
+            command: self.command.clone(),
+            status: self.status,
+            exit_code: self.exit_code,
+        }
+    }
+
     pub fn from_output(command: String, output: std::process::Output) -> Self {
         let status = if output.status.success() {
             ExecutionStatus::Succeeded
@@ -270,23 +287,445 @@ pub async fn run_tests(root: &Path, mode: &str) -> Result<TestResult, String> {
 // ============================================================
 // old_text eksik ';' iceren bir satir alt-dizisi olmamali.
 // Eslesme, yalnizca yatay bosluklar haric tam satir/blok kapsadiginda gecerlidir.
+fn line_block_boundary(content: &str, needle: &str, start: usize) -> bool {
+    let prefix = content[..start].rsplit('\n').next().unwrap_or("");
+    let suffix = content[start + needle.len()..]
+        .split('\n')
+        .next()
+        .unwrap_or("");
+    let only_indent = prefix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
+    let only_tail =
+        needle.ends_with('\n') || suffix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
+    only_indent && only_tail
+}
+
 pub fn exact_line_block_locations(content: &str, needle: &str) -> Vec<usize> {
     content
         .match_indices(needle)
-        .filter_map(|(start, _)| {
-            let prefix = content[..start].rsplit('\n').next().unwrap_or("");
-            let end = start + needle.len();
-            let suffix = content[end..].split('\n').next().unwrap_or("");
-            let only_indent = prefix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
-            let only_tail = needle.ends_with('\n')
-                || suffix.chars().all(|c| c == ' ' || c == '\t' || c == '\r');
-            if only_indent && only_tail {
-                Some(start)
-            } else {
-                None
-            }
-        })
+        .filter_map(|(start, _)| line_block_boundary(content, needle, start).then_some(start))
         .collect()
+}
+
+/// Opt-in ve recovery, ortusen bloklari da ayri konum sayar. Strict API'nin
+/// mevcut match_indices davranisi ve kabul kurali degistirilmez.
+fn all_line_block_locations(content: &str, needle: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    if needle.is_empty() {
+        return positions;
+    }
+    let mut offset = 0;
+    while let Some(relative) = content[offset..].find(needle) {
+        let start = offset + relative;
+        if line_block_boundary(content, needle, start) {
+            positions.push(start);
+        }
+        offset = start + content[start..].chars().next().unwrap().len_utf8();
+    }
+    positions
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PatchMatchMode {
+    #[default]
+    Exact,
+    LineEndings,
+}
+
+impl PatchMatchMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::LineEndings => "line_endings",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PatchMatchOptions {
+    pub mode: PatchMatchMode,
+    pub expected_sha256: Option<String>,
+}
+
+fn match_option_error(field: &str, reason: &str) -> String {
+    json!({"error":"PATCH_MATCH_OPTIONS","field":field,"reason":reason}).to_string()
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+impl PatchMatchOptions {
+    pub fn from_arguments(args: &Value) -> Result<Self, String> {
+        let mode = match args.get("match_mode") {
+            None => PatchMatchMode::Exact,
+            Some(Value::String(value)) if value == "exact" => PatchMatchMode::Exact,
+            Some(Value::String(value)) if value == "line_endings" => PatchMatchMode::LineEndings,
+            _ => {
+                return Err(match_option_error(
+                    "match_mode",
+                    "exact_or_line_endings_required",
+                ));
+            }
+        };
+        let expected_sha256 = match args.get("expected_sha256") {
+            None => None,
+            Some(Value::String(value)) if valid_sha256(value) => Some(value.to_ascii_lowercase()),
+            _ => {
+                return Err(match_option_error(
+                    "expected_sha256",
+                    "sha256_64_hex_required",
+                ));
+            }
+        };
+        let options = Self {
+            mode,
+            expected_sha256,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|value| !valid_sha256(value))
+        {
+            return Err(match_option_error(
+                "expected_sha256",
+                "sha256_64_hex_required",
+            ));
+        }
+        if self.mode == PatchMatchMode::LineEndings && self.expected_sha256.is_none() {
+            return Err(match_option_error(
+                "expected_sha256",
+                "required_for_line_endings",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn source_sha256(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+/// Byte araligi asil UTF-8 dosyaya aittir; end haric sinirdir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedBlock {
+    pub start: usize,
+    pub end: usize,
+    pub source_sha256: String,
+    pub range_sha256: String,
+    pub mode: PatchMatchMode,
+}
+
+impl MatchedBlock {
+    fn new(content: &str, start: usize, end: usize, mode: PatchMatchMode) -> Self {
+        Self {
+            start,
+            end,
+            source_sha256: source_sha256(content),
+            range_sha256: source_sha256(&content[start..end]),
+            mode,
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({"match_mode":self.mode.label(),"expected_sha256":self.source_sha256,
+            "byte_range":{"start":self.start,"end":self.end},"range_sha256":self.range_sha256})
+    }
+}
+
+/// Yalniz CRLF ciftini LF yapar. Her LF-gorunum byte siniri, orijinal byte
+/// sinirina eslenir; Unicode byte'lari ve tek basina CR aynen kalir.
+struct LfView {
+    text: String,
+    original_offsets: Vec<usize>,
+}
+
+impl LfView {
+    fn new(content: &str) -> Self {
+        let bytes = content.as_bytes();
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut original_offsets = Vec::with_capacity(bytes.len() + 1);
+        original_offsets.push(0);
+        let mut position = 0;
+        while position < bytes.len() {
+            if bytes[position] == b'\r' && bytes.get(position + 1) == Some(&b'\n') {
+                normalized.push(b'\n');
+                position += 2;
+            } else {
+                normalized.push(bytes[position]);
+                position += 1;
+            }
+            original_offsets.push(position);
+        }
+        Self {
+            text: String::from_utf8(normalized).expect("CRLF silme UTF-8 sinirlarini degistirmez"),
+            original_offsets,
+        }
+    }
+
+    fn block(&self, content: &str, start: usize, len: usize) -> MatchedBlock {
+        MatchedBlock::new(
+            content,
+            self.original_offsets[start],
+            self.original_offsets[start + len],
+            PatchMatchMode::LineEndings,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchMatchReason {
+    NotFound,
+    Ambiguous,
+    PartialLine,
+    LineEndingsMismatch,
+}
+
+impl PatchMatchReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::PartialLine => "partial_line",
+            Self::LineEndingsMismatch => "line_endings_mismatch",
+        }
+    }
+
+    fn next_action(self) -> &'static str {
+        match self {
+            Self::NotFound => "read_file_or_read_lines_then_copy_exact_old_text",
+            Self::Ambiguous => "choose_a_larger_unique_exact_block",
+            Self::PartialLine => "include_complete_line_or_block_with_punctuation",
+            Self::LineEndingsMismatch => {
+                "read_file_preserve_line_endings_then_resubmit_exact_old_text"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineEndingMetadata {
+    pub lf: usize,
+    pub crlf: usize,
+    pub bare_cr: usize,
+    pub final_newline: bool,
+}
+
+impl LineEndingMetadata {
+    fn of(text: &str) -> Self {
+        let crlf = text
+            .as_bytes()
+            .windows(2)
+            .filter(|pair| *pair == b"\r\n")
+            .count();
+        Self {
+            lf: text.bytes().filter(|byte| *byte == b'\n').count() - crlf,
+            crlf,
+            bare_cr: text.bytes().filter(|byte| *byte == b'\r').count() - crlf,
+            final_newline: text.ends_with('\n'),
+        }
+    }
+
+    fn json(self) -> Value {
+        json!({"lf":self.lf,"crlf":self.crlf,"bare_cr":self.bare_cr,"final_newline":self.final_newline})
+    }
+}
+
+/// Kaynak govdesi, yol veya model girdisi tasimayan, sinirli eslesme tanisi.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchMatchDiagnostic {
+    pub reason: PatchMatchReason,
+    /// Satir/blok sinirlarini da gecen, old_text ile birebir eslesen konum sayisi.
+    pub match_count: usize,
+    pub literal_match_count: usize,
+    pub normalized_match_count: Option<usize>,
+    pub total_lines: usize,
+    pub file_line_endings: LineEndingMetadata,
+    pub old_text_line_endings: LineEndingMetadata,
+    pub mode: PatchMatchMode,
+    pub recovery: Option<Box<MatchedBlock>>,
+}
+
+impl PatchMatchDiagnostic {
+    pub fn json(&self) -> Value {
+        let normalization_hint = (self.reason == PatchMatchReason::LineEndingsMismatch).then_some(
+            "Yalniz CRLF/LF karsilastirmasi eslesti; normalizasyon veya patch uygulanmadi.",
+        );
+        let mut diagnostic = json!({
+                "error":"PATCH_MATCH", "field":"old_text", "reason":self.reason.label(),
+                "match_count":self.match_count, "literal_match_count":self.literal_match_count,
+                "normalized_match_count":self.normalized_match_count, "total_lines":self.total_lines,
+                "line_endings":{"file":self.file_line_endings.json(),"old_text":self.old_text_line_endings.json()},
+                "normalization_hint":normalization_hint,"next_action":self.reason.next_action(),
+                "message":"Eski metin tam bir satir/blok olarak dosyada tam bir kez bulunmali. Girintiyi atlayabilirsiniz; satir sonundaki ';' gibi karakterleri atlayamazsiniz."
+        });
+        if self.mode != PatchMatchMode::Exact {
+            diagnostic["match_mode"] = json!(self.mode.label());
+        }
+        if let Some(recovery) = &self.recovery {
+            diagnostic["recovery"] = recovery.json();
+            diagnostic["next_action"] = json!(
+                "Ayni old_text/new_text ile match_mode=line_endings ve recovery.expected_sha256 gonder; yeniden kaynak okumak gerekmez. Rust hash ve tum eslesmeleri yeniden denetler."
+            );
+        }
+        diagnostic
+    }
+
+    /// Degisiklik dizisinin Rust tarafindan gozlenen, sifir tabanli indeksi.
+    pub fn for_change(&self, change_index: usize) -> Value {
+        let mut diagnostic = self.json();
+        diagnostic["change_index"] = json!(change_index);
+        diagnostic
+    }
+}
+
+impl std::fmt::Display for PatchMatchDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.json())
+    }
+}
+
+impl std::error::Error for PatchMatchDiagnostic {}
+
+/// Iki patch yolu da ayni tam ve tek eslesme kuralini kullanir. LF kopyalari
+/// yalnizca tani icindir; kabul edilen byte konumu her zaman asil metindendir.
+pub fn unique_line_block_match(
+    content: &str,
+    old_text: &str,
+) -> Result<usize, PatchMatchDiagnostic> {
+    let matches = if old_text.is_empty() {
+        Vec::new()
+    } else {
+        exact_line_block_locations(content, old_text)
+    };
+    if let [position] = matches.as_slice() {
+        return Ok(*position);
+    }
+    let literal_match_count = if old_text.is_empty() {
+        0
+    } else {
+        content.matches(old_text).count()
+    };
+    let mut normalized_match_count = None;
+    let mut recovery = None;
+    if !old_text.is_empty() && (content.contains("\r\n") || old_text.contains("\r\n")) {
+        let view = LfView::new(content);
+        let normalized_old = old_text.replace("\r\n", "\n");
+        let normalized_matches = all_line_block_locations(&view.text, &normalized_old);
+        if !normalized_matches.is_empty() {
+            normalized_match_count = Some(normalized_matches.len());
+        }
+        if let [start] = normalized_matches.as_slice() {
+            recovery = Some(Box::new(view.block(content, *start, normalized_old.len())));
+        }
+    }
+    let reason = if matches.len() > 1 {
+        PatchMatchReason::Ambiguous
+    } else if literal_match_count > 0 {
+        PatchMatchReason::PartialLine
+    } else if normalized_match_count.is_some() {
+        PatchMatchReason::LineEndingsMismatch
+    } else {
+        PatchMatchReason::NotFound
+    };
+    Err(PatchMatchDiagnostic {
+        reason,
+        match_count: matches.len(),
+        literal_match_count,
+        normalized_match_count,
+        total_lines: content.lines().count(),
+        file_line_endings: LineEndingMetadata::of(content),
+        old_text_line_endings: LineEndingMetadata::of(old_text),
+        mode: PatchMatchMode::Exact,
+        recovery,
+    })
+}
+
+/// Opt-in yol LF-gorunumundeki BUTUN tam blok eslesmelerini sayar. Bir exact
+/// eslesme bulunmasi diger CRLF/LF eslesmelerinin goz ardi edilmesine yol acmaz.
+pub fn match_line_block(
+    content: &str,
+    old_text: &str,
+    options: &PatchMatchOptions,
+) -> Result<MatchedBlock, String> {
+    options.validate()?;
+    if options
+        .expected_sha256
+        .as_ref()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&source_sha256(content)))
+    {
+        return Err(json!({"error":"PATCH_MATCH","field":"expected_sha256","reason":"source_changed",
+            "match_mode":options.mode.label(),"next_action":"read_current_source_and_build_new_candidate"}).to_string());
+    }
+    if options.mode == PatchMatchMode::Exact {
+        let start =
+            unique_line_block_match(content, old_text).map_err(|error| error.to_string())?;
+        return Ok(MatchedBlock::new(
+            content,
+            start,
+            start + old_text.len(),
+            options.mode,
+        ));
+    }
+    let view = LfView::new(content);
+    let normalized_old = old_text.replace("\r\n", "\n");
+    let matches = if normalized_old.is_empty() {
+        Vec::new()
+    } else {
+        all_line_block_locations(&view.text, &normalized_old)
+    };
+    if let [start] = matches.as_slice() {
+        return Ok(view.block(content, *start, normalized_old.len()));
+    }
+    let literal_match_count = if normalized_old.is_empty() {
+        0
+    } else {
+        view.text.matches(&normalized_old).count()
+    };
+    let reason = if matches.len() > 1 {
+        PatchMatchReason::Ambiguous
+    } else if literal_match_count > 0 {
+        PatchMatchReason::PartialLine
+    } else {
+        PatchMatchReason::NotFound
+    };
+    Err(PatchMatchDiagnostic {
+        reason,
+        match_count: matches.len(),
+        literal_match_count,
+        normalized_match_count: Some(matches.len()),
+        total_lines: content.lines().count(),
+        file_line_endings: LineEndingMetadata::of(content),
+        old_text_line_endings: LineEndingMetadata::of(old_text),
+        mode: options.mode,
+        recovery: None,
+    }
+    .to_string())
+}
+
+pub fn replace_line_block(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+    options: &PatchMatchOptions,
+) -> Result<String, String> {
+    if old_text.is_empty() {
+        return Err("Eski metin bos olamaz.".into());
+    }
+    if old_text == new_text {
+        return Err("Eski ve yeni kod ayni.".into());
+    }
+    let matched = match_line_block(content, old_text, options)?;
+    let mut updated = content.to_owned();
+    updated.replace_range(matched.start..matched.end, new_text);
+    if updated == content {
+        return Err("Eski ve yeni kod ayni.".into());
+    }
+    Ok(updated)
 }
 
 pub struct PatchPlan {
@@ -301,6 +740,22 @@ pub fn prepare_patch(
     relative: &str,
     old_text: &str,
     new_text: &str,
+) -> Result<PatchPlan, String> {
+    prepare_patch_with_options(
+        root,
+        relative,
+        old_text,
+        new_text,
+        &PatchMatchOptions::default(),
+    )
+}
+
+pub fn prepare_patch_with_options(
+    root: &Path,
+    relative: &str,
+    old_text: &str,
+    new_text: &str,
+    options: &PatchMatchOptions,
 ) -> Result<PatchPlan, String> {
     check_relative_path(relative)?;
     if old_text.is_empty() || new_text.is_empty() {
@@ -337,14 +792,7 @@ pub fn prepare_patch(
     if original.len() > 128_000 {
         return Err("Dosya 128 KB sinirini asiyor.".into());
     }
-    let matches = exact_line_block_locations(&original, old_text);
-    if matches.len() != 1 {
-        return Err("Eski metin tam bir satir/blok olarak dosyada tam bir kez bulunmali. Girintiyi atlayabilirsiniz; satir sonundaki ';' gibi karakterleri atlayamazsiniz.".into());
-    }
-
-    let pos = matches[0];
-    let mut updated = original.clone();
-    updated.replace_range(pos..pos + old_text.len(), new_text);
+    let updated = replace_line_block(&original, old_text, new_text, options)?;
     if updated.len() > 128_000 {
         return Err("Yeni dosya 128 KB sinirini asiyor.".into());
     }
@@ -457,31 +905,44 @@ pub fn rollback_patch(record: &PatchRecord) -> Result<(), String> {
 
 /// Her iki Cargo adimi da onaylanmis bir patch sonrasinda GERCEK projede calisir.
 pub async fn verify_patch(root: &Path) -> (bool, String) {
-    let check = match run_tests(root, "check").await {
-        Ok(result) => result,
-        Err(err) => return (false, format!("cargo check baslatilamadi: {err}")),
-    };
-    if !check.success {
-        return (false, check.report);
-    }
+    let results = verify_patch_results(root).await;
+    let success = results.len() == 2
+        && results
+            .iter()
+            .all(|result| result.status == ExecutionStatus::Succeeded);
+    let report = results
+        .iter()
+        .map(|result| result.report.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (success, report)
+}
 
-    let tests = match run_tests(root, "test").await {
-        Ok(result) => result,
-        Err(err) => {
-            return (
-                false,
-                format!("cargo check gecti, cargo test hatasi: {err}"),
-            );
+/// Eski metin API'sinin altinda gercek surec sonuclarini kaybetmez.
+pub async fn verify_patch_results(root: &Path) -> Vec<TestResult> {
+    let mut results = Vec::new();
+    for mode in ["check", "test"] {
+        let result = match run_tests(root, mode).await {
+            Ok(result) => result,
+            Err(error) => TestResult::execution_error(format!("cargo {mode}"), error),
+        };
+        let success = result.status == ExecutionStatus::Succeeded;
+        results.push(result);
+        if !success {
+            break;
         }
-    };
-    let report = format!("{}\n\n{}", check.report, tests.report);
-    (tests.success, report)
+    }
+    results
 }
 
 // ============================================================
 // OLLAMA ARAC TANIMLARI
 // ============================================================
 pub fn tool_definitions() -> Value {
+    let match_mode_schema = json!({"type":"string","enum":["exact","line_endings"],
+        "description":"Varsayilan exact. Yalniz Rust PATCH_MATCH recovery kaniti varsa line_endings ile CRLF/LF farkini acikca kabul et; expected_sha256 zorunludur. Bosluk veya noktalama esnetilmez."});
+    let expected_sha256_schema = json!({"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-fA-F]{64}$",
+        "description":"Rust recovery.expected_sha256: kaynak dosyanin TAM byte'larinin SHA256 ozeti. line_endings modunda zorunlu; hash degisirse aday reddedilir."});
     let mut definitions = json!([
         {
             "type": "function",
@@ -555,6 +1016,8 @@ pub fn tool_definitions() -> Value {
                         "path": {"type": "string", "description": "Ornek: src/main.rs"},
                         "old_text": {"type": "string", "description": "Satirin/blokun tam eski metni (girinti disinda hicbir karakter atlama)"},
                         "new_text": {"type": "string", "description": "Yerine konacak tam yeni metin"},
+                        "match_mode": match_mode_schema,
+                        "expected_sha256": expected_sha256_schema,
                         "mode": {"type": "string", "enum": ["check", "test"], "description": "Varsayilan check"}
                     }, "required": ["path", "old_text", "new_text"]
                 }
@@ -569,7 +1032,9 @@ pub fn tool_definitions() -> Value {
                     "type": "object", "properties": {
                         "path": {"type": "string"},
                         "old_text": {"type": "string", "description": "Satirin/blokun tam eski metni (girinti disinda hicbir karakter atlama)"},
-                        "new_text": {"type": "string", "description": "Yerine konacak tam yeni metin"}
+                        "new_text": {"type": "string", "description": "Yerine konacak tam yeni metin"},
+                        "match_mode": match_mode_schema,
+                        "expected_sha256": expected_sha256_schema
                     }, "required": ["path", "old_text", "new_text"]
                 }
             }
@@ -583,7 +1048,9 @@ pub fn tool_definitions() -> Value {
                 "operation": {"type": "string", "const": "edit"},
                 "path": {"type": "string"},
                 "old_text": {"type": "string", "description": "Okunan tam eski satir/blok, en fazla 8000 byte. JSON string olarak kodla; cozulen deger kaynakla ayni olmali. LF/CRLF ve dosya sonunda satir sonu olup olmadigini koru. Rust tam eslesmeyi denetler."},
-                "new_text": {"type": "string", "description": "Eski blok yerine gelecek tam metin, en fazla 8000 byte."}
+                "new_text": {"type": "string", "description": "Eski blok yerine gelecek tam metin, en fazla 8000 byte."},
+                "match_mode": match_mode_schema,
+                "expected_sha256": expected_sha256_schema
             }, "required": ["operation", "path", "old_text", "new_text"], "additionalProperties": false},
             {"type": "object", "properties": {
                 "operation": {"type": "string", "const": "create"},
@@ -625,6 +1092,212 @@ pub fn tool_definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_ending_options(content: &str) -> PatchMatchOptions {
+        PatchMatchOptions {
+            mode: PatchMatchMode::LineEndings,
+            expected_sha256: Some(source_sha256(content)),
+        }
+    }
+
+    #[test]
+    fn eol_eslesme_secenekleri_acik_ve_sha256_ile_bagli_olmali() {
+        assert_eq!(
+            PatchMatchOptions::from_arguments(&json!({})).unwrap(),
+            PatchMatchOptions::default()
+        );
+        assert_eq!(
+            PatchMatchOptions::from_arguments(&json!({"match_mode":"exact"})).unwrap(),
+            PatchMatchOptions::default()
+        );
+        let options = PatchMatchOptions::from_arguments(
+            &json!({"match_mode":"line_endings","expected_sha256":"A".repeat(64)}),
+        )
+        .unwrap();
+        assert_eq!(options.expected_sha256, Some("a".repeat(64)));
+        for args in [
+            json!({"match_mode":"line_endings"}),
+            json!({"match_mode":"fuzzy"}),
+            json!({"match_mode":null}),
+            json!({"expected_sha256":"bad"}),
+            json!({"expected_sha256":"z".repeat(64)}),
+        ] {
+            assert!(PatchMatchOptions::from_arguments(&args).is_err());
+        }
+        let direct = PatchMatchOptions {
+            mode: PatchMatchMode::LineEndings,
+            expected_sha256: None,
+        };
+        assert!(match_line_block("fn a() {}\n", "fn a() {}", &direct).is_err());
+    }
+
+    #[test]
+    fn eol_byte_eslemesi_lf_crlf_mixed_unicode_ve_dis_byte_lari_korumali() {
+        for (first, second, outside_first, outside_last) in [
+            ("\n", "\n", "\n", "\n"),
+            ("\r\n", "\r\n", "\r\n", "\r\n"),
+            ("\r\n", "\n", "\r\n", "\n"),
+            ("\n", "\r\n", "\r\n", "\n"),
+        ] {
+            let prefix = format!("// önce🦀{outside_first}");
+            let old_original = format!("    fn α() {{}}{first}\tfn β() {{}}{second}");
+            let suffix = format!("// sonra🌱{outside_last}");
+            let content = format!("{prefix}{old_original}{suffix}");
+            let old_text = "fn α() {}\n\tfn β() {}\n";
+            let new_text = "fn α() { /* ✓ */ }\n\tfn β() {}\n";
+            let options = line_ending_options(&content);
+            let matched = match_line_block(&content, old_text, &options).unwrap();
+            assert_eq!(matched.start, prefix.len() + 4);
+            assert_eq!(matched.end, prefix.len() + old_original.len());
+            assert_eq!(matched.range_sha256, source_sha256(&old_original[4..]));
+            assert_eq!(matched.source_sha256, source_sha256(&content));
+            let updated = replace_line_block(&content, old_text, new_text, &options).unwrap();
+            assert_eq!(updated, format!("{prefix}    {new_text}{suffix}"));
+            assert_eq!(
+                &updated.as_bytes()[..matched.start],
+                &content.as_bytes()[..matched.start]
+            );
+            assert!(
+                updated
+                    .as_bytes()
+                    .ends_with(&content.as_bytes()[matched.end..])
+            );
+            assert_eq!(
+                unique_line_block_match(&content, old_text).is_err(),
+                first == "\r\n" || second == "\r\n"
+            );
+        }
+    }
+
+    #[test]
+    fn eol_modu_exact_ve_normalized_eslesmelerin_tumunu_saymali() {
+        let content = "fn a() {}\nfn a() {}\r\n";
+        let old = "fn a() {}\n";
+        assert_eq!(
+            unique_line_block_match(content, old),
+            Ok(0),
+            "Strict varsayilan semantik korunur."
+        );
+        let error = match_line_block(content, old, &line_ending_options(content)).unwrap_err();
+        let diagnostic: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(diagnostic["reason"], "ambiguous");
+        assert_eq!(diagnostic["match_count"], 2);
+        assert_eq!(diagnostic["normalized_match_count"], 2);
+        assert!(diagnostic.get("recovery").is_none());
+        let only_crlf = "fn a() {}\r\nfn a() {}\r\n";
+        let strict = unique_line_block_match(only_crlf, old).unwrap_err().json();
+        assert!(
+            strict.get("recovery").is_none(),
+            "Normalized iki konum tek kanit sayilamaz."
+        );
+        let overlap = "fn a() {}\nfn a() {}\r\nfn a() {}\n";
+        let two_lines = "fn a() {}\nfn a() {}\n";
+        let strict = unique_line_block_match(overlap, two_lines)
+            .unwrap_err()
+            .json();
+        assert_eq!(strict["normalized_match_count"], 2);
+        assert!(strict.get("recovery").is_none());
+        let error =
+            match_line_block(overlap, two_lines, &line_ending_options(overlap)).unwrap_err();
+        let diagnostic: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(diagnostic["reason"], "ambiguous");
+        assert_eq!(
+            diagnostic["match_count"], 2,
+            "Ortusen normalized tam bloklar da sayilir."
+        );
+    }
+
+    #[test]
+    fn eol_optin_noktalama_bosluk_bare_cr_ve_literal_escape_esnetmemeli() {
+        for (content, old_text, reason) in [
+            ("    let value = 1;\r\n", "let value = 1", "partial_line"),
+            ("fn a() {}\r\n", "fn a() {", "partial_line"),
+            ("fn a() { 1 }\r\n", "fn a(){ 1 }\n", "not_found"),
+            ("fn a() {}\r\n", "fn a() {}\\n", "not_found"),
+            (
+                "fn a() {}\rfn b() {}\r",
+                "fn a() {}\nfn b() {}\n",
+                "not_found",
+            ),
+        ] {
+            let error =
+                match_line_block(content, old_text, &line_ending_options(content)).unwrap_err();
+            let diagnostic: Value = serde_json::from_str(&error).unwrap();
+            assert_eq!(diagnostic["reason"], reason);
+            assert!(diagnostic.get("recovery").is_none());
+        }
+        let content = "fn a() {}\r\n";
+        assert!(
+            replace_line_block(
+                content,
+                "fn a() {}\n",
+                "fn a() {}\r\n",
+                &line_ending_options(content)
+            )
+            .is_err(),
+            "Somut byte adayi degismiyorsa no-op reddedilir."
+        );
+        assert_eq!(
+            replace_line_block(content, "fn a() {}\n", "", &line_ending_options(content)).unwrap(),
+            "",
+            "Workspace bos replacement blok silmesini korur."
+        );
+    }
+
+    #[test]
+    fn eol_kurtarma_kaniti_tek_aralik_ve_guncel_kaynak_hashi_gerektirmeli() {
+        let content = "// ü\r\nfn a() {}\r\n// son\n";
+        let old = "fn a() {}\n";
+        let strict = unique_line_block_match(content, old).unwrap_err().json();
+        let recovery = &strict["recovery"];
+        assert_eq!(recovery["match_mode"], "line_endings");
+        assert_eq!(recovery["expected_sha256"], source_sha256(content));
+        assert_eq!(recovery["byte_range"]["start"], "// ü\r\n".len());
+        assert_eq!(recovery["range_sha256"], source_sha256("fn a() {}\r\n"));
+        let options = PatchMatchOptions::from_arguments(recovery).unwrap();
+        assert!(match_line_block(content, old, &options).is_ok());
+        let drift = format!("// drift\n{content}");
+        let error = match_line_block(&drift, old, &options).unwrap_err();
+        let diagnostic: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(diagnostic["field"], "expected_sha256");
+        assert_eq!(diagnostic["reason"], "source_changed");
+        assert!(diagnostic.get("recovery").is_none());
+        assert!(!error.contains("drift\n"));
+    }
+
+    #[test]
+    fn optin_prepare_exact_varsayilani_ve_yazmadan_aday_uretimini_korumali() {
+        let root = std::env::temp_dir().join(format!(
+            "fiko_eol_prepare_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let content = "// ü\r\nfn a() {}\r\n";
+        fs::write(root.join("src/a.rs"), content).unwrap();
+        let old = "fn a() {}\n";
+        let new = "fn a() { }\n";
+        assert!(prepare_patch(&root, "src/a.rs", old, new).is_err());
+        let plan =
+            prepare_patch_with_options(&root, "src/a.rs", old, new, &line_ending_options(content))
+                .unwrap();
+        assert_eq!(plan.original, content);
+        assert_eq!(plan.updated, "// ü\r\nfn a() { }\n");
+        assert_eq!(fs::read(root.join("src/a.rs")).unwrap(), content.as_bytes());
+        assert!(!root.join(".fiko_backups").exists());
+        assert!(root.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("fiko_eol_prepare_")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn newline_tam_satir_bloklari_eslesmeli() {
@@ -711,6 +1384,14 @@ mod tests {
             assert_eq!(result.status, expected);
             assert_eq!(result.exit_code, Some(code));
             assert_eq!(result.success, code == 0);
+            assert_eq!(
+                result.observation(),
+                CommandObservation {
+                    command: "cargo test".into(),
+                    status: expected,
+                    exit_code: Some(code),
+                }
+            );
             let response = result.tool_response();
             assert_eq!(response["authority"], "rust_process");
             assert_eq!(response["command"], "cargo test");
@@ -918,6 +1599,142 @@ mod tests {
     }
 
     #[test]
+    fn patch_match_tanisi_kaynak_verisini_tasimamali_ve_sinirli_olmali() {
+        for content in [
+            "SECRET_SOURCE_TOKEN\nC:\\private\\secret.rs\n".to_owned(),
+            "SECRET_SOURCE_TOKEN\n".repeat(6000),
+        ] {
+            let error = unique_line_block_match(&content, "SECRET_NEEDLE_TOKEN").unwrap_err();
+            assert_eq!(error.reason, PatchMatchReason::NotFound);
+            let encoded = error.to_string();
+            let diagnostic: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(diagnostic["error"], "PATCH_MATCH");
+            assert_eq!(diagnostic["field"], "old_text");
+            assert_eq!(diagnostic["match_count"], 0);
+            assert_eq!(diagnostic["total_lines"], content.lines().count());
+            assert!(encoded.len() < 1600);
+            assert!(!encoded.contains("SECRET_SOURCE_TOKEN"));
+            assert!(!encoded.contains("SECRET_NEEDLE_TOKEN"));
+            assert!(!encoded.contains("private"));
+            assert!(!encoded.contains("secret.rs"));
+        }
+    }
+
+    #[test]
+    fn patch_match_noktalama_sinir_cogulluk_ve_yokluk_ayrilmali() {
+        for (content, old_text, reason, exact_count, literal_count) in [
+            (
+                "    let value = 1;\n",
+                "let value = 1",
+                PatchMatchReason::PartialLine,
+                0,
+                1,
+            ),
+            (
+                "fn demo() {}\n",
+                "fn demo() {",
+                PatchMatchReason::PartialLine,
+                0,
+                1,
+            ),
+            (
+                "fn demo() {}\n",
+                "demo() {}",
+                PatchMatchReason::PartialLine,
+                0,
+                1,
+            ),
+            (
+                "fn demo() {}\nfn demo() {}\n",
+                "fn demo() {}",
+                PatchMatchReason::Ambiguous,
+                2,
+                2,
+            ),
+            (
+                "fn demo() {}\n",
+                "fn absent() {}",
+                PatchMatchReason::NotFound,
+                0,
+                0,
+            ),
+            (
+                "fn demo() {}\n",
+                "fn demo() {}\\n",
+                PatchMatchReason::NotFound,
+                0,
+                0,
+            ),
+            ("", "", PatchMatchReason::NotFound, 0, 0),
+        ] {
+            let error = unique_line_block_match(content, old_text).unwrap_err();
+            assert_eq!(error.reason, reason);
+            assert_eq!(error.match_count, exact_count);
+            assert_eq!(error.literal_match_count, literal_count);
+            assert_eq!(error.normalized_match_count, None);
+        }
+    }
+
+    #[test]
+    fn crlf_lf_farki_yalniz_kanitli_tani_olmali() {
+        for (content, old_text) in [
+            (
+                "    fn a() {}\r\n\tfn b() {}\r\n",
+                "fn a() {}\n\tfn b() {}\n",
+            ),
+            (
+                "    fn a() {}\n\tfn b() {}\n",
+                "fn a() {}\r\n\tfn b() {}\r\n",
+            ),
+            ("    fn a() {}\n\tfn b() {}\r\n", "fn a() {}\n\tfn b() {}\n"),
+        ] {
+            let error = unique_line_block_match(content, old_text).unwrap_err();
+            assert_eq!(error.reason, PatchMatchReason::LineEndingsMismatch);
+            assert_eq!(error.match_count, 0);
+            assert_eq!(error.normalized_match_count, Some(1));
+            assert!(!exact_line_block_locations(content, old_text).contains(&4));
+            let diagnostic: Value = serde_json::from_str(&error.to_string()).unwrap();
+            assert!(diagnostic["normalization_hint"].is_string());
+        }
+        let crlf = LineEndingMetadata::of("a\r\nb\r\n");
+        assert_eq!(
+            crlf,
+            LineEndingMetadata {
+                lf: 0,
+                crlf: 2,
+                bare_cr: 0,
+                final_newline: true
+            }
+        );
+        let mixed = LineEndingMetadata::of("a\r\nb\nc\r");
+        assert_eq!(
+            mixed,
+            LineEndingMetadata {
+                lf: 1,
+                crlf: 1,
+                bare_cr: 1,
+                final_newline: false
+            }
+        );
+    }
+
+    #[test]
+    fn ortak_match_helper_tam_eslesme_ve_girinti_kuralini_korumali() {
+        for ending in ["\n", "\r\n"] {
+            let content = format!("fn demo() {{{ending}\tlet value = 1;{ending}}}{ending}");
+            for old_text in [
+                "let value = 1;".to_owned(),
+                format!("\tlet value = 1;{ending}"),
+                format!("fn demo() {{{ending}\tlet value = 1;{ending}}}{ending}"),
+            ] {
+                let exact = exact_line_block_locations(&content, &old_text);
+                assert_eq!(exact.len(), 1);
+                assert_eq!(unique_line_block_match(&content, &old_text), Ok(exact[0]));
+            }
+        }
+    }
+
+    #[test]
     fn tam_satir_patch_girinti_olmadan_kabul_edilmeli() {
         let content = "fn main() {\n    println!(\"FIKO\");\n}\n";
         assert_eq!(
@@ -970,12 +1787,28 @@ mod tests {
         // 1-1 araligi: 1 satir dondurmeli
         let result_1_1 = read_lines(&root, "src/test.rs", 1, 1).unwrap();
         assert!(result_1_1.contains("1 |     println!(\"satir 1\", 1);"));
-        assert_eq!(result_1_1.lines().count(), 1);
+        let (header, body) = result_1_1.split_once('\n').unwrap();
+        let metadata: Value =
+            serde_json::from_str(header.strip_prefix("[READ_LINES] ").unwrap()).unwrap();
+        assert_eq!(metadata["total_lines"], 65);
+        assert_eq!(
+            metadata["returned_range"],
+            json!({"start_line":1,"end_line":1})
+        );
+        assert_eq!(body.lines().count(), 1);
 
         // 1-60 araligi: 60 satir dondurmeli
         let result_1_60 = read_lines(&root, "src/test.rs", 1, 60).unwrap();
         assert!(result_1_60.contains("60 |     println!(\"satir 60\", 60);"));
-        assert_eq!(result_1_60.lines().count(), 60);
+        let (header, body) = result_1_60.split_once('\n').unwrap();
+        let metadata: Value =
+            serde_json::from_str(header.strip_prefix("[READ_LINES] ").unwrap()).unwrap();
+        assert_eq!(metadata["total_lines"], 65);
+        assert_eq!(
+            metadata["returned_range"],
+            json!({"start_line":1,"end_line":60})
+        );
+        assert_eq!(body.lines().count(), 60);
 
         // 1-61 araligi: reddedilmeli (61 satir siniri asiyor)
         let err_1_61 = read_lines(&root, "src/test.rs", 1, 61).unwrap_err();
