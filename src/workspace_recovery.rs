@@ -5,7 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -100,9 +100,11 @@ pub fn start(root: &Path, record: &WorkspaceRecord) -> Result<(), String> {
         return Err("Onceki workspace islemi belirsiz: --recovery-audit calistirin; yeni yazma reddedildi.".into());
     }
     let directory = root.join(".fiko_backups");
-    if !directory.is_dir() {
-        return Err("Yedek klasoru bulunamadi; hedef dosyalara yazilmayacak.".into());
+    if !directory.exists() {
+        fs::create_dir(&directory).map_err(|e| format!("Kurtarma klasoru olusturulamadi: {e}"))?;
     }
+    // Recheck the directory after creating it; never follow a substituted link.
+    marker_path(&root)?;
     let bytes = serde_json::to_vec_pretty(&manifest(record)).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err("Kurtarma kaydi boyut sinirini asiyor.".into());
@@ -121,15 +123,14 @@ fn file_state(root: &Path, relative: &str, expected_original: Option<&str>, expe
         Ok(path) => path,
         Err(_) => return "unsafe_path",
     };
-    let meta = match fs::symlink_metadata(&target) {
+    match fs::symlink_metadata(&target) {
         Ok(meta) if meta.is_file() && !is_link(&meta) && meta.len() <= MAX_FILE_BYTES as u64 => meta,
         Ok(_) => return "unsafe_or_oversized",
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return if expected_original.is_none() { "original_absent" } else { "missing" };
         }
         Err(_) => return "unreadable",
-    };
-    let _ = meta;
+    }
     let mut bytes = Vec::new();
     if File::open(&target).and_then(|file| file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes)).is_err() {
         return "unreadable";
@@ -153,7 +154,11 @@ fn state_matches(root: &Path, record: &WorkspaceRecord, verified: bool) -> bool 
 fn finish(root: &Path, record: &WorkspaceRecord, verified: bool) -> Result<(), String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     if !matching_marker(&root, record)? {
-        return Ok(());
+        return if verified {
+            Err("Dogrulanmis islem icin kurtarma kaydi kayip; basari raporlanamaz.".into())
+        } else {
+            Ok(())
+        };
     }
     if !state_matches(&root, record, verified) {
         return Err("Dosyalar beklenen kurtarma durumunda degil; kayit korundu.".into());
@@ -206,6 +211,7 @@ mod tests {
     use super::*;
     use crate::workspace_patch::{self, FileChange, WorkspacePlan};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::PathBuf;
 
     struct Fixture(PathBuf);
     impl Fixture {
