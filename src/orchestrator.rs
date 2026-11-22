@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::agent::{
     PatchEffect, Prompter, Session, ToolOutcome, handle_tool_call, task_status_line,
@@ -178,7 +179,97 @@ fn canonical(value: &Value) -> Value {
 
 /// Ayni arac + ayni argumanlar icin ayni anahtar (alan sirasi onemsiz).
 pub fn call_key(name: &str, args: &Value) -> String {
-    format!("{name}|{}", canonical(args))
+    format!(
+        "{name}|{:x}",
+        Sha256::digest(canonical(args).to_string().as_bytes())
+    )
+}
+
+/// Yalniz tekrar karsilastirmasi; argumanlari veya dosya icerigini degistirmez.
+fn normalized_call(name: &str, args: &Value) -> Value {
+    let Ok(mut normalized) = validate_args(name, args) else {
+        return args.clone();
+    };
+    let normalize = |value: &mut Value| {
+        if let Some(path) = value.as_str()
+            && let Ok(path) = crate::context::normalize_path(path)
+        {
+            *value = Value::String(if cfg!(windows) {
+                path.to_lowercase()
+            } else {
+                path
+            });
+        }
+    };
+    if let Some(object) = normalized.as_object_mut() {
+        if let Some(path) = object.get_mut("path") {
+            normalize(path);
+        }
+        if let Some(changes) = object.get_mut("changes").and_then(Value::as_array_mut) {
+            for change in changes.iter_mut() {
+                if let Some(path) = change.get_mut("path") {
+                    normalize(path);
+                }
+            }
+            changes.sort_by_key(|change| change["path"].as_str().unwrap_or("").to_owned());
+        }
+    }
+    normalized
+}
+
+/// old_text hatasinda new_text/mode degistirmek eslesme hatasini gidermez.
+fn failed_match_keys(name: &str, args: &Value) -> Vec<String> {
+    let normalized = normalized_call(name, args);
+    let identity = |edit: &Value| serde_json::json!({"path":edit["path"],"old_text":edit["old_text"],"match_mode":edit.get("match_mode").cloned().unwrap_or(Value::String("exact".into())),"expected_sha256":edit["expected_sha256"]});
+    let edits = if matches!(name, "verify_candidate" | "apply_patch") {
+        vec![identity(&normalized)]
+    } else if matches!(name, "verify_workspace" | "apply_workspace") {
+        normalized["changes"]
+            .as_array()
+            .map_or_else(Vec::new, |changes| {
+                changes
+                    .iter()
+                    .filter(|change| change["operation"] == "edit")
+                    .map(identity)
+                    .collect()
+            })
+    } else {
+        return Vec::new();
+    };
+    edits
+        .iter()
+        .map(|edit| call_key("failed_old_text", edit))
+        .collect()
+}
+
+fn rejected_match_key(name: &str, args: &Value, output: &str) -> Option<String> {
+    if matches!(name, "verify_candidate" | "apply_patch") {
+        return failed_match_keys(name, args).into_iter().next();
+    }
+    let diagnostic: Value = serde_json::from_str(output.strip_prefix("ERROR: ")?).ok()?;
+    let index = diagnostic["change_index"].as_u64()? as usize;
+    let change = args["changes"].as_array()?.get(index)?;
+    failed_match_keys("verify_candidate", change)
+        .into_iter()
+        .next()
+}
+
+fn normalize_matching(
+    name: &str,
+    input: &Value,
+    output: &mut Map<String, Value>,
+) -> Result<(), String> {
+    let matching = crate::tools::PatchMatchOptions::from_arguments(input)
+        .map_err(|error| invalid(name, &error))?;
+    output.remove("match_mode");
+    output.remove("expected_sha256");
+    if matching.mode == crate::tools::PatchMatchMode::LineEndings {
+        output.insert("match_mode".into(), Value::String("line_endings".into()));
+    }
+    if let Some(hash) = matching.expected_sha256 {
+        output.insert("expected_sha256".into(), Value::String(hash));
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -373,13 +464,21 @@ pub fn validate_args(name: &str, args: &Value) -> Result<Value, String> {
             }
             out.insert("old_text".into(), old_text);
             out.insert("new_text".into(), new_text);
+            normalize_matching(name, args, &mut out)?;
             if name == "verify_candidate" {
                 out.insert("mode".into(), mode(name, object, true)?);
             }
         }
         "verify_workspace" | "apply_workspace" => {
             crate::workspace_agent::parse_changes(args).map_err(|error| invalid(name, &error))?;
-            out.insert("changes".into(), object["changes"].clone());
+            let mut changes = object["changes"].clone();
+            for change in changes.as_array_mut().unwrap() {
+                if change["operation"] == "edit" {
+                    let original = change.clone();
+                    normalize_matching(name, &original, change.as_object_mut().unwrap())?;
+                }
+            }
+            out.insert("changes".into(), changes);
             if name == "verify_workspace" {
                 out.insert("mode".into(), mode(name, object, true)?);
             }
@@ -445,6 +544,13 @@ pub struct Orchestrator {
     plan_verified: bool,
     context_budget: ContextBudget,
     patch_events: Vec<PatchEffect>,
+    approval_rejected: bool,
+    processes: Vec<crate::tools::CommandObservation>,
+    modified_paths: Option<std::collections::BTreeSet<String>>,
+    read_evidence: Vec<Value>,
+    evidence_terms: Vec<String>,
+    failed_matches: HashMap<String, usize>,
+    file_scope: intent::FileScope,
 }
 
 impl Orchestrator {
@@ -470,12 +576,29 @@ impl Orchestrator {
             plan_verified: false,
             context_budget: ContextBudget::default(),
             patch_events: Vec::new(),
+            approval_rejected: false,
+            processes: Vec::new(),
+            modified_paths: Some(std::collections::BTreeSet::new()),
+            read_evidence: Vec::new(),
+            evidence_terms: Vec::new(),
+            failed_matches: HashMap::new(),
+            file_scope: intent::FileScope::default(),
         }
     }
 
     /// Kullanici istegini siniflandirip gorev baglamini kurar.
     pub fn for_request(request: &str) -> Self {
         let mut task = Self::new(intent::classify(request));
+        task.file_scope = intent::file_scope(request);
+        if task.file_scope.ambiguous {
+            task.authority = WriteAuthority::Denied;
+        }
+        task.evidence_terms = request
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .filter(|term| (2..=64).contains(&term.len()))
+            .take(32)
+            .map(str::to_owned)
+            .collect();
         if task.intent() == TaskIntent::Modify {
             task.plan = Some(TaskPlan::new(request));
         }
@@ -507,22 +630,10 @@ impl Orchestrator {
     }
 
     pub(crate) fn context_key(&self, name: &str, args: &Value) -> String {
-        if self.plan.is_some()
-            && READ_TOOLS.contains(&name)
-            && let Ok(mut normalized) = validate_args(name, args)
-        {
-            if let Some(path) = normalized["path"].as_str()
-                && let Ok(path) = crate::context::normalize_path(path)
-            {
-                normalized["path"] = Value::String(if cfg!(windows) {
-                    path.to_lowercase()
-                } else {
-                    path
-                });
-            }
-            call_key(name, &normalized)
-        } else {
+        if self.intent() == TaskIntent::Generate {
             call_key(name, args)
+        } else {
+            call_key(name, &normalized_call(name, args))
         }
     }
 
@@ -565,6 +676,104 @@ impl Orchestrator {
         &self.test_results
     }
 
+    /// Yalniz gercek handler etkileri ve surec kayitlari; model raporu okunmaz.
+    pub fn memory_finish(&self) -> crate::memory::TaskFinish {
+        let restored = self.patch_events.contains(&PatchEffect::Restored);
+        let uncertain = self.project_state == ProjectState::Uncertain;
+        let outcome = if uncertain {
+            "uncertain"
+        } else if self.applied() {
+            "verified"
+        } else if restored {
+            "rolled_back"
+        } else {
+            "not_applied"
+        };
+        let phase = if self.approval_rejected && !self.applied() && !restored && !uncertain {
+            "Rejected"
+        } else if self.phase().is_terminal() {
+            self.phase().label()
+        } else {
+            "Interrupted"
+        };
+        let target_paths = self.plan.as_ref().map_or_else(Vec::new, |plan| {
+            plan.required_targets
+                .iter()
+                .cloned()
+                .chain(plan.targets.iter().map(|target| target.path.clone()))
+                .collect()
+        });
+        let commands = self
+            .processes
+            .iter()
+            .filter_map(|result| {
+                let mode = result.command.rsplit_once(' ')?.1;
+                if !["check", "test"].contains(&mode) {
+                    return None;
+                }
+                Some(crate::memory::CommandMemory {
+                    command: format!("cargo {mode}"),
+                    status: result.status.label().into(),
+                    exit_code: result.exit_code,
+                })
+            })
+            .take(16)
+            .collect();
+        crate::memory::TaskFinish {
+            phase: phase.into(),
+            outcome: outcome.into(),
+            applied: (!uncertain).then_some(self.applied() || restored),
+            rolled_back: (!uncertain).then_some(restored && !self.applied()),
+            commands,
+            files: vec![],
+            target_paths,
+            modified_paths: self
+                .modified_paths
+                .as_ref()
+                .map(|paths| paths.iter().cloned().collect()),
+        }
+    }
+
+    fn record_read_evidence(&mut self, name: &str, args: &Value, output: &str) {
+        if self.read_evidence.len() >= 8
+            || !matches!(name, "read_file" | "read_lines" | "search_in_file")
+        {
+            return;
+        }
+        let Some(path) = args["path"]
+            .as_str()
+            .and_then(|path| crate::memory_retrieval::safe_path(path).ok())
+        else {
+            return;
+        };
+        let mut lines: Vec<_> = output
+            .lines()
+            .filter(|line| {
+                line.contains("fn ") || line.contains("struct ") || line.contains("pub mod ")
+            })
+            .collect();
+        lines.sort_by_key(|line| {
+            !self.evidence_terms.iter().any(|term| {
+                line.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .any(|word| word == term)
+            })
+        });
+        let excerpts: Vec<String> = lines
+            .into_iter()
+            .take(2)
+            .map(|line| line.chars().take(180).collect())
+            .collect();
+        self.read_evidence.push(serde_json::json!({"path":path,"tool":name,"source":"this_task_tool_output","literal_excerpts":excerpts,"scope":"read_region_only; no_global_absence_proof"}));
+    }
+
+    fn factual_report(&self) -> String {
+        let finish = self.memory_finish();
+        format!(
+            "[RUST KANIT OZETI] {}",
+            serde_json::json!({"source":"this_task_rust_dispatcher","reads":self.read_evidence,"modified_paths":finish.modified_paths,"commands_run_this_task":finish.commands.iter().map(|command| serde_json::json!({"command":command.command,"status":command.status,"exit_code":command.exit_code})).collect::<Vec<_>>(),"notice":"Alintilar gercek okuma ciktisidir; semantik/AST veya tum projede yokluk kaniti degildir. Gecmis testler bu gorevde yeniden calistirilmis sayilmaz."})
+        )
+    }
+
     fn command_report(&self) -> String {
         let reports: Vec<_> = self
             .test_results
@@ -583,6 +792,13 @@ impl Orchestrator {
     /// olarak sunulmaz. Ham model mesaji sohbet gecmisinde korunur; bu gorunum
     /// yalniz Rust'in gozledigi sonucu ve gercek cikti onizlemesini kullanir.
     pub fn render_answer(&self, answer: &str) -> String {
+        if matches!(self.intent(), TaskIntent::Analyze | TaskIntent::Explain) {
+            return format!(
+                "[MODEL ACIKLAMASI - DOGRULANMAMIS] Dosya degisikligi ve okuma kaniti icin Rust ozeti esas alinir; celisen model ifadeleri kanit degildir.\n{answer}\n\n{}\n{}",
+                self.factual_report(),
+                self.command_report()
+            );
+        }
         if self.intent() == TaskIntent::Test {
             return format!(
                 "[MODEL RAPORU KORUMASI] Modelin test sonucu yorumu dogrulanmadigi icin sonuc raporu olarak gosterilmedi. Modelin farkli basari/basarisizlik veya test adi iddiasi asagidaki yetkili surec kaydiyla celisir; Rust raporu gecerlidir.\n{}",
@@ -613,6 +829,11 @@ impl Orchestrator {
 
     /// Kullanici mesajina eklenen kisa yol gosterici (system prompt buyutulmez).
     pub fn request_note(&self) -> String {
+        if self.file_scope.ambiguous
+            && matches!(self.intent(), TaskIntent::Unknown | TaskIntent::Modify)
+        {
+            return "[FIKO NOT] Yazma/koruma kapsami belirsiz veya celiskili. Dosya degistirme, verify/apply veya onay isteme. Hangi dosyanin degistirilecegini ve hangisinin korunacagini acikca netlestir.".into();
+        }
         if self.decision.write_forbidden && self.intent() == TaskIntent::Unknown {
             return format!(
                 "[FIKO NOT] Gorev turu: Unknown (kanit: {}). Kullanici dosya degisikligini acikca yasakladi. verify_candidate ve apply_patch kullanilamaz; yazma izni isteme. Istegi aciklastir veya salt-okunur yanit ver.",
@@ -653,6 +874,7 @@ impl Orchestrator {
             self.authority = if allowed {
                 WriteAuthority::Granted
             } else {
+                self.approval_rejected = true;
                 WriteAuthority::Denied
             };
             println!(
@@ -699,8 +921,12 @@ impl Orchestrator {
         self.repair.clear_pending_workspace();
         self.plan_verified = false;
         let phase = self.phase();
-        if stop.is_some() && self.intent() == TaskIntent::Generate && !phase.is_terminal() {
-            self.repair.enter(TaskPhase::Blocked);
+        if stop.is_some() && !phase.is_terminal() {
+            self.repair.enter(if phase == TaskPhase::Applying {
+                TaskPhase::Failed
+            } else {
+                TaskPhase::Blocked
+            });
         }
         if announce {
             println!("[ORCH] {}", output.lines().next().unwrap_or(""));
@@ -720,6 +946,10 @@ impl Orchestrator {
             test_result: None,
             workspace_report: None,
             candidate_verified: false,
+            approval_rejected: false,
+            processes: Vec::new(),
+            modified_paths: None,
+            patch_match_failure: false,
         }
     }
 
@@ -791,7 +1021,7 @@ impl Orchestrator {
         {
             self.stats.repeated_failures += 1;
             let output = format!(
-                "ERROR: {name} ayni argumanlarla daha once basarisiz oldu. Ayni cagriyi tekrarlama; argumanlari duzelt ya da farkli bir yaklasim sec. (tekrar {}/{MAX_IDENTICAL_CALLS}; bir sonraki tekrar gorevi durdurur)",
+                "ERROR: {name} ayni argumanlarla daha once basarisiz oldu. Ayni cagriyi tekrarlama; onceki JSON hatasindaki field/reason ve suggested_range bilgisini kullan. old_text hatasinda kaynagi tekrar okuyup tam ve benzersiz blogu duzelt; yalniz new_text/mode degistirme. (tekrar {}/{MAX_IDENTICAL_CALLS}; bir sonraki tekrar gorevi durdurur)",
                 repeats + 1
             );
             return Ok(self.refuse(name, key, output, None, false));
@@ -815,6 +1045,22 @@ impl Orchestrator {
                 return Ok(self.refuse(name, key, format!("ERROR: {detail}"), None, false));
             }
         };
+        // Dosya korumasi model metnine veya planda dosya bulunmasina bagli degildir.
+        // Unknown icin izin sorusu bile korunan hedefe yeni yetki veremez.
+        if WRITE_PATH_TOOLS.contains(&name) && !self.file_scope.protected_targets.is_empty() {
+            let allowed =
+                crate::planning::TaskPlan::candidate_targets(name, &args).and_then(|targets| {
+                    crate::planning::check_file_scope_paths(
+                        &self.file_scope.write_targets,
+                        &self.file_scope.protected_targets,
+                        &targets,
+                    )
+                });
+            if let Err(error) = allowed {
+                self.stats.intent_blocked += 1;
+                return Ok(self.refuse(name,key,format!("INTENT_BLOCKED: Dosya kapsami: {error}. Korunan dosya degistirilemez; kullanici onayi istenmedi."),None,true));
+            }
+        }
         // 4) Yazma yoluna giden araclar: asama ve niyet kapisi.
         if name == "run_tests" && self.phase().is_terminal() {
             let output = format!(
@@ -840,6 +1086,21 @@ impl Orchestrator {
         }
 
         // Plan, yalniz terminal/niyet/izin kapilarini gecen adaya ait olabilir.
+        if let Some(fingerprint) = failed_match_keys(name, &args)
+            .into_iter()
+            .find(|key| self.failed_matches.contains_key(key))
+            && let Some(count) = self.failed_matches.get_mut(&fingerprint)
+        {
+            *count += 1;
+            let stop = *count >= MAX_IDENTICAL_CALLS;
+            self.stats.repeated_failures += 1;
+            self.stats.loop_stops += usize::from(stop);
+            let output = format!(
+                "ERROR: {}",
+                serde_json::json!({"error":"PATCH_MATCH_RETRY","field":"old_text","argument_fingerprint":fingerprint,"attempt":count,"limit":MAX_IDENTICAL_CALLS,"next_action":"Ayni eslesmeyen old_text tekrar calistirilmadi. Kaynagi gecerli aralikta oku, numaralari cikar, tam/benzersiz old_text'i duzelt. Yalniz new_text/mode degistirmek strateji degisikligi degildir.","stopped":stop})
+            );
+            return Ok(self.refuse(name,key,output,stop.then_some("Esdeger basarisiz old_text siniri doldu; kaynak degistirilmeden gorev durduruldu."),false));
+        }
         if WRITE_PATH_TOOLS.contains(&name)
             && let Some(plan) = &mut self.plan
         {
@@ -858,6 +1119,11 @@ impl Orchestrator {
         let mut outcome =
             handle_tool_call(session, &mut self.repair, prompter, name, &args).await?;
         self.stats.dispatched += 1;
+        if outcome.patch_match_failure
+            && let Some(fingerprint) = rejected_match_key(name, &args, &outcome.output)
+        {
+            self.failed_matches.insert(fingerprint, 1);
+        }
         if matches!(name, "verify_workspace" | "apply_workspace")
             && let Some(report) = &outcome.workspace_report
         {
@@ -872,6 +1138,11 @@ impl Orchestrator {
             || name == "run_tests" || is_failure(&outcome.output),
             |result| result.status != ExecutionStatus::Succeeded,
         );
+        self.approval_rejected |= outcome.approval_rejected;
+        self.processes.extend(outcome.processes.iter().cloned());
+        if !failed {
+            self.record_read_evidence(name, &args, &outcome.output);
+        }
         if let Some(result) = command_result {
             self.test_results.push(result.clone());
         } else if name == "run_tests" {
@@ -926,6 +1197,13 @@ impl Orchestrator {
         // Tipli etkiyi yalnizca gercek apply_patch cagrisi tasiyabilir. Okunan
         // kaynakta PATCH_VERIFIED yazmasi bu durumu degistiremez.
         if matches!(name, "apply_patch" | "apply_workspace" | "verify_workspace") {
+            if outcome.patch_effect != PatchEffect::None {
+                match (&mut self.modified_paths, &outcome.modified_paths) {
+                    (Some(known), Some(paths)) => known.extend(paths.iter().cloned()),
+                    (_, None) => self.modified_paths = None,
+                    (None, Some(_)) => {}
+                }
+            }
             if outcome.patch_effect != PatchEffect::None {
                 self.patch_events.push(outcome.patch_effect);
             }
@@ -1334,6 +1612,8 @@ mod tests {
         assert_eq!(prompter.asked.len(), 1, "{:?}", prompter.asked);
         assert!(prompter.asked[0].contains("kod degisikligine izin"));
         assert_eq!(task.authority(), WriteAuthority::Denied);
+        assert_eq!(task.memory_finish().phase, "Rejected");
+        assert_eq!(task.memory_finish().modified_paths, Some(vec![]));
         assert_eq!(main_rs(&root), MINI_MAIN);
         assert!(!root.join(".fiko_backups").exists());
         assert_eq!(task.repair.verify_attempts(), 0);
@@ -1929,5 +2209,61 @@ mod tests {
         assert!(visible.ends_with(&evidence));
         assert!(visible.contains("kontrollu spawn hatasi"));
         assert!(task.status_report().contains(&summary));
+    }
+
+    #[test]
+    fn arac_fingerprint_yol_varsayilan_ve_json_esdegerligini_ayirmali() {
+        let task = Orchestrator::for_request("Modify src/main.rs.");
+        let original = serde_json::json!({"path":"src/main.rs","old_text":"fn a() {}\n","new_text":"fn b() {}\n"});
+        let equivalent:Value=serde_json::from_str(r#"{"path":"./src/./main.rs","old_text":"fn a() {}\u000A","new_text":"fn b() {}\n","mode":"check","unused":"ignored"}"#).unwrap();
+        let key = task.context_key("verify_candidate", &original);
+        assert_eq!(key, task.context_key("verify_candidate", &equivalent));
+        assert_eq!(key.split('|').nth(1).unwrap().len(), 64);
+        assert!(!key.contains("fn a"));
+        assert_eq!(original["path"], "src/main.rs");
+        for old in ["fn a() {}\r\n", r"fn a() {}\n"] {
+            let mut different = original.clone();
+            different["old_text"] = Value::String(old.into());
+            assert_ne!(key, task.context_key("verify_candidate", &different));
+        }
+    }
+
+    #[test]
+    fn workspace_hatasinda_yalniz_hatalanmis_old_text_izlenmeli() {
+        let args = serde_json::json!({"changes":[
+            {"operation":"edit","path":"src/a.rs","old_text":"fn a() {}","new_text":"fn aa() {}"},
+            {"operation":"edit","path":"src/b.rs","old_text":"missing","new_text":"new"}
+        ]});
+        let error = r#"ERROR: {"error":"PATCH_MATCH","field":"old_text","change_index":1}"#;
+        let failed = rejected_match_key("verify_workspace", &args, error).unwrap();
+        let mut changed = args.clone();
+        changed["changes"][0]["old_text"] = Value::String("fn other() {}".into());
+        changed["changes"][1]["new_text"] = Value::String("another replacement".into());
+        assert!(failed_match_keys("verify_workspace", &changed).contains(&failed));
+        changed["changes"][1]["old_text"] = Value::String("corrected anchor".into());
+        assert!(!failed_match_keys("verify_workspace", &changed).contains(&failed));
+    }
+
+    #[tokio::test]
+    async fn belirsiz_gorevde_plan_olmasa_da_korunan_hedef_onaya_ulasmamali() {
+        let root = mini_crate("scope_unknown_protected");
+        let mut session = trusted_session(&root);
+        let mut task = Orchestrator::new(IntentDecision::fixed(TaskIntent::Unknown));
+        task.file_scope = intent::FileScope {
+            write_targets: vec!["src/main.rs".into()],
+            protected_targets: vec!["src/lib.rs".into()],
+            ambiguous: false,
+        };
+        let mut prompter = ScriptedPrompter::with(&[true, true, true]);
+        let args = serde_json::json!({"path":"./src/./lib.rs","old_text":"old","new_text":"new"});
+        let outcome = run(&mut task, &mut session, &mut prompter, "apply_patch", &args).await;
+        assert!(outcome.output.starts_with("INTENT_BLOCKED"));
+        assert!(prompter.asked.is_empty());
+        assert!(task.plan().is_none());
+        assert_eq!(task.stats().dispatched, 0);
+        assert_eq!(task.memory_finish().modified_paths, Some(vec![]));
+        assert_eq!(main_rs(&root), MINI_MAIN);
+        assert!(!root.join(".fiko_backups").exists());
+        remove(&root);
     }
 }

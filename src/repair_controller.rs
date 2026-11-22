@@ -6,12 +6,13 @@
 //! dogrulama kaydi olan aday uygulanabilir. Bu kurallar system prompt'a degil
 //! bu module aittir.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::execution::{ExecutionState, TaskPhase};
 use crate::workspace_patch::WorkspacePlan;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Yalniz gercek dogrulama basarisi uretir. changes, buyuk dosyalarda bile
 /// dogrulanan tam planin ayni sinirli edit/create girdisiyle yeniden kurulmasini saglar.
@@ -178,6 +179,8 @@ pub struct RepairController {
     verify_attempts: usize,
     proposals: HashMap<Proposal, CandidateStatus>,
     verified: HashMap<Proposal, VerifiedCandidate>,
+    /// Modelin farkli anchor/girintiyle ayni gercek dosya adayini derletmesini engeller.
+    prepared_candidates: HashSet<[u8; 32]>,
     workspace_proposals: HashMap<WorkspacePlan, CandidateStatus>,
     verified_workspaces: HashMap<WorkspacePlan, (u64, VerifyMode)>,
     pending_workspace: Option<PendingWorkspace>,
@@ -194,6 +197,7 @@ impl Default for RepairController {
             verify_attempts: 0,
             proposals: HashMap::new(),
             verified: HashMap::new(),
+            prepared_candidates: HashSet::new(),
             workspace_proposals: HashMap::new(),
             verified_workspaces: HashMap::new(),
             pending_workspace: None,
@@ -204,6 +208,39 @@ impl Default for RepairController {
 }
 
 impl RepairController {
+    /// Yalniz prepare_patch basarisi ve mevcut izin/kilit denetimlerinden sonra,
+    /// gercek compile oncesi cagrilir. Verified Patch Lock kaydini degistirmez.
+    pub(crate) fn register_prepared_candidate(
+        &mut self,
+        plan: &crate::tools::PatchPlan,
+        mode: VerifyMode,
+        project_fingerprint: u64,
+    ) -> Result<(), String> {
+        let original = Sha256::digest(plan.original.as_bytes());
+        let updated = Sha256::digest(plan.updated.as_bytes());
+        let fingerprint = project_fingerprint.to_le_bytes();
+        let mut digest = Sha256::new();
+        for field in [
+            plan.path.as_os_str().as_encoded_bytes(),
+            &original[..],
+            &updated[..],
+            mode.as_str().as_bytes(),
+            &fingerprint,
+        ] {
+            digest.update((field.len() as u64).to_le_bytes());
+            digest.update(field);
+        }
+        let identity: [u8; 32] = digest.finalize().into();
+        if self.prepared_candidates.contains(&identity) {
+            return Err("CANDIDATE_REPEAT: Ayni gercek dosya adayi bu dogrulama modunda zaten denendi. Farkli bir gercek aday hazirlayin; eski aday zaten dogrulandiysa birebir ayni path/old_text/new_text ile apply_patch kullanin.".into());
+        }
+        if self.prepared_candidates.len() >= crate::orchestrator::MAX_TOOL_CALLS_PER_TASK {
+            return Err("Hazirlanmis aday kaydi gorevin arac cagrisi sinirina ulasti; yeni derleme baslatilmadi.".into());
+        }
+        self.prepared_candidates.insert(identity);
+        Ok(())
+    }
+
     pub(crate) fn pending_workspace_args(&self) -> Option<Value> {
         self.pending_workspace
             .as_ref()
@@ -536,6 +573,82 @@ impl RepairController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_plan(old_text: &str, new_text: &str) -> crate::tools::PatchPlan {
+        let original = "fn main() {\n    let value = 1;\n}\n".to_owned();
+        let position = crate::tools::unique_line_block_match(&original, old_text).unwrap();
+        let mut updated = original.clone();
+        updated.replace_range(position..position + old_text.len(), new_text);
+        crate::tools::PatchPlan {
+            path: std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("src/main.rs"),
+            original,
+            updated,
+        }
+    }
+
+    #[test]
+    fn ayni_hazirlanmis_byte_farkli_anchor_ile_yeniden_derlenmemeli() {
+        let mut controller = RepairController::default();
+        let first = prepared_plan("let value = 1;", "let value = 2;");
+        let equivalent = prepared_plan("    let value = 1;", "    let value = 2;");
+        assert_eq!(first.original, equivalent.original);
+        assert_eq!(first.updated, equivalent.updated);
+        controller
+            .register_prepared_candidate(&first, VerifyMode::Check, 11)
+            .unwrap();
+        let error = controller
+            .register_prepared_candidate(&equivalent, VerifyMode::Check, 11)
+            .unwrap_err();
+        assert!(error.contains("CANDIDATE_REPEAT"));
+        assert!(!error.contains("fn main()"));
+        assert!(!error.contains(first.path.to_string_lossy().as_ref()));
+        assert_eq!(controller.prepared_candidates.len(), 1);
+        assert_eq!(controller.verify_attempts(), 0);
+        assert_eq!(controller.approved_attempts(), 0);
+        assert!(controller.proposals.is_empty());
+        assert!(controller.verified.is_empty());
+        assert_eq!(controller.phase(), TaskPhase::Created);
+    }
+
+    #[test]
+    fn gercek_satir_sonu_farki_ve_check_test_yukseltmesi_ayri_aday_olmali() {
+        let mut controller = RepairController::default();
+        let plan = prepared_plan("let value = 1;", "let value = 2;");
+        controller
+            .register_prepared_candidate(&plan, VerifyMode::Check, 11)
+            .unwrap();
+        controller
+            .register_prepared_candidate(&plan, VerifyMode::Test, 11)
+            .unwrap();
+        assert!(
+            controller
+                .register_prepared_candidate(&plan, VerifyMode::Test, 11)
+                .is_err()
+        );
+        let mut updated_newline = prepared_plan("let value = 1;", "let value = 2;");
+        updated_newline.updated.pop();
+        controller
+            .register_prepared_candidate(&updated_newline, VerifyMode::Check, 11)
+            .unwrap();
+        let mut original_newline = prepared_plan("let value = 1;", "let value = 2;");
+        original_newline.original.pop();
+        controller
+            .register_prepared_candidate(&original_newline, VerifyMode::Check, 11)
+            .unwrap();
+        controller
+            .register_prepared_candidate(&plan, VerifyMode::Check, 12)
+            .unwrap();
+        assert_eq!(controller.prepared_candidates.len(), 5);
+        assert_eq!(
+            controller.required_mode(),
+            VerifyMode::Check,
+            "Yeni kayit kilit seviyesini degistirmez."
+        );
+    }
 
     fn workspace_plan() -> WorkspacePlan {
         WorkspacePlan {

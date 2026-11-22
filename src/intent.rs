@@ -384,6 +384,10 @@ const GUARD_PHRASES: &[&str] = &[
     "avoid modifying",
     "avoid writing",
     "avoid creating",
+    "do not touch",
+    "don't touch",
+    "never touch",
+    "without touching",
 ];
 
 // ============================================================
@@ -531,7 +535,9 @@ fn guard(folded: &str, tokens: &[String]) -> Option<String> {
                     .iter()
                     .any(|word| ["istemiyorum", "istemem", "istemiyoruz"].contains(&word.as_str()));
                 let denied_english = english_negation(&words)
-                    && words.iter().any(|word| english_in(word, MODIFY_EN));
+                    && words
+                        .iter()
+                        .any(|word| english_in(word, MODIFY_EN) || word == "touch");
                 let denied_turkish = words.iter().enumerate().any(|(index, word)| {
                     if noun_action(&words, index) {
                         return false;
@@ -621,18 +627,28 @@ fn phrase_match(text: &str, phrase: &str) -> bool {
 /// Cumle/eylem sinirlari olumsuzlugun komsu olumlu istege yayilmasini onler.
 /// Dosya adlarinin icindeki noktalara dokunulmaz.
 fn command_groups(folded: &str) -> Vec<String> {
-    let mut text = folded.replace(". ", "; ");
-    for boundary in [" but ", " ama ", " ancak "] {
-        text = text.replace(boundary, "; ");
+    let text = folded.replace(". ", "; ");
+    let mut groups = Vec::new();
+    for sentence in text.split([';', '!', '?']) {
+        let mut group = Vec::new();
+        for word in sentence.split_whitespace() {
+            let boundary = fold(word.trim_matches(','));
+            let discard = ["but", "ama", "ancak"].contains(&boundary.as_str());
+            let retain =
+                ["without", "only", "just", "sadece", "yalnizca"].contains(&boundary.as_str());
+            if (discard || retain) && !group.is_empty() {
+                groups.push(group.join(" "));
+                group.clear();
+            }
+            if !discard {
+                group.push(word);
+            }
+        }
+        if !group.is_empty() {
+            groups.push(group.join(" "));
+        }
     }
-    for boundary in [" without ", " only ", " just ", " sadece ", " yalnizca "] {
-        text = text.replace(boundary, &format!("; {} ", boundary.trim()));
-    }
-    text.split([';', '!', '?'])
-        .map(str::trim)
-        .filter(|group| !group.is_empty())
-        .map(str::to_owned)
-        .collect()
+    groups
 }
 
 fn clauses(folded: &str) -> Vec<String> {
@@ -672,6 +688,7 @@ fn english_negation(words: &[String]) -> bool {
                 word,
                 &[
                     "explain", "describe", "clarify", "run", "execute", "test", "compile", "build",
+                    "touch",
                 ],
             )
     });
@@ -851,28 +868,33 @@ fn execution_requested(words: &[String], clause: &str) -> bool {
 /// Acik dosya komutlari ve `- src/file.rs: ...` degisiklik listelerinin
 /// hedefleri. Referans/okuma yollarini kapsama katmaz; serbest dildeki tum
 /// isteklerin dosya kapsamlarini cikardigini iddia etmez.
-pub(crate) fn workspace_write_targets(request: &str) -> Vec<String> {
-    fn file_path(word: &str) -> Option<String> {
-        let path = word
-            .trim_start_matches(['`', '\'', '"', '(', '['])
-            .trim_end_matches(['`', '\'', '"', ')', ']', ':', '.']);
-        let mut path = path.replace('\\', "/");
-        while let Some(rest) = path.strip_prefix("./") {
-            path = rest.to_owned();
-        }
-        if path.is_empty()
-            || path.starts_with('/')
-            || path.contains(':')
-            || path.split('/').any(|part| part.is_empty() || part == "..")
-            || path.contains(['=', '{', '}', '<', '>', '|'])
-        {
-            return None;
-        }
-        let extension = path.rsplit('.').next().unwrap_or("");
-        (path.contains('/') || path.contains('.') && extension.chars().any(char::is_alphabetic))
-            .then_some(path)
+fn file_path(word: &str) -> Option<String> {
+    let path = word
+        .trim_start_matches(['`', '\'', '"', '(', '['])
+        .trim_end_matches(['`', '\'', '"', ')', ']', ':', '.']);
+    let mut path = path.replace('\\', "/");
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest.to_owned();
     }
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains(':')
+        || path.split('/').any(|part| part.is_empty() || part == "..")
+        || path.contains(['=', '{', '}', '<', '>', '|'])
+    {
+        return None;
+    }
+    path = path
+        .split('/')
+        .filter(|part| *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let extension = path.rsplit('.').next().unwrap_or("");
+    (path.contains('/') || path.contains('.') && extension.chars().any(char::is_alphabetic))
+        .then_some(path)
+}
 
+fn raw_workspace_write_targets(request: &str) -> Vec<String> {
     fn collect(part: &[&str], inherited: &mut bool, targets: &mut Vec<String>) {
         let text = fold(&part.join(" "));
         let words = tokens(&text);
@@ -905,6 +927,14 @@ pub(crate) fn workspace_write_targets(request: &str) -> Vec<String> {
                 "explain",
                 "analyze",
                 "inspect",
+                "preserve",
+                "keep",
+                "leave",
+                "not",
+                "never",
+                "without",
+                "no",
+                "cannot",
             ]
             .contains(&normalized.as_str())
             {
@@ -930,14 +960,18 @@ pub(crate) fn workspace_write_targets(request: &str) -> Vec<String> {
     for word in text.split_whitespace() {
         let boundary = fold(word);
         if [
-            ",", ";", "and", "then", "but", "ve", "sonra", "ama", "ancak",
+            ",", ";", "and", "then", "but", "ve", "sonra", "ama", "ancak", "without",
         ]
         .contains(&boundary.as_str())
         {
             collect(&part, &mut inherited, &mut targets);
             part.clear();
-            if [";", "then", "but", "sonra", "ama", "ancak"].contains(&boundary.as_str()) {
+            if [";", "then", "but", "sonra", "ama", "ancak", "without"].contains(&boundary.as_str())
+            {
                 inherited = false;
+            }
+            if boundary == "without" {
+                part.push(word);
             }
         } else {
             part.push(word);
@@ -945,6 +979,295 @@ pub(crate) fn workspace_write_targets(request: &str) -> Vec<String> {
     }
     collect(&part, &mut inherited, &mut targets);
     targets
+}
+
+/// Acik dosya kapsamidir; belirsiz/global koruma otomatik yazmaya yetki vermez.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileScope {
+    pub write_targets: Vec<String>,
+    pub protected_targets: Vec<String>,
+    pub ambiguous: bool,
+}
+
+fn safe_scope_path(word: &str) -> Option<String> {
+    let path = file_path(word)?;
+    if path.contains(['\'', '"', '`']) || crate::discovery::check_relative_path(&path).is_err() {
+        return None;
+    }
+    Some(path)
+}
+
+fn scope_path_list(words: &[&str]) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    for word in words {
+        if ["and", "or", "ve", ","].contains(&fold(word).as_str()) {
+            continue;
+        }
+        let path = safe_scope_path(word)?;
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Kucuk ve acik English dosya koruma dilbilgisi. Diger olumsuzluklar legacy
+/// guard'a kalir; serbest bir isim/it belirli bir dosyaya tahminle baglanmaz.
+fn local_protection(text: &str) -> Option<Result<(Vec<String>, bool), ()>> {
+    let mut raw: Vec<_> = text.split_whitespace().collect();
+    if raw
+        .first()
+        .is_some_and(|word| ["please", "kindly"].contains(&fold(word).as_str()))
+    {
+        raw.remove(0);
+    }
+    let words: Vec<_> = raw
+        .iter()
+        .map(|word| fold(word.trim_end_matches('.')))
+        .collect();
+    let patterns: &[&[&str]] = &[
+        &["do", "not", "modify"],
+        &["do", "not", "change"],
+        &["do", "not", "edit"],
+        &["do", "not", "write"],
+        &["do", "not", "save"],
+        &["do", "not", "delete"],
+        &["do", "not", "touch"],
+        &["never", "modify"],
+        &["never", "change"],
+        &["never", "edit"],
+        &["never", "touch"],
+        &["without", "modifying"],
+        &["without", "changing"],
+        &["without", "touching"],
+        &["avoid", "changing"],
+        &["avoid", "modifying"],
+        &["preserve"],
+        &["keep"],
+        &["leave"],
+    ];
+    let prefix = patterns.iter().find(|prefix| {
+        words.len() >= prefix.len()
+            && words
+                .iter()
+                .zip(prefix.iter())
+                .all(|(word, expected)| word == expected)
+    });
+    let Some(prefix) = prefix else {
+        let negative = words
+            .first()
+            .is_some_and(|word| ["never", "without", "avoid"].contains(&word.as_str()))
+            || words
+                .windows(2)
+                .any(|words| words[0] == "do" && words[1] == "not");
+        let file_subject = raw.iter().any(|word| file_path(word).is_some())
+            || words.iter().any(|word| {
+                ["it", "them", "file", "files", "project", "workspace"].contains(&word.as_str())
+            });
+        let unsupported_preserve = words
+            .iter()
+            .position(|word| ["preserve", "keep", "leave", "protect"].contains(&word.as_str()))
+            .is_some_and(|index| {
+                raw[index + 1..].iter().any(|word| {
+                    file_path(word).is_some()
+                        || [
+                            "it",
+                            "them",
+                            "file",
+                            "files",
+                            "anything",
+                            "everything",
+                            "project",
+                            "workspace",
+                        ]
+                        .contains(&fold(word.trim_end_matches('.')).as_str())
+                })
+            });
+        return (negative && file_subject || unsupported_preserve).then_some(Err(()));
+    };
+    let preserving = ["preserve", "keep", "leave"].contains(&words[0].as_str());
+    let mut tail = &raw[prefix.len()..];
+    if preserving {
+        let file_subject = tail.iter().any(|word| {
+            file_path(word).is_some()
+                || [
+                    "it",
+                    "them",
+                    "file",
+                    "files",
+                    "anything",
+                    "everything",
+                    "project",
+                    "workspace",
+                    "this",
+                    "that",
+                ]
+                .contains(&fold(word.trim_end_matches('.')).as_str())
+        });
+        if !file_subject {
+            return None;
+        }
+        let unchanged = tail
+            .last()
+            .is_some_and(|word| fold(word.trim_end_matches('.')) == "unchanged");
+        if unchanged {
+            tail = &tail[..tail.len() - 1];
+        }
+        if words[0] != "preserve" && !unchanged {
+            return Some(Err(()));
+        }
+    }
+    Some(
+        scope_path_list(tail)
+            .map(|paths| (paths, preserving))
+            .ok_or(()),
+    )
+}
+
+fn scopes_overlap(first: &str, second: &str) -> bool {
+    let lexical = |path: &str| {
+        path.replace('\\', "/")
+            .split('/')
+            .filter(|part| *part != ".")
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let (first, second) = (lexical(first), lexical(second));
+    let (first, second) = if cfg!(windows) {
+        (first.to_lowercase(), second.to_lowercase())
+    } else {
+        (first, second)
+    };
+    first == second
+        || (!first.contains('/') || !second.contains('/'))
+            && first.rsplit('/').next() == second.rsplit('/').next()
+}
+
+fn scoped_files(request: &str) -> (FileScope, Option<String>) {
+    let normalized = request.replace(['’', '‘'], "'").replace("n't", " not");
+    let mut scope = FileScope {
+        write_targets: raw_workspace_write_targets(&normalized),
+        ..FileScope::default()
+    };
+    let mut remaining = Vec::new();
+    let mut previous_preserve: Option<Vec<String>> = None;
+    for group in command_groups(&normalized) {
+        let folded = fold(&group);
+        if outside_workspace_only(&folded) {
+            previous_preserve = None;
+            continue;
+        }
+        let mut parts = Vec::new();
+        let mut part = Vec::new();
+        let separated = group.replace(',', " , ");
+        for word in separated.split_whitespace() {
+            if [",", "and", "ve"].contains(&fold(word).as_str()) {
+                if !part.is_empty() {
+                    parts.push(part.join(" "));
+                    part.clear();
+                }
+            } else {
+                part.push(word);
+            }
+        }
+        if !part.is_empty() {
+            parts.push(part.join(" "));
+        }
+        let mut local_paths: Option<Vec<String>> = None;
+        let mut negative_scope = false;
+        let mut leftover = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let folded = fold(part).trim_end_matches('.').to_owned();
+            let bound_pronoun = index == 0
+                && [
+                    "without modifying it",
+                    "without changing it",
+                    "without touching it",
+                ]
+                .contains(&folded.as_str())
+                && previous_preserve
+                    .as_ref()
+                    .is_some_and(|paths| paths.len() == 1);
+            let protection = if bound_pronoun {
+                Some(Ok((previous_preserve.clone().unwrap(), false)))
+            } else {
+                local_protection(part)
+            };
+            match protection {
+                Some(Ok((paths, preserving))) => {
+                    for path in &paths {
+                        if !scope.protected_targets.contains(path) {
+                            scope.protected_targets.push(path.clone());
+                        }
+                    }
+                    previous_preserve = preserving.then(|| paths.clone());
+                    local_paths = Some(paths);
+                    negative_scope = !preserving;
+                }
+                Some(Err(())) => {
+                    scope.ambiguous = true;
+                    previous_preserve = None;
+                    local_paths = None;
+                    leftover.push(part.clone());
+                }
+                None => {
+                    let continuation = local_paths.as_ref().and_then(|_| {
+                        scope_path_list(&part.split_whitespace().collect::<Vec<_>>())
+                    });
+                    if let Some(paths) = continuation {
+                        for path in paths {
+                            if let Some(previous) = &mut previous_preserve
+                                && !previous.contains(&path)
+                            {
+                                previous.push(path.clone());
+                            }
+                            if !scope.protected_targets.contains(&path) {
+                                scope.protected_targets.push(path);
+                            }
+                        }
+                    } else {
+                        // "Do not modify B and modify A" olumsuzlugunu A'ya
+                        // yazma iznine cevirmeyiz. Yeni but/cumle grubu ayirir.
+                        scope.ambiguous |= negative_scope
+                            && tokens(&folded).iter().any(|word| modification_word(word));
+                        previous_preserve = None;
+                        local_paths = None;
+                        leftover.push(part.clone());
+                    }
+                }
+            }
+        }
+        if !leftover.is_empty() {
+            remaining.push(leftover.join(" and "));
+        }
+    }
+    // Tek basina bir koruma istegini Unknown uzerinden yeni yazma onayina
+    // donusturme. Yerel muafiyet yalniz ayri, acik yazma hedefi varken anlamli.
+    scope.ambiguous |= scope.write_targets.is_empty() && !scope.protected_targets.is_empty();
+    scope.ambiguous |= scope.write_targets.iter().any(|written| {
+        scope
+            .protected_targets
+            .iter()
+            .any(|protected| scopes_overlap(written, protected))
+    });
+    let global_guard = remaining
+        .iter()
+        .find_map(|group| guard(&fold(group), &tokens(&fold(group))));
+    scope.ambiguous |= global_guard.is_some();
+    let write_guard = global_guard.or_else(|| {
+        scope
+            .ambiguous
+            .then(|| "belirsiz veya celisen dosya korumasi".into())
+    });
+    (scope, write_guard)
+}
+
+pub(crate) fn file_scope(request: &str) -> FileScope {
+    scoped_files(request).0
+}
+
+pub(crate) fn workspace_write_targets(request: &str) -> Vec<String> {
+    file_scope(request).write_targets
 }
 
 // ============================================================
@@ -1235,10 +1558,7 @@ pub fn classify(request: &str) -> IntentDecision {
 
     // Virgulle veya and/or ile uzayan hedefleri ayirmadan once kapsam secilir;
     // aksi halde "outside this project and src/lib.rs" ic yasagi gizleyebilir.
-    let write_guard = command_groups(&folded)
-        .into_iter()
-        .filter(|group| !outside_workspace_only(group))
-        .find_map(|group| guard(&group, &tokens(&group)));
+    let (_, write_guard) = scoped_files(request);
     if let Some(found) = &write_guard {
         // Kullanici acikca degisiklik istemiyor: yazma sinyalleri gecersiz.
         scores.modify = 0;
@@ -1308,6 +1628,153 @@ pub fn classify(request: &str) -> IntentDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn belirli_dosya_korumasi_yalniz_diger_acik_hedefe_yazma_izni_birakmali() {
+        for (request, written, protected) in [
+            (
+                "Modify src/math.rs, preserve src/lib.rs without modifying it.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs and preserve src/lib.rs.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs, but please preserve src/lib.rs.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs, but please keep src/lib.rs unchanged.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs, but leave src/lib.rs unchanged.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify ./src/math.rs and keep src\\lib.rs unchanged.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs, but do not modify src/lib.rs.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs, but never touch src/lib.rs or src/other.rs.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs", "src/other.rs"],
+            ),
+            (
+                "Modify src/math.rs without modifying src/lib.rs.",
+                vec!["src/math.rs"],
+                vec!["src/lib.rs"],
+            ),
+            (
+                "Modify src/math.rs and src/lib.rs.",
+                vec!["src/math.rs", "src/lib.rs"],
+                vec![],
+            ),
+        ] {
+            let scope = file_scope(request);
+            assert_eq!(scope.write_targets, written, "{request}: {scope:?}");
+            assert_eq!(scope.protected_targets, protected, "{request}: {scope:?}");
+            assert!(!scope.ambiguous, "{request}: {scope:?}");
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Modify,
+                "{request}: {decision:?}"
+            );
+            assert!(!decision.write_forbidden, "{request}: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn genel_belirsiz_guvensiz_ve_ayni_dosya_yasagi_muafiyet_almamali() {
+        for request in [
+            "Avoid changing src/main.rs.",
+            "Never modify src/main.rs.",
+            "Preserve src/main.rs.",
+            "Never touch src/main.rs.",
+            "Modify src/math.rs, but do not modify any files.",
+            "Modify src/math.rs, do not touch any files.",
+            "Modify src/math.rs, never touch files.",
+            "Modify src/math.rs, but you must not touch src/lib.rs.",
+            "Modify src/math.rs, preserve src/math.rs without modifying it.",
+            "Modify src/math.rs, preserve src/./math.rs without modifying it.",
+            "Modify src/./math.rs, preserve src/math.rs without modifying it.",
+            "Modify src/math.rs and preserve math.rs.",
+            "Modify src/math.rs, but do not modify it.",
+            "Modify src/math.rs and src/lib.rs, but preserve it without modifying it.",
+            "Modify src/math.rs, preserve src/lib.rs and src/other.rs without modifying it.",
+            "Modify src/math.rs, but do not modify ../outside.rs.",
+            "Modify src/math.rs, but do not modify .env.",
+            "Modify src/math.rs, preserve behavior without modifying it.",
+            "Modify src/math.rs, but do not modify src/lib.rs or anything else.",
+            "Modify src/math.rs, but do not alter src/lib.rs.",
+            "Modify src/math.rs, but you must preserve src/lib.rs.",
+            "Never touch src/lib.rs and modify src/math.rs.",
+            "Do not modify src/lib.rs and modify src/math.rs.",
+        ] {
+            let scope = file_scope(request);
+            assert!(scope.ambiguous, "{request}: {scope:?}");
+            let decision = classify(request);
+            assert!(decision.write_forbidden, "{request}: {decision:?}");
+            assert_ne!(
+                decision.intent,
+                TaskIntent::Modify,
+                "{request}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn salt_inceleme_ve_aciklama_yerel_korumayla_yazma_yetkisi_almamali() {
+        for (request, expected) in [
+            (
+                "Analyze src/lib.rs, do not modify any files.",
+                TaskIntent::Analyze,
+            ),
+            (
+                "Explain src/lib.rs without modifying it.",
+                TaskIntent::Explain,
+            ),
+        ] {
+            assert!(file_scope(request).write_targets.is_empty());
+            let decision = classify(request);
+            assert_eq!(decision.intent, expected, "{request}: {decision:?}");
+            assert!(decision.write_forbidden, "{request}: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn fonksiyon_davranisini_korumak_tum_dosyayi_yazmaya_kapatmamali() {
+        for request in [
+            "Modify src/math.rs by preserving double and adding triple.",
+            "Modify src/math.rs and preserve existing functions.",
+            "Modify src/math.rs, preserve double and add triple.",
+        ] {
+            let scope = file_scope(request);
+            assert_eq!(scope.write_targets, vec!["src/math.rs"]);
+            assert!(scope.protected_targets.is_empty(), "{request}: {scope:?}");
+            assert!(!scope.ambiguous, "{request}: {scope:?}");
+            let decision = classify(request);
+            assert_eq!(
+                decision.intent,
+                TaskIntent::Modify,
+                "{request}: {decision:?}"
+            );
+            assert!(!decision.write_forbidden, "{request}: {decision:?}");
+        }
+    }
 
     #[test]
     fn proje_disi_yazma_yasagi_proje_ici_modify_istegini_iptal_etmemeli() {

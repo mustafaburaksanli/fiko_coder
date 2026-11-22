@@ -47,7 +47,14 @@ pub(crate) fn parse_changes(args: &Value) -> Result<Vec<FileChange>, String> {
                         old_text,
                         new_text,
                     },
-                    &["operation", "path", "old_text", "new_text"][..],
+                    &[
+                        "operation",
+                        "path",
+                        "old_text",
+                        "new_text",
+                        "match_mode",
+                        "expected_sha256",
+                    ][..],
                 )
             }
             Some("create") => {
@@ -79,7 +86,18 @@ fn prepare(session: &Session, args: &Value) -> Result<WorkspacePlan, String> {
             "Dogrulama calistirilmadi: proje turu desteklenmiyor; workspace uygulanmadi.".into(),
         );
     }
-    workspace_patch::prepare(&session.root, &parse_changes(args)?)
+    let changes = parse_changes(args)?;
+    let options = args["changes"]
+        .as_array()
+        .ok_or("changes bir JSON dizisi olmali.")?
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            crate::tools::PatchMatchOptions::from_arguments(item)
+                .map_err(|error| workspace_patch::error_for_change(error, index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    workspace_patch::prepare_with_options(&session.root, &changes, &options)
 }
 
 pub(crate) async fn verify<P: Prompter>(
@@ -91,7 +109,7 @@ pub(crate) async fn verify<P: Prompter>(
     repair.clear_pending_workspace();
     let plan = match prepare(session, args) {
         Ok(plan) => plan,
-        Err(error) => return Ok(ToolOutcome::output(format!("ERROR: {error}"))),
+        Err(error) => return Ok(ToolOutcome::preparation_error(error)),
     };
     let Some(mode) = VerifyMode::parse(args["mode"].as_str().unwrap_or("check")) else {
         return Ok(ToolOutcome::output(
@@ -122,7 +140,8 @@ async fn verify_plan<P: Prompter>(
         return Ok(ToolOutcome::stop(
             "VERIFY_REJECTED: Gecici kopyada kod calistirma izni reddedildi; kaynaklara yazilmadi.",
             "Workspace dogrulama izni yok.",
-        ));
+        )
+        .rejected());
     }
     if let Err(error) = repair.register_workspace_candidate(plan, mode) {
         return Ok(ToolOutcome::output(format!("ERROR: {error}")));
@@ -148,7 +167,14 @@ async fn verify_plan<P: Prompter>(
             let outcome = ToolOutcome::output(format!(
                 "{status}: Workspace gecici kopyasi; ana proje degismedi.\n{}",
                 report.render()
-            ));
+            ))
+            .with_processes(
+                report
+                    .results
+                    .iter()
+                    .map(|result| result.observation())
+                    .collect(),
+            );
             Ok(if success {
                 outcome.with_verified_candidate()
             } else {
@@ -196,7 +222,7 @@ pub(crate) async fn apply<P: Prompter>(
     }
     let plan = match prepare(session, args) {
         Ok(plan) => plan,
-        Err(error) => return Ok(ToolOutcome::output(format!("ERROR: {error}"))),
+        Err(error) => return Ok(ToolOutcome::preparation_error(error)),
     };
     if pending.as_ref().is_some_and(|pending| pending.plan != plan) {
         return Ok(stop(repair, "Uygulanacak plan Rust'in dogruladigi bekleyen adaydan farkli. Yeni verify_workspace gerekir.".into(), PatchEffect::None));
@@ -206,6 +232,7 @@ pub(crate) async fn apply<P: Prompter>(
         Err(error) => return Ok(stop(repair, error, PatchEffect::None)),
     };
     let mut auto_verify_report = None;
+    let mut processes = Vec::new();
     if let Err(rejection) = repair.authorize_workspace(&plan, fingerprint) {
         if pending.is_some() {
             return Ok(stop(
@@ -224,6 +251,7 @@ pub(crate) async fn apply<P: Prompter>(
         if outcome.stop.is_some() {
             return Ok(outcome);
         }
+        processes.extend(outcome.processes);
         auto_verify_report = Some(outcome.output);
     }
     // Gecici calistirma sirasindaki kaynak degisikligi de eski kilidi acamaz.
@@ -236,7 +264,8 @@ pub(crate) async fn apply<P: Prompter>(
                 repair,
                 format!("{error}\n{}", auto_verify_report.as_deref().unwrap_or("")),
                 PatchEffect::Uncertain,
-            ));
+            )
+            .with_processes(processes));
         }
     };
     if let Err(error) = repair.authorize_workspace(&plan, current_fingerprint) {
@@ -244,7 +273,8 @@ pub(crate) async fn apply<P: Prompter>(
             repair,
             format!("{error}\n{}", auto_verify_report.as_deref().unwrap_or("")),
             PatchEffect::None,
-        ));
+        )
+        .with_processes(processes));
     }
     repair.enter(TaskPhase::AwaitingApproval);
     println!(
@@ -259,7 +289,9 @@ pub(crate) async fn apply<P: Prompter>(
             repair,
             "Kullanici tum workspace planini reddetti; dosyalar degismedi.".into(),
             PatchEffect::None,
-        ));
+        )
+        .rejected()
+        .with_processes(processes));
     }
     let after_approval = workspace_patch::revalidate(&session.root, &plan)
         .and_then(|()| verification::project_fingerprint(&session.root))
@@ -273,7 +305,8 @@ pub(crate) async fn apply<P: Prompter>(
             repair,
             format!("Onay sirasinda aday/proje eskidi: {error}. Yeni dogrulama ve onay gerekir."),
             PatchEffect::Uncertain,
-        ));
+        )
+        .with_processes(processes));
     }
     repair.approve();
     repair.enter(TaskPhase::Applying);
@@ -305,12 +338,15 @@ pub(crate) async fn apply<P: Prompter>(
                 } else {
                     PatchEffect::Uncertain
                 },
-            ));
+            )
+            .with_processes(processes));
         }
     };
     let verification = verification::verify_workspace_applied(&session.root).await;
+    let modified_paths = record.modified_paths();
     let (passed, evidence) = match verification {
         Ok(results) => {
+            processes.extend(results.iter().map(|result| result.observation()));
             let success = results.len() == 2
                 && results
                     .iter()
@@ -338,7 +374,7 @@ pub(crate) async fn apply<P: Prompter>(
         session.last_patch = None;
         session.last_workspace = Some(record);
         repair.enter(TaskPhase::Completed);
-        return Ok(ToolOutcome::stop(format!("PATCH_VERIFIED: Tum workspace hedefleri uygulandi; cargo check + cargo test gecti.\n{evidence}"), "Workspace dogrulandi.").with_patch_effect(PatchEffect::Verified));
+        return Ok(ToolOutcome::stop(format!("PATCH_VERIFIED: Tum workspace hedefleri uygulandi; cargo check + cargo test gecti.\n{evidence}"), "Workspace dogrulandi.").with_patch_effect(PatchEffect::Verified).with_modified_paths(modified_paths).with_processes(processes));
     }
     repair.mark_workspace_failed(&plan);
     repair.enter(TaskPhase::Failed);
@@ -360,5 +396,92 @@ pub(crate) async fn apply<P: Prompter>(
         PatchEffect::Restored
     } else {
         PatchEffect::Uncertain
-    }))
+    })
+    .with_modified_paths(modified_paths)
+    .with_processes(processes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Digest;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Project(PathBuf);
+    impl Project {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fiko_workspace_options_{}_{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(path.join("src")).unwrap();
+            fs::write(
+                path.join("Cargo.toml"),
+                "[package]\nname='fixture'\nversion='0.1.0'\n",
+            )
+            .unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+    impl Drop for Project {
+        fn drop(&mut self) {
+            assert!(
+                self.0
+                    .starts_with(std::env::temp_dir().canonicalize().unwrap())
+            );
+            assert!(
+                self.0
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("fiko_workspace_options_")
+            );
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn workspace_raw_edit_metadata_hazirlamaya_tasinmali_create_strict_kalmali() {
+        let project = Project::new();
+        let original = "fn value() -> u8 {\r\n    1\n}\r\n";
+        let replacement = "fn value() -> u8 {\n    3\r\n}\n";
+        fs::write(project.0.join("src/lib.rs"), original).unwrap();
+        let session = Session::new(project.0.clone());
+        let mut args = serde_json::json!({"changes":[
+            {"operation":"edit","path":"src/lib.rs","old_text":"fn value() -> u8 {\n    1\n}\n","new_text":replacement,
+                "match_mode":"line_endings","expected_sha256":format!("{:x}",sha2::Sha256::digest(original.as_bytes()))},
+            {"operation":"create","path":"src/new.rs","content":"pub fn new() {}\r\n"}
+        ]});
+        let changes = parse_changes(&args).unwrap();
+        assert_eq!(
+            changes[0],
+            FileChange::Edit {
+                path: "src/lib.rs".into(),
+                old_text: "fn value() -> u8 {\n    1\n}\n".into(),
+                new_text: replacement.into()
+            }
+        );
+        let plan = prepare(&session, &args).unwrap();
+        assert_eq!(plan.files[0].original.as_deref(), Some(original));
+        assert_eq!(plan.files[0].updated, replacement);
+        assert_eq!(plan.files[1].updated, "pub fn new() {}\r\n");
+        args["changes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_sha256");
+        assert!(prepare(&session, &args).is_err());
+        args["changes"][1]["match_mode"] = serde_json::json!("line_endings");
+        assert!(parse_changes(&args).is_err());
+        assert_eq!(
+            fs::read(project.0.join("src/lib.rs")).unwrap(),
+            original.as_bytes()
+        );
+        assert!(!project.0.join("src/new.rs").exists());
+        assert!(!project.0.join(".fiko_backups").exists());
+    }
 }
