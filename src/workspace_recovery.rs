@@ -5,7 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -159,9 +159,7 @@ fn file_state(
         Err(_) => return "unsafe_path",
     };
     match fs::symlink_metadata(&target) {
-        Ok(meta) if meta.is_file() && !is_link(&meta) && meta.len() <= MAX_FILE_BYTES as u64 => {
-            meta
-        }
+        Ok(meta) if meta.is_file() && !is_link(&meta) && meta.len() <= MAX_FILE_BYTES as u64 => {}
         Ok(_) => return "unsafe_or_oversized",
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return if expected_original.is_none() {
@@ -280,7 +278,6 @@ pub fn audit(root: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::workspace_patch::{self, FileChange, WorkspacePlan};
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct Fixture(PathBuf);
