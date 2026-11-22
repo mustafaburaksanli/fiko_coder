@@ -1452,6 +1452,111 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[test]
+    #[ignore = "run only via dedicated real-process interruption parent"]
+    fn partial_stage_child_waits_during_write() {
+        let Some(root) = std::env::var_os("FIKO_TEST_PARTIAL_STAGE_KILL_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let result = restore_after_explicit_approval(&root, &fingerprint);
+        panic!("partial-stage child was not terminated: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "run once in cross-platform CI, not in repeated stress runs"]
+    fn process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Fixture::new("restore_partial_stage_kill");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let previous_marker = fs::read(&marker).unwrap();
+        let candidate_before = fs::read(project.0.join("src/a.rs")).unwrap();
+        let original = fs::read(record.files[0].backup_path.as_ref().unwrap()).unwrap();
+        let signal = project.0.join(".fiko_test_partial_stage_ready");
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::partial_stage_child_waits_during_write",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_PARTIAL_STAGE_KILL_PROJECT", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot start isolated partial-stage child");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "partial-stage child exited too early ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "partial-stage child did not reach ready signal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill().expect("cannot terminate partial-stage child");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "child must be forcefully terminated");
+
+        assert_eq!(fs::read(&marker).unwrap(), previous_marker);
+        assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), candidate_before);
+        let stage_files: Vec<_> = fs::read_dir(project.0.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_restore_stage_")
+            })
+            .collect();
+        assert_eq!(stage_files.len(), 1, "expected one orphan staged file");
+        let orphan = fs::read(stage_files[0].path()).unwrap();
+        assert_eq!(orphan.len(), (original.len() / 2).max(1));
+        assert_ne!(sha(&orphan), sha(&original));
+        assert_eq!(orphan, original[..orphan.len()]);
+
+        let report: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(report["eligible_for_review"], true);
+        assert_eq!(
+            report["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
+        // A new approval can restore from the verified backup, not the
+        // untrusted, incomplete staged orphan left by the terminated process.
+        let result = restore_after_explicit_approval(
+            &project.0,
+            &approved_fingerprint(&project.0),
+        )
+        .unwrap();
+        assert!(result.contains("RECOVERY_RESTORED"));
+        assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), original);
+        assert!(!marker.exists());
+        assert!(stage_files[0].path().exists(), "orphan evidence remains for review");
+    }
+
     #[cfg(unix)]
     #[test]
     fn staged_restore_does_not_modify_external_hard_link() {
