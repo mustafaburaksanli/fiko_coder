@@ -80,6 +80,14 @@ The parent process kills a dedicated child after the **first** of three files ha
 
 This is an actual process kill **between** file writes, not during a partial-byte write or a simulated power outage. The underlying restore procedure is still not an atomic filesystem transaction.
 
+## Staged restore (v1.3 experimental)
+
+Restoring an edited file now writes the original bytes to a **new sibling temporary file** in the same directory, verifies the original SHA-256, syncs that staged copy, preserves source permissions and then attempts to replace the candidate file. It does **not** truncate the original candidate in place. This narrows the damage window if the process stops mid-write.
+
+If a process is killed while staging, a hidden `.fiko_restore_stage_*.tmp` file may remain next to the original target. Do not treat orphan stage files as authenticated sources or delete them blindly. Make an independent project copy and inspect the pending marker and target hashes first. A fresh approved restore may complete while leaving such orphan evidence for manual cleanup.
+
+CI kills a real child process **after the staged file is synced but before replacement**. It verifies that the candidate target and pending marker remain unchanged and that a newly approved restore completes. This is distinct from an abrupt power outage, a crash during rename, or multi-file atomicity; those properties are **not guaranteed**.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.
@@ -87,4 +95,4 @@ This is an actual process kill **between** file writes, not during a partial-byt
 - The marker does not guarantee directory durability, absence of power-loss corruption or process isolation.
 - SHA-256 matches demonstrate byte integrity relative to the marker, not authenticity or approval.
 - Candidate verification via Cargo is **not sandboxed**, even in a temporary workspace.
-- User-confirmed restoration is fail-closed and resumable for already-original / already-absent targets, but is **not** a filesystem transaction and cannot guarantee crash atomicity.
+- User-confirmed restoration now stages original bytes before each replacement, but remains **non-atomic across multiple files** and cannot guarantee power-loss durability or isolation from external writers.
