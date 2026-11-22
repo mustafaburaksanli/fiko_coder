@@ -357,7 +357,12 @@ pub fn restoration_preview(root: &Path) -> Result<String, String> {
         };
         let valid_hash =
             |hash: &str| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
-        let valid_entry = valid_hash(updated) && original.is_none_or(valid_hash);
+        let valid_entry = entry.get("path").is_some()
+            && entry.get("original_sha256").is_some()
+            && entry.get("updated_sha256").is_some()
+            && entry.get("backup_name").is_some()
+            && valid_hash(updated)
+            && original.is_none_or(valid_hash);
         let target = if valid_entry && discovery::check_relative_path(path).is_ok() {
             discovery::resolve_target(&root, path).ok()
         } else {
@@ -637,6 +642,14 @@ mod tests {
             "invalid_or_duplicate_target"
         );
         assert!(path.is_file());
+
+        manifest["files"][0]["updated_sha256"] = json!(sha(b"pub fn a() -> u8 { 2 }\n"));
+        manifest["files"][0].as_object_mut().unwrap().remove("backup_name");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
     }
 
     #[test]
