@@ -606,12 +606,12 @@ fn rollback_without_operation_lock(root: &Path, record: &WorkspaceRecord) -> Res
     workspace_recovery::assert_rollback_record(root, record)?;
     let mut errors = Vec::new();
     for file in record.files.iter().rev() {
-        if let Err(error) = rollback_file(&root, file) {
+        if let Err(error) = rollback_file(root, file) {
             errors.push(format!("{}: {error}", file.file.relative));
         }
     }
     if errors.is_empty() {
-        workspace_recovery::finish_rollback(&root, record)
+        workspace_recovery::finish_rollback(root, record)
     } else {
         Err(errors.join("\n"))
     }
