@@ -1187,9 +1187,12 @@ async fn run_task_loop<P: Prompter>(
                 && !task.phase().is_terminal()
                 && let Some(args) = task.repair.take_pending_patch_args()
             {
-                println!("[PATCH ONAYI] Model arac cagirmadi; Rust tarafindan dogrulanmis tek dosya adayi mevcut apply onayina iletiliyor.");
+                println!(
+                    "[PATCH ONAYI] Model arac cagirmadi; Rust tarafindan dogrulanmis tek dosya adayi mevcut apply onayina iletiliyor."
+                );
                 host_patch_attempted = true;
-                let outcome = execute_task_tool(&mut task, session, prompter, "apply_patch", &args).await?;
+                let outcome =
+                    execute_task_tool(&mut task, session, prompter, "apply_patch", &args).await?;
                 if let Some(reason) = &outcome.stop {
                     println!("[REPAIR CONTROLLER] {reason}\n");
                 }
