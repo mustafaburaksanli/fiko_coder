@@ -518,7 +518,11 @@ mod tests {
         // A Windows drive-relative or ADS name must never escape the backup directory.
         value["files"][0]["backup_name"] = json!("C:outside.bak");
         fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(audit(&project.0).unwrap().contains("backup=unsafe_reference"));
+        assert!(
+            audit(&project.0)
+                .unwrap()
+                .contains("backup=unsafe_reference")
+        );
     }
 
     #[cfg(unix)]
