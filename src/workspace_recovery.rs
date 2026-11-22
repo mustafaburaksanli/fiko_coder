@@ -941,6 +941,150 @@ mod tests {
     }
 
     #[test]
+    fn operation_lock_rejects_other_fiko_write_paths_and_manual_restore() {
+        let project = Fixture::new("locked_writes");
+        let root = project.0.canonicalize().unwrap();
+        let plan = project.plan();
+        let lock = try_lock_operation(&root).unwrap();
+        let second = try_lock_operation(&root)
+            .err()
+            .expect("a second handle must not acquire the held lock");
+        assert!(second.contains("Baska bir FIKO"), "{second}");
+
+        let blocked = workspace_patch::apply(&root, &plan).unwrap_err();
+        assert!(blocked.message.contains("Baska bir FIKO"), "{blocked}");
+
+        let single = crate::tools::prepare_patch(
+            &root,
+            "src/a.rs",
+            "pub fn a() -> u8 { 1 }",
+            "pub fn a() -> u8 { 3 }",
+        )
+        .unwrap();
+        let error = crate::tools::apply_approved_patch(&root, single)
+            .err()
+            .expect("single-file writer must respect the same lock");
+        assert!(error.contains("Baska bir FIKO"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        drop(lock);
+
+        let record = workspace_patch::apply(&root, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let lock = try_lock_operation(&root).unwrap();
+        let error = restore_after_explicit_approval(&root, &fingerprint).unwrap_err();
+        assert!(error.contains("Baska bir FIKO"), "{error}");
+        let rollback_error = workspace_patch::rollback(&root, &record).unwrap_err();
+        assert!(rollback_error.contains("Baska bir FIKO"), "{rollback_error}");
+        assert!(root.join(".fiko_backups").join(MARKER).exists());
+        drop(lock);
+
+        restore_after_explicit_approval(&root, &fingerprint).unwrap();
+        assert!(!root.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    #[ignore = "isolated child only; parent test owns the process lifetime"]
+    fn operation_lock_child_holds_until_killed() {
+        let Some(project) = std::env::var_os("FIKO_TEST_WORKSPACE_LOCK_CHILD") else {
+            return;
+        };
+        let root = PathBuf::from(project).canonicalize().unwrap();
+        let _lock = try_lock_operation(&root).unwrap();
+        let mut signal = File::create(root.join(".fiko_test_workspace_lock_ready")).unwrap();
+        signal.write_all(b"ready").unwrap();
+        signal.sync_all().unwrap();
+        drop(signal);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        panic!("lock child should have been terminated by parent");
+    }
+
+    #[test]
+    fn process_kill_releases_os_lock_without_deleting_lock_file() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Fixture::new("lock_process_kill");
+        let root = project.0.canonicalize().unwrap();
+        let signal = root.join(".fiko_test_workspace_lock_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::operation_lock_child_holds_until_killed",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_WORKSPACE_LOCK_CHILD", &root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("could not start workspace lock child");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut signaled = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                signaled = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "lock child exited too soon ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !signaled {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "lock child never signaled: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let error = try_lock_operation(&root)
+            .err()
+            .expect("parent must not obtain a live child lock");
+        assert!(error.contains("Baska bir FIKO"), "{error}");
+
+        child.kill().expect("could not kill lock-owning child");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(root.join(".fiko_backups/workspace.operation.lock").is_file());
+
+        let new_owner = try_lock_operation(&root).unwrap();
+        let blocked = try_lock_operation(&root).err().unwrap();
+        assert!(blocked.contains("Baska bir FIKO"));
+        drop(new_owner);
+        try_lock_operation(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_operation_lock_is_never_accepted() {
+        use std::os::unix::fs::symlink;
+
+        let project = Fixture::new("symlink_lock");
+        let root = project.0.canonicalize().unwrap();
+        let lock = try_lock_operation(&root).unwrap();
+        drop(lock);
+        let path = root.join(".fiko_backups/workspace.operation.lock");
+        fs::remove_file(&path).unwrap();
+        symlink(root.join("src/a.rs"), &path).unwrap();
+        let error = try_lock_operation(&root).err().unwrap();
+        assert!(error.contains("normal bir dosya"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+    }
+
+    #[test]
     fn writes_marker_before_target_and_audits_result_without_modifying() {
         let project = Fixture::new("audit");
         let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
