@@ -443,4 +443,90 @@ mod tests {
         assert!(audit(&project.0).unwrap().contains("unexpected"));
         assert!(project.0.join(".fiko_backups").join(MARKER).exists());
     }
+
+    #[test]
+    fn create_only_workspace_has_marker_and_no_backup_requirement() {
+        let project = Fixture::new("create_only");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[FileChange::Create {
+                path: "src/added.rs".into(),
+                content: "pub fn added() -> bool { true }\n".into(),
+            }],
+        )
+        .unwrap();
+        let record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let path = project.0.join("src/added.rs");
+        assert!(path.is_file());
+        assert!(audit(&project.0).unwrap().contains("backup=not_required"));
+        finish_verified(&project.0, &record).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "pub fn added() -> bool { true }\n"
+        );
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn corrupted_backup_keeps_recovery_marker_and_does_not_overwrite_target() {
+        let project = Fixture::new("backup_mismatch");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let backup = record.files[0].backup_path.as_ref().unwrap();
+        fs::write(backup, b"backup tampered").unwrap();
+        assert!(audit(&project.0).unwrap().contains("backup=mismatch"));
+        assert!(finish_verified(&project.0, &record).is_err());
+        assert!(workspace_patch::rollback(&project.0, &record).is_err());
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
+    fn malformed_marker_blocks_new_writes_without_changing_sources() {
+        let project = Fixture::new("invalid_marker");
+        let folder = project.0.join(".fiko_backups");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join(MARKER), b"{invalid-json").unwrap();
+        assert!(audit(&project.0).is_err());
+        let err = workspace_patch::apply(&project.0, &project.plan()).unwrap_err();
+        assert!(err.restored);
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert_eq!(fs::read(folder.join(MARKER)).unwrap(), b"{invalid-json");
+    }
+
+    #[test]
+    fn forged_backup_path_is_rejected_without_reading_external_files() {
+        let project = Fixture::new("forged_reference");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let mut value: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        value["files"][0]["backup_name"] = json!("../outside.bak");
+        fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        let audit_before = fs::read(&marker).unwrap();
+        assert!(audit(&project.0).unwrap().contains("backup=unsafe_reference"));
+        assert_eq!(fs::read(&marker).unwrap(), audit_before);
+        assert!(finish_verified(&project.0, &record).is_err());
+        assert!(marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_backup_directory_is_rejected_without_writing_source() {
+        use std::os::unix::fs::symlink;
+        let project = Fixture::new("linked_dir");
+        let external = Fixture::new("external");
+        symlink(&external.0, project.0.join(".fiko_backups")).unwrap();
+        assert!(audit(&project.0).is_err());
+        let err = workspace_patch::apply(&project.0, &project.plan()).unwrap_err();
+        assert!(err.restored);
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+    }
 }
