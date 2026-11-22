@@ -29,6 +29,8 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
       - name: Restore subprocess kill and approved resume regression
         run: cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
+      - name: Staged restore interruption before replacement
+        run: cargo test --locked --lib workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore -- --ignored --exact
       - name: Stabilization stress (20 parallel + 20 serial runs)
         shell: pwsh
         run: |
@@ -68,3 +70,5 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
       - name: Restore subprocess kill and approved resume regression
         run: cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
+      - name: Staged restore interruption before replacement
+        run: cargo test --locked --lib workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore -- --ignored --exact
