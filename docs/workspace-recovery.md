@@ -32,6 +32,16 @@ The audit does not call Ollama, PostgreSQL or Cargo. Avoid running `cargo run` i
 4. Decide manually whether to keep the changed code or restore reviewed originals. The audit never grants this authority.
 5. Do not remove the marker just to unblock edits; doing so loses recovery evidence.
 
+## Developer interruption regression
+
+The Windows and Linux CI workflows run an isolated process-termination regression in addition to ordinary Rust tests:
+
+```shell
+cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
+```
+
+The parent test kills a dedicated child process **after two workspace files have been written and before the third write**. It then verifies that the read-only audit can still describe the pending marker, intact backups and unchanged third target. This is a real process kill but **not** a partial-byte-write or sudden power-loss simulation.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.
