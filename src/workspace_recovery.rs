@@ -1430,6 +1430,35 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn staged_restore_does_not_modify_external_hard_link() {
+        let project = Fixture::new("restore_hardlink");
+        let record = workspace_patch::apply(&project.0, &project.plan()).unwrap();
+        let external = project.0.parent().unwrap().join(format!(
+            "fiko_external_hardlink_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::hard_link(project.0.join("src/a.rs"), &external).unwrap();
+        assert_eq!(
+            fs::read_to_string(&external).unwrap(),
+            "pub fn a() -> u8 { 2 }\n"
+        );
+        let result =
+            restore_after_explicit_approval(&project.0, &approved_fingerprint(&project.0));
+        let outside_content = fs::read_to_string(&external).unwrap();
+        let _ = fs::remove_file(&external);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fs::read_to_string(project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert_eq!(outside_content, "pub fn a() -> u8 { 2 }\n");
+        assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+        assert!(record.files[0].backup_path.as_ref().unwrap().is_file());
+    }
+
     #[test]
     fn staged_restore_preserves_source_permissions_when_supported() {
         let project = Fixture::new("restore_permissions");
