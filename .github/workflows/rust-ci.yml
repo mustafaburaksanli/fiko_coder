@@ -31,6 +31,8 @@ jobs:
         run: cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
       - name: Staged restore interruption before replacement
         run: cargo test --locked --lib workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore -- --ignored --exact
+      - name: Real partial-stage write interruption regression
+        run: cargo test --locked --lib workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval -- --ignored --exact
       - name: Stabilization stress (20 parallel + 20 serial runs)
         shell: pwsh
         run: |
@@ -72,3 +74,5 @@ jobs:
         run: cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
       - name: Staged restore interruption before replacement
         run: cargo test --locked --lib workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore -- --ignored --exact
+      - name: Real partial-stage write interruption regression
+        run: cargo test --locked --lib workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval -- --ignored --exact
