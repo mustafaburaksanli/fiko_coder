@@ -399,6 +399,52 @@ mod tests {
     }
 
     #[test]
+    fn forgotten_in_memory_record_leaves_read_only_recovery_evidence() {
+        let project = Fixture::new("record_lost");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[
+                FileChange::Edit {
+                    path: "src/a.rs".into(),
+                    old_text: "pub fn a() -> u8 { 1 }".into(),
+                    new_text: "pub fn a() -> u8 { 2 }".into(),
+                },
+                FileChange::Create {
+                    path: "src/new.rs".into(),
+                    content: "pub fn new_file() {}\n".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        {
+            let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+            // Simulated restart boundary: intentionally discard the in-memory record.
+            // This is not an actual OS process kill.
+        }
+        let before = fs::read(project.0.join("src/a.rs")).unwrap();
+        let report = audit(&project.0).unwrap();
+        assert!(report.contains("src/a.rs\": updated"), "{report}");
+        assert!(report.contains("src/new.rs\": updated"), "{report}");
+        assert!(report.contains("backup=intact"), "{report}");
+        assert!(report.contains("backup=not_required"), "{report}");
+        assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), before);
+
+        let next = workspace_patch::prepare(
+            &project.0,
+            &[FileChange::Create {
+                path: "src/later.rs".into(),
+                content: "new".into(),
+            }],
+        )
+        .unwrap();
+        let blocked = workspace_patch::apply(&project.0, &next).unwrap_err();
+        assert!(blocked.message.contains("belirsiz"), "{blocked}");
+        assert!(!project.0.join("src/later.rs").exists());
+        assert!(project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[test]
     fn unclosed_marker_blocks_second_transaction() {
         let project = Fixture::new("blocked");
         let _record = workspace_patch::apply(&project.0, &project.plan()).unwrap();

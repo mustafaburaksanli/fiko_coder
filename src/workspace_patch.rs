@@ -994,6 +994,105 @@ mod tests {
     }
 
     #[test]
+    fn ucuncu_yazma_hatasi_onceki_iki_editi_geri_almali_ve_kaydi_kapatmali() {
+        let project = Project::new();
+        let plan = prepare(
+            &project.0,
+            &[
+                edit_a(),
+                edit(
+                    "src/b.rs",
+                    "pub fn b() -> u8 { 2 }",
+                    "pub fn b() -> u8 { 4 }",
+                ),
+                create("src/c.rs", "yeni\n"),
+            ],
+        )
+        .unwrap();
+        let error = apply_with(&project.0, &plan, |index, _| {
+            if index == 2 {
+                Err("kontrollu ucuncu yazma hatasi".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.restored, "{error}");
+        assert_eq!(
+            read_text(&project.0.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        assert_eq!(
+            read_text(&project.0.join("src/b.rs")).unwrap(),
+            "pub fn b() -> u8 { 2 }\n"
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+        assert!(
+            !project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .exists()
+        );
+        // The recovered workspace must be writable by a newly authorized plan.
+        let subsequent = prepare(&project.0, &[edit_a()]).unwrap();
+        let record = apply(&project.0, &subsequent).unwrap();
+        rollback(&project.0, &record).unwrap();
+    }
+
+    #[test]
+    fn ucuncu_yazmada_dis_degisiklik_kalirsa_kayit_ve_durumu_korumali() {
+        let project = Project::new();
+        let plan = prepare(
+            &project.0,
+            &[
+                edit_a(),
+                edit(
+                    "src/b.rs",
+                    "pub fn b() -> u8 { 2 }",
+                    "pub fn b() -> u8 { 4 }",
+                ),
+                create("src/c.rs", "yeni\n"),
+            ],
+        )
+        .unwrap();
+        let error = apply_with(&project.0, &plan, |index, _| {
+            if index == 2 {
+                fs::write(project.0.join("src/a.rs"), "kullanicinin dis degisikligi\n").unwrap();
+                Err("kontrollu ucuncu yazma hatasi".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(!error.restored);
+        assert!(error.message.contains("BELIRSIZ"));
+        assert_eq!(
+            read_text(&project.0.join("src/a.rs")).unwrap(),
+            "kullanicinin dis degisikligi\n"
+        );
+        assert_eq!(
+            read_text(&project.0.join("src/b.rs")).unwrap(),
+            "pub fn b() -> u8 { 2 }\n"
+        );
+        assert!(!project.0.join("src/c.rs").exists());
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
+        let audit = workspace_recovery::audit(&project.0).unwrap();
+        assert!(audit.contains("src/a.rs\": unexpected"), "{audit}");
+        assert!(audit.contains("src/b.rs\": original"), "{audit}");
+        let next = prepare(&project.0, &[create("src/next.rs", "new")]).unwrap();
+        let blocked = apply(&project.0, &next).unwrap_err();
+        assert!(blocked.message.contains("belirsiz"), "{blocked}");
+        assert!(!project.0.join("src/next.rs").exists());
+    }
+
+    #[test]
     fn ikinci_yazma_hatasinda_onceki_edit_ve_create_geri_alinmali() {
         for initial in [edit_a(), create("src/aa.rs", "yeni\n")] {
             let project = Project::new();
