@@ -1561,7 +1561,8 @@ mod tests {
             .collect();
         assert_eq!(orphan_stages.len(), 1);
         let staged_bytes = fs::read(orphan_stages[0].path()).unwrap();
-        assert_eq!(staged_bytes, b"pub fn a() -> u8 { 3 }\n"[..(b"pub fn a() -> u8 { 3 }\n".len() / 2).max(1)]);
+        let updated = b"pub fn a() -> u8 { 3 }\n";
+        assert_eq!(staged_bytes.as_slice(), &updated[..(updated.len() / 2).max(1)]);
 
         let report: serde_json::Value =
             serde_json::from_str(&workspace_recovery::restoration_preview(&project.0).unwrap())
