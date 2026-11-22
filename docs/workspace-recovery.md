@@ -22,6 +22,8 @@ The audit does not call Ollama, PostgreSQL or Cargo. Avoid running `cargo run` i
 - Backup `not_required`: create-only target, no original to back up.
 - Backup `missing`, `mismatch`, `missing_reference`, `unsafe_reference`, `invalid_original_hash`, `unreadable`, `unsafe_or_oversized`, `unexpected_reference`: do not assume recovery is possible.
 
+**Pending marker write lock:** Both `apply_workspace` and single-file `apply_patch` reject new writes when an unresolved workspace marker exists. This does not freeze unrelated external processes or replace user-reviewed recovery.
+
 ## Incident response (no automatic restore)
 
 1. Stop new writes and make an **independent copy** of the project and its `.fiko_backups` directory.
