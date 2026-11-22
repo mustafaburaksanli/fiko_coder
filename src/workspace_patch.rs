@@ -404,6 +404,10 @@ fn apply_with(
     mut before_write: impl FnMut(usize, &PlannedFile) -> Result<(), String>,
 ) -> Result<WorkspaceRecord, ApplyError> {
     let root = root_path(root).map_err(before_write_error)?;
+    // Hold the same OS lock as single-file writes and interactive restore.
+    // The marker remains the crash-recovery gate after the lock is released.
+    let _operation_lock =
+        workspace_recovery::try_lock_operation(&root).map_err(before_write_error)?;
     revalidate(&root, plan).map_err(before_write_error)?;
     workspace_recovery::ensure_clear(&root).map_err(before_write_error)?;
     let mut record = WorkspaceRecord {
