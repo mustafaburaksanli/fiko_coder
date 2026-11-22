@@ -4,7 +4,7 @@
 //! It never restores files automatically and never grants write authorization.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -567,9 +567,29 @@ pub fn restore_after_explicit_approval(
                     .as_ref()
                     .ok_or("Geri yukleme yedegi kayip.")?;
                 let mut handle = OpenOptions::new()
+                    .read(true)
                     .write(true)
                     .open(&step.target)
                     .map_err(|e| format!("{}: {e}", step.relative))?;
+                // Recheck the bytes through the exact writable file handle.
+                // This reduces the race between the earlier path check and open,
+                // though it is NOT an OS-level no-follow/exclusive-open guarantee.
+                let opened = handle.metadata().map_err(|e| e.to_string())?;
+                if !opened.is_file() || opened.len() > MAX_FILE_BYTES as u64 {
+                    return Err(format!("{}: Acilan hedef normal bir dosya degil.", step.relative));
+                }
+                if discovery::resolve_existing(&root, &step.relative)? != step.target {
+                    return Err(format!("{}: Hedef dosya yolu degisti.", step.relative));
+                }
+                let mut candidate = Vec::new();
+                (&mut handle)
+                    .take(MAX_FILE_BYTES as u64 + 1)
+                    .read_to_end(&mut candidate)
+                    .map_err(|e| e.to_string())?;
+                if candidate.len() > MAX_FILE_BYTES || sha(&candidate) != step.updated_sha256 {
+                    return Err(format!("{}: Acilan dosya onayli adayla eslesmiyor.", step.relative));
+                }
+                handle.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                 handle.set_len(0).map_err(|e| e.to_string())?;
                 handle.write_all(bytes).map_err(|e| e.to_string())?;
                 handle.sync_all().map_err(|e| e.to_string())?;
