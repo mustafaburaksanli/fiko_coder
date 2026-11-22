@@ -88,6 +88,12 @@ If a process is killed while staging, a hidden `.fiko_restore_stage_*.tmp` file 
 
 CI kills a real child process **after the staged file is synced but before replacement**. It verifies that the candidate target and pending marker remain unchanged and that a newly approved restore completes. This is distinct from an abrupt power outage, a crash during rename, or multi-file atomicity; those properties are **not guaranteed**.
 
+### Partial staged-write interruption regression
+
+A dedicated Windows/Linux CI regression terminates a real isolated process **after only half of the original recovery content was written to a sibling staging file**, and before any replacement. The parent verifies that the approved candidate, pending marker and verified backup remain unchanged, that the orphan staging file is partial and untrusted, and that a new separately approved recovery reads the verified backup rather than the orphan.
+
+This is process termination after a controlled partial write, not sudden power loss or evidence of whole-workspace crash atomicity. Orphan staging files are retained for review rather than trusted or automatically deleted.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.
