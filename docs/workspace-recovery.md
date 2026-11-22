@@ -100,6 +100,14 @@ Immediately before replacing a candidate source, the restore implementation read
 
 Tests include same-length staged-content tampering and a dedicated isolated-process tampering scenario. This narrows the race but **does not** provide an OS-wide exclusive file lock or prevent hostile races between the final check and rename.
 
+## Cooperative OS operation lock (v1.3 experimental)
+
+FIKO's single-file apply, multi-file workspace apply/rollback and explicitly approved restore use the same **non-blocking exclusive OS file lock** at `.fiko_backups/workspace.operation.lock`. A second cooperating FIKO writer fails immediately while this lock is held, before modifying targets or backups. The file stays on disk permanently; removing it would let two processes lock different file identities.
+
+The OS releases the lock handle when the owning process terminates, including a forced termination. The pending `workspace.pending.json` marker is independent and **must still block new writes after an interrupted transaction**. The lock never authorizes automatic recovery or bypasses the interactive restore approval.
+
+The lock coordinates **cooperating FIKO callers only**. External editors, malware, filesystem path substitution and all other programs that ignore the lock can still race source reads and writes. It is not a sandbox, an exclusive OS-wide project lock, or an atomic multi-file transaction. The legacy standalone single-file rollback API and independent post-write verification are not yet all covered by a single continuous lock lifetime.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.
@@ -107,4 +115,4 @@ Tests include same-length staged-content tampering and a dedicated isolated-proc
 - The marker does not guarantee directory durability, absence of power-loss corruption or process isolation.
 - SHA-256 matches demonstrate byte integrity relative to the marker, not authenticity or approval.
 - Candidate verification via Cargo is **not sandboxed**, even in a temporary workspace.
-- User-confirmed restoration now stages original bytes before each replacement, but remains **non-atomic across multiple files** and cannot guarantee power-loss durability or isolation from external writers.
+- User-confirmed restoration stages original bytes before each replacement, and FIKO now coordinates cooperating write paths with an OS advisory lock; the operation remains **non-atomic across multiple files** and cannot guarantee power-loss durability or isolation from external writers.
