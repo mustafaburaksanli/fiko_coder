@@ -826,6 +826,13 @@ pub fn restore_after_explicit_approval(
                     fs::remove_file(&step.target).map_err(|e| e.to_string())?;
                     symlink(&external, &step.target).map_err(|e| e.to_string())?;
                 }
+                #[cfg(test)]
+                if step.relative == "src/new.rs"
+                    && std::env::var_os("FIKO_TEST_RECOVERY_CREATE_DIRECTORY_RACE").is_some()
+                {
+                    fs::remove_file(&step.target).map_err(|e| e.to_string())?;
+                    fs::create_dir(&step.target).map_err(|e| e.to_string())?;
+                }
                 let meta = fs::symlink_metadata(&step.target)
                     .map_err(|e| format!("{}: {e}", step.relative))?;
                 if !meta.is_file() || is_link(&meta) || meta.len() > MAX_FILE_BYTES as u64 {
@@ -1560,6 +1567,53 @@ mod tests {
         assert!(
             output.status.success(),
             "isolated recovery test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated child process only"]
+    fn created_recovery_directory_swap_child() {
+        let Some(root) = std::env::var_os("FIKO_TEST_RECOVERY_CREATE_DIRECTORY_RACE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let plan = workspace_patch::prepare(
+            &root,
+            &[FileChange::Create {
+                path: "src/new.rs".into(),
+                content: "new\n".into(),
+            }],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&root, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        assert!(restore_after_explicit_approval(&root, &fingerprint).is_err());
+        assert!(root.join("src/new.rs").is_dir());
+        assert!(root.join(".fiko_backups").join(MARKER).is_file());
+        let preview: Value = serde_json::from_str(&restoration_preview(&root).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
+    }
+
+    #[test]
+    fn created_file_recovery_rejects_directory_substitution_at_final_delete_gate() {
+        use std::process::Command;
+
+        let project = Fixture::new("recovery_created_directory_race");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::created_recovery_directory_swap_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_RECOVERY_CREATE_DIRECTORY_RACE", &project.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated recovery directory test failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
