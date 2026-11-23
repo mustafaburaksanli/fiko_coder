@@ -63,7 +63,7 @@ impl Drop for Fixture {
 fn assert_cargo_tests_pass(root: &Path) {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
-        .args(["test", "--offline", "--locked"])
+        .args(["test", "--offline"])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .arg("--target-dir")
