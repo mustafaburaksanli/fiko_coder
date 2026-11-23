@@ -706,6 +706,16 @@ fn create_new_staged(root: &Path, record: &mut RecordedFile) -> Result<(), Strin
         return Err("Published create child was expected to be terminated.".into());
     }
 
+    let published_meta = fs::symlink_metadata(&file.path).map_err(|e| e.to_string())?;
+    if !published_meta.is_file()
+        || is_link(&published_meta)
+        || published_meta.len() != bytes.len() as u64
+    {
+        return Err(format!(
+            "{}: Published target is no longer a regular file.",
+            file.relative
+        ));
+    }
     if read_bytes(&file.path)? != bytes {
         return Err(format!(
             "{}: Published file verification failed.",
