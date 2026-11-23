@@ -835,7 +835,8 @@ pub fn restore_after_explicit_approval(
                     ));
                 }
                 if discovery::resolve_existing(&root, &step.relative)? != step.target
-                    || file_state(&root, &step.relative, original, &step.updated_sha256) != "updated"
+                    || file_state(&root, &step.relative, original, &step.updated_sha256)
+                        != "updated"
                 {
                     return Err(format!(
                         "{}: Silinecek aday degisti; kayit korundu.",
@@ -1533,7 +1534,10 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(fs::read(root.join("external_created_recovery.rs")).unwrap(), b"new\n");
+        assert_eq!(
+            fs::read(root.join("external_created_recovery.rs")).unwrap(),
+            b"new\n"
+        );
         assert!(root.join(".fiko_backups").join(MARKER).is_file());
     }
 
