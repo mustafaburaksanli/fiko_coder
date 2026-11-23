@@ -1023,11 +1023,18 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 return Err("rollback child must be killed after removal".into());
             }
-            if fs::symlink_metadata(&target).is_ok() {
-                return Err("Yeni dosyanin kaldirildigi dogrulanamadi.".into());
-            }
-            Ok(())
+            confirm_created_target_absent(fs::symlink_metadata(&target))
         }
+    }
+}
+
+/// Deletion is confirmed only by NotFound; permission and I/O errors
+/// cannot be mistaken for proof that the removed file is absent.
+fn confirm_created_target_absent(result: std::io::Result<fs::Metadata>) -> Result<(), String> {
+    match result {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Silme sonrasi hedef denetlenemedi: {error}")),
+        Ok(_) => Err("Yeni dosyanin kaldirildigi dogrulanamadi.".into()),
     }
 }
 
@@ -1564,6 +1571,24 @@ mod tests {
             assert!(!project.0.join("src/aa.rs").exists());
             assert!(!project.0.join("src/z.rs").exists());
         }
+    }
+
+    #[test]
+    fn created_file_rollback_postdelete_verification_requires_not_found() {
+        use std::io::{Error, ErrorKind};
+
+        // A failed filesystem query is not evidence that deletion succeeded.
+        assert!(confirm_created_target_absent(Err(Error::from(ErrorKind::NotFound))).is_ok());
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            let error = confirm_created_target_absent(Err(Error::from(kind))).unwrap_err();
+            assert!(error.contains("denetlenemedi"), "{error}");
+        }
+
+        let project = Project::new();
+        let target = project.0.join("src/c.rs");
+        assert!(confirm_created_target_absent(fs::symlink_metadata(&target)).is_ok());
+        fs::write(&target, "still present").unwrap();
+        assert!(confirm_created_target_absent(fs::symlink_metadata(&target)).is_err());
     }
 
     #[test]
