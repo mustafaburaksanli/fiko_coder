@@ -9,8 +9,8 @@ permissions:
 
 jobs:
   cross-platform:
-    name: Rust CI (\${{ matrix.name }})
-    runs-on: \${{ matrix.runner }}
+    name: Rust CI (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "\${{ matrix.target }}"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
           uname -a
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -51,7 +51,7 @@ jobs:
       - name: Unit and offline integration tests
         run: cargo test --locked
       - name: All shared process-interruption recovery regressions
-        run: \${{ matrix.python }} scripts/ci_regressions.py ignored
+        run: ${{ matrix.python }} scripts/ci_regressions.py ignored
       - name: Live-Qwen acceptance script offline smoke (no model or approvals)
         shell: pwsh
         run: |
@@ -69,4 +69,4 @@ jobs:
           $result = Get-Content -LiteralPath ($fixture + '.result.json') -Raw | ConvertFrom-Json
           if ($result.pass -ne $true) { throw 'Acceptance result must be successful' }
       - name: Stabilization stress (20 parallel + 20 serial runs)
-        run: \${{ matrix.python }} scripts/ci_regressions.py stress --repeats 20
+        run: ${{ matrix.python }} scripts/ci_regressions.py stress --repeats 20
