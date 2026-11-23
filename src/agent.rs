@@ -3180,14 +3180,11 @@ fn fail_after_removing_own_backup() {
     async fn workspace_agent_failed_real_cargo_test_rolls_back_all_files() {
         let root = mini_crate("agent_workspace_failed_test");
         let original = fs::read(root.join("src/main.rs")).unwrap();
-        // Candidate compiles in temporary check mode, but fails the actual
-        // post-apply cargo test on the original crate.
-        let failing = format!(
-            "{MINI_GOOD}\\n#[cfg(test)]\\n#[test]\\nfn intentional_failure() {{ assert_eq!(2 + 2, 5); }}\\n"
-        );
+        // Check mode compiles both files without executing the new failing test.
+        // Actual post-apply cargo test must fail, and host rollback must run.
         let changes = json!([
-            {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": failing},
-            {"operation": "create", "path": "src/helper.rs", "content": "pub fn helper() {}\\n"}
+            {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": MINI_GOOD},
+            {"operation": "create", "path": "src/lib.rs", "content": "#[test]\\nfn intentional_failure() { assert_eq!(2 + 2, 5); }\\n"}
         ]);
         let (url, server) = mock_ollama(vec![
             json!({"message": {"role": "assistant", "tool_calls": [{"function": {
@@ -3200,7 +3197,7 @@ fn fail_after_removing_own_backup() {
         .await;
         let mut session = Session::new(root.clone());
         let mut prompter = ScriptedPrompter::with(&[true, true]);
-        let mut messages = conversation("Update src/main.rs and create src/helper.rs.");
+        let mut messages = conversation("Update src/main.rs and create src/lib.rs.");
         let task = run_task_at(
             &reqwest::Client::builder().no_proxy().build().unwrap(),
             "controlled-model",
@@ -3234,7 +3231,7 @@ fn fail_after_removing_own_backup() {
                     && command.exit_code.is_some_and(|code| code != 0))
         );
         assert_eq!(fs::read(root.join("src/main.rs")).unwrap(), original);
-        assert!(!root.join("src/helper.rs").exists());
+        assert!(!root.join("src/lib.rs").exists());
         assert!(!root.join(".fiko_backups/workspace.pending.json").exists());
         remove(&root);
     }
