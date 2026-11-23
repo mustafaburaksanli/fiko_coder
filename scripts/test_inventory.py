@@ -16,6 +16,8 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "ci" / "ignored-regressions.txt"
 HISTORICAL = ROOT / "ci" / "historical-acceptance-tests.txt"
+HELPERS = ROOT / "ci" / "ignored-subprocess-helpers.txt"
+POSTGRES = ROOT / "ci" / "ignored-postgres-tests.txt"
 
 
 def discover(*cargo_args: str, ignored: bool = False) -> list[str]:
@@ -56,6 +58,34 @@ def main() -> int:
     ignored_lib_tests = discover("--lib", ignored=True)
     manifest = read_manifest(MANIFEST)
     historical = read_manifest(HISTORICAL)
+    helpers = read_manifest(HELPERS)
+    postgres = read_manifest(POSTGRES)
+
+    categories = {
+        "crash": set(manifest),
+        "subprocess_helpers": set(helpers),
+        "postgres": set(postgres),
+    }
+    if len(set().union(*categories.values())) != sum(len(v) for v in categories.values()):
+        raise RuntimeError("Ignored-test category manifests overlap")
+
+    unclassified_ignored = sorted(set(ignored_tests) - set().union(*categories.values()))
+    missing_classified = sorted(set().union(*categories.values()) - set(ignored_tests))
+    if unclassified_ignored or missing_classified:
+        raise RuntimeError(
+            f"Ignored-test classification drift: unclassified={unclassified_ignored}, "
+            f"missing={missing_classified}"
+        )
+
+    expected_ignored_lib = categories["crash"] | categories["subprocess_helpers"] | {
+        name for name in postgres if name.startswith("agent::tests::")
+    }
+    if set(ignored_lib_tests) != expected_ignored_lib:
+        raise RuntimeError(
+            f"Ignored library classification drift: "
+            f"unclassified={sorted(set(ignored_lib_tests) - expected_ignored_lib)}, "
+            f"missing={sorted(expected_ignored_lib - set(ignored_lib_tests))}"
+        )
 
     missing_historical = sorted(set(historical) - set(all_tests))
     if missing_historical:
@@ -65,10 +95,9 @@ def main() -> int:
     if missing:
         raise RuntimeError(f"Dedicated crash tests absent from ignored library tests: {missing}")
 
-    # Not every ignored test is a crash regression: there are opt-in
-    # PostgreSQL tests, manual fixtures, and child-process helper tests.
-    # Keep those visible for deliberate classification, never auto-run.
-    other_ignored_lib = sorted(set(ignored_lib_tests) - set(manifest))
+    # Subprocess helpers are not independent regression tests: executing
+    # them standalone can wait forever for their supervising parent. All
+    # ignored tests must be accounted for without running unsafe helpers.
     report = {
         "schema_version": 1,
         "all_discovered_tests": all_tests,
@@ -76,7 +105,9 @@ def main() -> int:
         "ignored_library_tests": ignored_lib_tests,
         "crash_manifest_tests": sorted(manifest),
         "historical_acceptance_tests": sorted(historical),
-        "other_ignored_library_tests_for_review": other_ignored_lib,
+        "subprocess_helper_tests": sorted(helpers),
+        "postgres_opt_in_tests": sorted(postgres),
+        "unclassified_ignored_tests": unclassified_ignored,
         "counts": {
             "all_test_list_entries": len(all_tests),
             "all_unique_identifiers": len(set(all_tests)),
@@ -84,7 +115,9 @@ def main() -> int:
             "ignored_library_unique_identifiers": len(set(ignored_lib_tests)),
             "dedicated_crash_manifest": len(manifest),
             "historical_acceptance_manifest": len(historical),
-            "other_ignored_library_for_review": len(other_ignored_lib),
+            "subprocess_helpers": len(helpers),
+            "postgres_opt_in": len(postgres),
+            "unclassified_ignored": len(unclassified_ignored),
         },
     }
     output = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
@@ -93,8 +126,7 @@ def main() -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(output, encoding="utf-8")
     print("[INVENTORY] " + json.dumps(report["counts"], sort_keys=True), flush=True)
-    for name in other_ignored_lib:
-        print(f"[REVIEW] Unclassified opt-in library test: {name}", flush=True)
+    print("[INVENTORY] All ignored tests are explicitly classified; subprocess-only fixtures were not executed.", flush=True)
     return 0
 
 
