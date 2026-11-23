@@ -3355,14 +3355,27 @@ fn fail_after_removing_own_backup() {
         assert_eq!(prompter.asked.len(), 2);
         assert!(prompter.asked[0].contains("cargo check"));
         assert!(prompter.asked[1].contains("Tum workspace"));
-        let tool_results: Vec<_> = messages.iter()
+        let tool_results: Vec<_> = messages
+            .iter()
             .filter(|message| message["role"] == "tool")
             .filter_map(|message| message["content"].as_str())
             .collect();
         assert_eq!(tool_results.len(), 3);
-        assert!(tool_results[0].starts_with("VERIFY_FAILED"), "{}", tool_results[0]);
-        assert!(tool_results[1].starts_with("VERIFY_OK"), "{}", tool_results[1]);
-        assert!(tool_results[2].starts_with("PATCH_VERIFIED"), "{}", tool_results[2]);
+        assert!(
+            tool_results[0].starts_with("VERIFY_FAILED"),
+            "{}",
+            tool_results[0]
+        );
+        assert!(
+            tool_results[1].starts_with("VERIFY_OK"),
+            "{}",
+            tool_results[1]
+        );
+        assert!(
+            tool_results[2].starts_with("PATCH_VERIFIED"),
+            "{}",
+            tool_results[2]
+        );
         let modified = fs::read_to_string(root.join("src/main.rs")).unwrap();
         assert_ne!(modified.as_bytes(), original);
         assert!(modified.contains(MINI_GOOD));
