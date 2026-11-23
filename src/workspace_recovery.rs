@@ -851,6 +851,19 @@ pub fn restore_after_explicit_approval(
                     ));
                 }
                 fs::remove_file(&step.target).map_err(|e| format!("{}: {e}", step.relative))?;
+                #[cfg(test)]
+                if step.relative == "src/new.rs"
+                    && std::env::var_os("FIKO_TEST_APPROVED_CREATED_DELETE_KILL").is_some()
+                {
+                    let mut signal =
+                        File::create(root.join(".fiko_test_approved_created_deleted_ready"))
+                            .map_err(|e| e.to_string())?;
+                    signal.write_all(b"ready").map_err(|e| e.to_string())?;
+                    signal.sync_all().map_err(|e| e.to_string())?;
+                    drop(signal);
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return Err("approved recovery child should have been killed".into());
+                }
             }
             "already_original" | "already_absent" => {}
             _ => return Err("Bilinmeyen kurtarma eylemi.".into()),
@@ -1616,6 +1629,103 @@ mod tests {
             "isolated recovery directory test failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    #[ignore = "child invoked only by dedicated process-kill test"]
+    fn approved_created_delete_child_waits_after_removal() {
+        let Some(root) = std::env::var_os("FIKO_TEST_APPROVED_CREATED_DELETE_KILL") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        let result = restore_after_explicit_approval(&root, &fingerprint);
+        panic!("approved recovery child unexpectedly returned: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "explicit real process-kill regression in Windows/Linux CI"]
+    fn approved_created_file_recovery_kill_after_delete_requires_fresh_approval() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Fixture::new("approved_created_delete_kill");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[FileChange::Create {
+                path: "src/new.rs".into(),
+                content: "new\n".into(),
+            }],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+        let marker = project.0.join(".fiko_backups").join(MARKER);
+        let marker_before = fs::read(&marker).unwrap();
+        let signal = project.0.join(".fiko_test_approved_created_deleted_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::approved_created_delete_child_waits_after_removal",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_APPROVED_CREATED_DELETE_KILL", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "child exited early ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "child did not signal deletion: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill().unwrap();
+        assert!(!child.wait_with_output().unwrap().status.success());
+        assert!(!project.0.join("src/new.rs").exists());
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["requires_explicit_user_approval"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_absent");
+        assert!(marker.exists());
+
+        let next = workspace_patch::prepare(
+            &project.0,
+            &[FileChange::Create {
+                path: "src/blocked.rs".into(),
+                content: "blocked".into(),
+            }],
+        )
+        .unwrap();
+        assert!(workspace_patch::apply(&project.0, &next).is_err());
+        assert!(!project.0.join("src/blocked.rs").exists());
+
+        let fingerprint = approved_fingerprint(&project.0);
+        restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(!marker.exists());
+        assert!(!project.0.join("src/new.rs").exists());
     }
 
     #[test]
