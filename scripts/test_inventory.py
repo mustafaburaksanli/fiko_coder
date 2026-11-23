@@ -17,8 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "ci" / "ignored-regressions.txt"
 
 
-def discover(*extra: str) -> list[str]:
-    command = ["cargo", "test", "--locked", *extra, "--", "--list"]
+def discover(*cargo_args: str, ignored: bool = False) -> list[str]:
+    # --ignored is a libtest harness option and must follow the -- separator.
+    command = ["cargo", "test", "--locked", *cargo_args, "--", "--list"]
+    if ignored:
+        command.append("--ignored")
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
     # libtest emits '<test name>: test'. Other output, counts and warnings
     # are intentionally ignored. Names can recur between test binaries,
@@ -48,8 +51,8 @@ def main() -> int:
     args = parser.parse_args()
 
     all_tests = discover()
-    ignored_tests = discover("--ignored")
-    ignored_lib_tests = discover("--lib", "--ignored")
+    ignored_tests = discover(ignored=True)
+    ignored_lib_tests = discover("--lib", ignored=True)
     manifest = crash_manifest()
 
     missing = sorted(set(manifest) - set(ignored_lib_tests))
