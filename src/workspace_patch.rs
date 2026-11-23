@@ -909,6 +909,14 @@ fn restore_existing_staged_rollback(
             file.relative
         ));
     }
+    // Test-only same-length staged corruption after revalidating the target.
+    #[cfg(test)]
+    if file.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_ROLLBACK_STAGE_TAMPER_PROJECT").is_some()
+    {
+        fs::write(&stage_path, vec![b'x'; verified_backup.len()])
+            .map_err(|e| e.to_string())?;
+    }
     check_staged()?;
     fs::rename(&stage_path, &target)
         .map_err(|e| format!("{}: Rollback rename failed: {e}", file.relative))?;
@@ -2222,6 +2230,54 @@ mod tests {
         );
         assert!(root.join(".fiko_backups/workspace.pending.json").exists());
         assert!(rollback_stage_orphans(&root).is_empty());
+    }
+
+    #[test]
+    #[ignore = "isolated child process only"]
+    fn rollback_child_rejects_same_length_stage_corruption() {
+        let Some(root) = std::env::var_os("FIKO_TEST_ROLLBACK_STAGE_TAMPER_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let record = apply(&root, &prepare(&root, &[edit_a()]).unwrap()).unwrap();
+        let error = rollback(&root, &record).unwrap_err();
+        assert!(error.contains("Staged rollback backup is untrusted"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 3 }\n"
+        );
+        assert!(root.join(".fiko_backups/workspace.pending.json").exists());
+        assert!(rollback_stage_orphans(&root).is_empty());
+    }
+
+    #[test]
+    fn staged_rollback_rejects_same_length_corrupted_stage_before_rename() {
+        use std::process::Command;
+
+        let project = Project::new();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::rollback_child_rejects_same_length_stage_corruption",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_ROLLBACK_STAGE_TAMPER_PROJECT", &project.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stage corruption child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preview: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(&project.0).unwrap())
+                .unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(
+            preview["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
     }
 
     #[test]
