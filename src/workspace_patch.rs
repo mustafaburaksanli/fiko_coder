@@ -1732,6 +1732,202 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), original);
     }
 
+    fn isolated_create_plan(root: &Path) -> WorkspacePlan {
+        prepare(root, &[create("src/c.rs", "pub fn c() -> u8 { 5 }\n")]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "child process only"]
+    fn create_child_waits_with_partial_staging() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CREATE_PARTIAL_STAGE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let result = apply(&root, &isolated_create_plan(&root));
+        panic!("partial create process should have been killed: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "child process only"]
+    fn create_child_waits_after_publication() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CREATE_AFTER_PUBLISH_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let result = apply(&root, &isolated_create_plan(&root));
+        panic!("published create process should have been killed: {result:?}");
+    }
+
+    fn kill_create_child_after_signal(
+        root: &Path,
+        test_name: &str,
+        env_name: &str,
+        signal_name: &str,
+    ) {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let signal = root.join(signal_name);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--ignored", "--nocapture"])
+            .env(env_name, root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("could not launch isolated staged create process");
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if fs::read(&signal).ok().as_deref() == Some(&b"ready"[..]) {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "create child exited before signal ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !ready {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "create child did not signal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill().expect("failed to terminate staged create child");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "child must terminate by force");
+    }
+
+    fn staged_create_orphans(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_create_stage_")
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "separate OS subprocess kill regression in Windows/Linux CI"]
+    fn process_kill_mid_staged_create_preserves_target_absence_and_pending_marker() {
+        let project = Project::new();
+        let root = &project.0;
+        kill_create_child_after_signal(
+            root,
+            "workspace_patch::tests::create_child_waits_with_partial_staging",
+            "FIKO_TEST_CREATE_PARTIAL_STAGE_PROJECT",
+            ".fiko_test_create_partial_stage_ready",
+        );
+        assert!(!root.join("src/c.rs").exists(), "target must not exist halfway");
+        let marker = root.join(".fiko_backups/workspace.pending.json");
+        assert!(marker.is_file());
+        let stages = staged_create_orphans(root);
+        assert_eq!(stages.len(), 1);
+        let staged = fs::read(&stages[0]).unwrap();
+        let complete = b"pub fn c() -> u8 { 5 }\n";
+        assert_eq!(staged.as_slice(), &complete[..(complete.len() / 2).max(1)]);
+
+        let report: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(root).unwrap()).unwrap();
+        assert_eq!(report["eligible_for_review"], true);
+        assert_eq!(report["files"][0]["proposed_action"], "already_absent");
+        let fingerprint = report["marker_fingerprint_sha256"].as_str().unwrap();
+        workspace_recovery::restore_after_explicit_approval(root, fingerprint).unwrap();
+        assert!(!marker.exists());
+        assert!(!root.join("src/c.rs").exists());
+        assert!(stages[0].exists(), "orphan is evidence, not recovery input");
+    }
+
+    #[test]
+    #[ignore = "separate OS subprocess kill regression in Windows/Linux CI"]
+    fn process_kill_after_staged_create_publication_resumes_with_explicit_approval() {
+        let project = Project::new();
+        let root = &project.0;
+        kill_create_child_after_signal(
+            root,
+            "workspace_patch::tests::create_child_waits_after_publication",
+            "FIKO_TEST_CREATE_AFTER_PUBLISH_PROJECT",
+            ".fiko_test_create_published_ready",
+        );
+        let complete = b"pub fn c() -> u8 { 5 }\n";
+        assert_eq!(fs::read(root.join("src/c.rs")).unwrap(), complete);
+        let marker = root.join(".fiko_backups/workspace.pending.json");
+        assert!(marker.is_file());
+        let stages = staged_create_orphans(root);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(fs::read(&stages[0]).unwrap(), complete);
+        let report: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(root).unwrap()).unwrap();
+        assert_eq!(report["eligible_for_review"], true);
+        assert_eq!(report["files"][0]["proposed_action"], "remove_created_candidate");
+        let fingerprint = report["marker_fingerprint_sha256"].as_str().unwrap();
+        workspace_recovery::restore_after_explicit_approval(root, fingerprint).unwrap();
+        assert!(!marker.exists());
+        assert!(!root.join("src/c.rs").exists());
+        assert!(stages[0].exists(), "orphan is not silently removed");
+    }
+
+    #[test]
+    #[ignore = "subprocess only; simulates concurrent target creation"]
+    fn staged_create_child_rejects_external_destination_without_clobber() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CREATE_EXTERNAL_RACE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let error = apply(&root, &isolated_create_plan(&root)).unwrap_err();
+        assert!(!error.restored, "unexpected target must leave unresolved marker");
+        assert_eq!(
+            fs::read(root.join("src/c.rs")).unwrap(),
+            b"external writer content"
+        );
+        assert!(root.join(".fiko_backups/workspace.pending.json").exists());
+        assert!(staged_create_orphans(&root).is_empty());
+    }
+
+    #[test]
+    fn staged_create_never_overwrites_a_target_created_at_publication_time() {
+        use std::process::Command;
+
+        let project = Project::new();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::staged_create_child_rejects_external_destination_without_clobber",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_CREATE_EXTERNAL_RACE_PROJECT", &project.0)
+            .output()
+            .expect("cannot start no-clobber test process");
+        assert!(
+            output.status.success(),
+            "external race test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(project.0.join("src/c.rs")).unwrap(),
+            b"external writer content"
+        );
+        let report: serde_json::Value = serde_json::from_str(
+            &workspace_recovery::restoration_preview(&project.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["eligible_for_review"], false);
+        assert_eq!(report["files"][0]["proposed_action"], "manual_review");
+    }
+
     #[test]
     fn bos_yeni_dosyanin_diffi_ve_yokluk_geri_almasi_acik_olmali() {
         let project = Project::new();
