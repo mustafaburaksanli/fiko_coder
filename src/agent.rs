@@ -3226,9 +3226,12 @@ fn fail_after_removing_own_backup() {
         assert_eq!(finish.applied, Some(true));
         assert_eq!(finish.rolled_back, Some(true));
         assert!(
-            finish.commands.iter().any(|command| command.command == "cargo test"
-                && command.status == "failed"
-                && command.exit_code.is_some_and(|code| code != 0))
+            finish
+                .commands
+                .iter()
+                .any(|command| command.command == "cargo test"
+                    && command.status == "failed"
+                    && command.exit_code.is_some_and(|code| code != 0))
         );
         assert_eq!(fs::read(root.join("src/main.rs")).unwrap(), original);
         assert!(!root.join("src/helper.rs").exists());
