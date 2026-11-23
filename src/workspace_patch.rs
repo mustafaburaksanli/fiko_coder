@@ -968,7 +968,13 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
             match fs::symlink_metadata(&target) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error.to_string()),
-                Ok(_) => {}
+                Ok(metadata) => {
+                    // A created-file rollback may delete only the regular file
+                    // that FIKO published, not a substituted link or directory.
+                    if !metadata.is_file() || is_link(&metadata) {
+                        return Err("Yeni dosyanin turu degismis; guvensiz hedef silinmedi.".into());
+                    }
+                }
             }
             if read_bytes(&target)? != *expected {
                 return Err("Yeni dosya islem sonrasinda degismis; dosya silinmedi.".into());
@@ -1515,6 +1521,56 @@ mod tests {
             assert!(!project.0.join("src/aa.rs").exists());
             assert!(!project.0.join("src/z.rs").exists());
         }
+    }
+
+    #[test]
+    fn created_file_rollback_refuses_directory_substitution() {
+        let project = Project::new();
+        let target = project.0.join("src/new.rs");
+        let plan = prepare(&project.0, &[create("src/new.rs", "created\\n")]).unwrap();
+        let record = apply(&project.0, &plan).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+
+        assert!(rollback(&project.0, &record).is_err());
+        assert!(target.is_dir());
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_file_rollback_refuses_same_content_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let project = Project::new();
+        let target = project.0.join("src/new.rs");
+        let external = project.0.join("external.rs");
+        let expected = "created\\n";
+        let plan = prepare(&project.0, &[create("src/new.rs", expected)]).unwrap();
+        let record = apply(&project.0, &plan).unwrap();
+        fs::write(&external, expected).unwrap();
+        fs::remove_file(&target).unwrap();
+        symlink(&external, &target).unwrap();
+
+        assert!(rollback(&project.0, &record).is_err());
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&external).unwrap(), expected);
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
     }
 
     #[test]
