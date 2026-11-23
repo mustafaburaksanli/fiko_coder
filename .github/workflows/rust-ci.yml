@@ -41,6 +41,8 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
       - name: Created-file rollback post-deletion process interruption
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_created_file_rollback_delete_requires_new_approval -- --ignored --exact
+      - name: Approved created-file recovery post-deletion process interruption
+        run: cargo test --locked --lib workspace_recovery::tests::approved_created_file_recovery_kill_after_delete_requires_fresh_approval -- --ignored --exact
       - name: Workspace rollback partial-stage interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
       - name: Workspace rollback post-rename interruption regression
@@ -96,6 +98,8 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
       - name: Created-file rollback post-deletion process interruption
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_created_file_rollback_delete_requires_new_approval -- --ignored --exact
+      - name: Approved created-file recovery post-deletion process interruption
+        run: cargo test --locked --lib workspace_recovery::tests::approved_created_file_recovery_kill_after_delete_requires_fresh_approval -- --ignored --exact
       - name: Workspace rollback partial-stage interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
       - name: Workspace rollback post-rename interruption regression
