@@ -60,16 +60,20 @@ impl Drop for Fixture {
     }
 }
 
-fn assert_cargo_tests_pass(root: &Path) {
+fn cargo_tests(root: &Path) -> std::process::Output {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
+    Command::new(cargo)
         .args(["test", "--offline"])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .arg("--target-dir")
         .arg(root.join("t"))
         .output()
-        .expect("Cargo executable must be available in Rust CI");
+        .expect("Cargo executable must be available in Rust CI")
+}
+
+fn assert_cargo_tests_pass(root: &Path) {
+    let output = cargo_tests(root);
     assert!(
         output.status.success(),
         "Cargo test failed: stdout={} stderr={}",
@@ -114,6 +118,69 @@ fn real_cargo_project_compiles_before_after_multifile_apply_and_after_rollback()
     assert!(pending.is_file());
     assert_cargo_tests_pass(root);
 
+    workspace_patch::rollback(root, &record).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
+    assert!(!root.join("src/math.rs").exists());
+    assert_eq!(
+        fs::read(root.join("protected.txt")).unwrap(),
+        protected_before
+    );
+    assert!(!pending.exists());
+    assert_cargo_tests_pass(root);
+}
+
+#[test]
+fn real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state() {
+    let project = Fixture::new();
+    let root = &project.0;
+    let protected_before = fs::read(root.join("protected.txt")).unwrap();
+    assert_cargo_tests_pass(root);
+
+    // Deliberately introduce a logical regression: the new module returns 6,
+    // while the updated test expects 7. A successful compile alone is not enough.
+    let failing = UPDATED.replace("calculate(2, 3), 6", "calculate(2, 3), 7");
+    let plan = workspace_patch::prepare(
+        root,
+        &[
+            FileChange::Edit {
+                path: "src/lib.rs".into(),
+                old_text: ORIGINAL.into(),
+                new_text: failing.clone(),
+            },
+            FileChange::Create {
+                path: "src/math.rs".into(),
+                content: MATH.into(),
+            },
+        ],
+    )
+    .unwrap();
+    let record = workspace_patch::apply(root, &plan).unwrap();
+    let pending = root.join(".fiko_backups/workspace.pending.json");
+    assert!(pending.is_file());
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        failing
+    );
+    assert_eq!(fs::read_to_string(root.join("src/math.rs")).unwrap(), MATH);
+
+    let failed = cargo_tests(root);
+    assert!(
+        !failed.status.success(),
+        "Deliberate failing test unexpectedly passed: stdout={} stderr={}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let output = String::from_utf8_lossy(&failed.stdout);
+    assert!(
+        output.contains("test result: FAILED"),
+        "Expected a test assertion failure, not a compiler/linker failure: {output}"
+    );
+
+    // The public rollback API preserves the original code and protected data.
+    // This test does not claim the model/agent automatically invoked rollback.
     workspace_patch::rollback(root, &record).unwrap();
     assert_eq!(
         fs::read_to_string(root.join("src/lib.rs")).unwrap(),
