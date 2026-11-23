@@ -51,3 +51,19 @@ The shared runner checks that each manifest entry exactly matches a library test
 3. Record each platform's **actual run result on one immutable head SHA**. If audit changes trigger new CI runs, prior green runs are not evidence for the new SHA.
 4. Decide and document platform exclusions with a rationale, especially Windows PostgreSQL and live hardware-bound Qwen tests; do not label excluded work as passed.
 5. Keep PR #37 open/draft until the above evidence is complete and all required CI checks pass. No merge is authorized by this document alone.
+
+## Verified #28–#34 real-Cargo and controlled-agent test introductions
+
+The following identifiers were extracted from added test functions in the corresponding PR patches (not inferred from their PR titles). They are expected to be discovered by the normal `cargo test --locked` command, subject to final exact-name inventory and platform run validation.
+
+| PR | Test identifier in its source file |
+|---|---|
+| #28 | `real_cargo_project_compiles_before_after_multifile_apply_and_after_rollback` (`tests/real_cargo_workspace_acceptance.rs`) |
+| #29 | `real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state` (same integration suite) |
+| #30 | `real_cargo_compiler_failure_rollback_restores_a_compilable_project` (same integration suite) |
+| #31 | `workspace_agent_failed_real_cargo_test_rolls_back_all_files` (`src/agent.rs`) |
+| #32 | `workspace_agent_denied_apply_consent_preserves_all_project_files` (`src/agent.rs`) |
+| #33 | `workspace_agent_failed_candidate_then_corrected_candidate_is_verified` (`src/agent.rs`) |
+| #34 | `workspace_agent_failing_unit_test_then_corrected_candidate_passes` (`src/agent.rs`) |
+
+This establishes seven historical test introductions with source provenance, **not** proof that the named tests survived unchanged or passed on every platform. The new `scripts/test_inventory.py` enumerates currently discoverable tests and prints previously unclassified ignored library tests for review. It is run in the four-runner Rust CI matrix, but full historical parity still requires reconciling the remaining PR diffs and manually classified opt-in cases.
