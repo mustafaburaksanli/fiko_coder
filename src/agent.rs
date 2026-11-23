@@ -3179,6 +3179,21 @@ fn fail_after_removing_own_backup() {
     #[tokio::test]
     async fn workspace_agent_failed_real_cargo_test_rolls_back_all_files() {
         let root = mini_crate("agent_workspace_failed_test");
+        // Cargo.lock must exist before the verification fingerprint is captured.
+        // Otherwise Cargo's first run creates a new project file after apply.
+        let lock = std::process::Command::new(
+            std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+        )
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+        assert!(
+            lock.status.success(),
+            "Could not generate isolated Cargo.lock: {}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        let baseline = crate::verification::project_fingerprint(&root).unwrap();
         let original = fs::read(root.join("src/main.rs")).unwrap();
         // Check mode compiles both files without executing the new failing test.
         // Actual post-apply cargo test must fail, and host rollback must run.
@@ -3233,6 +3248,7 @@ fn fail_after_removing_own_backup() {
         assert_eq!(fs::read(root.join("src/main.rs")).unwrap(), original);
         assert!(!root.join("src/lib.rs").exists());
         assert!(!root.join(".fiko_backups/workspace.pending.json").exists());
+        assert_eq!(crate::verification::project_fingerprint(&root).unwrap(), baseline);
         remove(&root);
     }
 
