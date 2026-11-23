@@ -980,6 +980,21 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
                 return Err("Yeni dosya islem sonrasinda degismis; dosya silinmedi.".into());
             }
             fs::remove_file(&target).map_err(|e| e.to_string())?;
+            // CI-only interruption point: the target is absent, but the
+            // workspace pending marker must still require user approval.
+            #[cfg(test)]
+            if file.relative == "src/c.rs"
+                && std::env::var_os("FIKO_TEST_CREATE_ROLLBACK_AFTER_DELETE_PROJECT").is_some()
+            {
+                let mut signal =
+                    File::create(root.join(".fiko_test_create_rollback_deleted_ready"))
+                        .map_err(|e| e.to_string())?;
+                signal.write_all(b"ready").map_err(|e| e.to_string())?;
+                signal.sync_all().map_err(|e| e.to_string())?;
+                drop(signal);
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return Err("rollback child must be killed after removal".into());
+            }
             if fs::symlink_metadata(&target).is_ok() {
                 return Err("Yeni dosyanin kaldirildigi dogrulanamadi.".into());
             }
@@ -2110,6 +2125,50 @@ mod tests {
         assert!(!marker.exists());
         assert!(!root.join("src/c.rs").exists());
         assert!(stages[0].exists(), "orphan is not silently removed");
+    }
+
+    #[test]
+    #[ignore = "child process only; parent terminates after created-file deletion"]
+    fn create_rollback_child_waits_after_deletion() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CREATE_ROLLBACK_AFTER_DELETE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let record = apply(&root, &isolated_create_plan(&root)).unwrap();
+        let result = rollback(&root, &record);
+        panic!("created-file rollback child should have been killed: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "separate real OS subprocess kill regression on Windows and Linux"]
+    fn process_kill_after_created_file_rollback_delete_requires_new_approval() {
+        let project = Project::new();
+        let root = &project.0;
+        kill_create_child_after_signal(
+            root,
+            "workspace_patch::tests::create_rollback_child_waits_after_deletion",
+            "FIKO_TEST_CREATE_ROLLBACK_AFTER_DELETE_PROJECT",
+            ".fiko_test_create_rollback_deleted_ready",
+        );
+        assert!(!root.join("src/c.rs").exists());
+        let marker = root.join(".fiko_backups/workspace.pending.json");
+        assert!(marker.is_file());
+
+        let report: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(root).unwrap()).unwrap();
+        assert_eq!(report["eligible_for_review"], true);
+        assert_eq!(report["requires_explicit_user_approval"], true);
+        assert_eq!(report["files"][0]["proposed_action"], "already_absent");
+
+        let plan = prepare(root, &[create("src/later.rs", "blocked")]).unwrap();
+        assert!(apply(root, &plan).is_err());
+        assert!(!root.join("src/later.rs").exists());
+        assert!(marker.is_file());
+
+        let fingerprint = report["marker_fingerprint_sha256"].as_str().unwrap();
+        workspace_recovery::restore_after_explicit_approval(root, fingerprint).unwrap();
+        assert!(!marker.exists());
+        assert!(!root.join("src/c.rs").exists());
     }
 
     #[test]
