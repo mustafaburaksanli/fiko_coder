@@ -265,9 +265,7 @@ pub fn prepare_with_options(
                     ));
                 }
                 let full = discovery::resolve_target(&root, path)?;
-                if fs::symlink_metadata(&full).is_ok() {
-                    return Err(format!("{path}: Yeni dosya hedefi zaten mevcut."));
-                }
+                require_create_target_absent(fs::symlink_metadata(&full), path)?;
                 (full, None, content.clone())
             }
         };
@@ -282,6 +280,21 @@ pub fn prepare_with_options(
     let plan = WorkspacePlan { files };
     revalidate(&root, &plan)?;
     Ok(plan)
+}
+
+/// A create plan may proceed only when the destination is confirmed absent.
+/// Permission or I/O errors are not proof of an available destination.
+fn require_create_target_absent(
+    metadata: std::io::Result<fs::Metadata>,
+    relative: &str,
+) -> Result<(), String> {
+    match metadata {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "{relative}: Yeni dosya hedefi denetlenemedi: {error}"
+        )),
+        Ok(_) => Err(format!("{relative}: Yeni dosya hedefi zaten mevcut.")),
+    }
 }
 
 fn revalidate_file(root: &Path, file: &PlannedFile) -> Result<(), String> {
@@ -1571,6 +1584,28 @@ mod tests {
             assert!(!project.0.join("src/aa.rs").exists());
             assert!(!project.0.join("src/z.rs").exists());
         }
+    }
+
+    #[test]
+    fn create_plan_requires_confirmed_target_absence() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(
+            require_create_target_absent(Err(Error::from(ErrorKind::NotFound)), "src/new.rs")
+                .is_ok()
+        );
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            let error =
+                require_create_target_absent(Err(Error::from(kind)), "src/new.rs").unwrap_err();
+            assert!(error.contains("denetlenemedi"), "{error}");
+        }
+        let project = Project::new();
+        let target = project.0.join("src/c.rs");
+        assert!(require_create_target_absent(fs::symlink_metadata(&target), "src/c.rs").is_ok());
+        fs::write(&target, "taken").unwrap();
+        let error =
+            require_create_target_absent(fs::symlink_metadata(&target), "src/c.rs").unwrap_err();
+        assert!(error.contains("zaten mevcut"), "{error}");
     }
 
     #[test]
