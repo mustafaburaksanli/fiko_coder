@@ -49,7 +49,7 @@ The shared runner checks that each manifest entry exactly matches a library test
 
 The Linux CI inventory for commit `35c6e79` discovered **441 distinct test identifiers**, including **44 ignored/opt-in** entries (32 ignored library tests). These are *test identifiers*, not a count of GitHub Actions jobs or independently executed tests.
 
-We identified all 44 opt-in entries and added explicit classifications:
+We identified all 44 opt-in entries on Unix and added explicit classifications. On Windows, **42** of these exist: the two symlink helper fixtures `workspace_patch::tests::created_file_rollback_late_symlink_swap_child` and `workspace_recovery::tests::created_recovery_symlink_swap_child` are `#[cfg(unix)]` and intentionally do not compile on Windows. The inventory applies this narrow architecture-aware exception, but treats all other missing entries as failures:
 
 | Classification | Count | Manifest | Execution policy |
 |---|---:|---|---|
@@ -57,7 +57,7 @@ We identified all 44 opt-in entries and added explicit classifications:
 | Child-only subprocess fixtures | 20 | `ci/ignored-subprocess-helpers.txt` | Never run as independent ignored tests; invoked and controlled by parent tests |
 | PostgreSQL integration and controlled-model agent tests | 13 | `ci/ignored-postgres-tests.txt` | Only the isolated PostgreSQL CI workflow on Linux and both macOS architectures; Windows is not tested |
 
-`scripts/test_inventory.py` now checks **exact set equality** between discovered ignored tests and the disjoint union of the three manifest sets, and verifies the library-test subset separately. Any newly added or missing ignored test fails CI on the four Rust platforms until classified. A child helper is a test-harness entrypoint, **not an additional independently validated regression**. These classifications were inferred from test names and historical source comments; exact parent-child invocation traceability still warrants a separate audit. None of this implies real-Qwen model evaluation.
+`scripts/test_inventory.py` now checks **exact set equality** between discovered ignored tests and the disjoint union of the three manifest sets (minus only the two source-confirmed Unix-only helpers on Windows), and verifies the library-test subset separately. Any newly added or missing ignored test fails CI on the four Rust platforms until classified. A child helper is a test-harness entrypoint, **not an additional independently validated regression**. These classifications were inferred from test names and historical source comments; exact parent-child invocation traceability still warrants a separate audit. None of this implies real-Qwen model evaluation.
 
 ## Remaining blockers before claiming full historical parity
 
