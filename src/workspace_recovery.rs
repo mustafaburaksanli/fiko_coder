@@ -814,6 +814,35 @@ pub fn restore_after_explicit_approval(
                 stage_original_and_replace(&root, step, handle, &opened, fingerprint)?;
             }
             "remove_created_candidate" => {
+                // A final type and content recheck narrows, but does not
+                // eliminate, the race before deleting a created file.
+                #[cfg(all(test, unix))]
+                if step.relative == "src/new.rs"
+                    && std::env::var_os("FIKO_TEST_RECOVERY_CREATE_SYMLINK_RACE").is_some()
+                {
+                    use std::os::unix::fs::symlink;
+                    let external = root.join("external_created_recovery.rs");
+                    fs::write(&external, b"new\n").map_err(|e| e.to_string())?;
+                    fs::remove_file(&step.target).map_err(|e| e.to_string())?;
+                    symlink(&external, &step.target).map_err(|e| e.to_string())?;
+                }
+                let meta = fs::symlink_metadata(&step.target)
+                    .map_err(|e| format!("{}: {e}", step.relative))?;
+                if !meta.is_file() || is_link(&meta) || meta.len() > MAX_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "{}: Silinecek aday normal dosya degil; kayit korundu.",
+                        step.relative
+                    ));
+                }
+                if discovery::resolve_existing(&root, &step.relative)? != step.target
+                    || file_state(&root, &step.relative, original, &step.updated_sha256)
+                        != "updated"
+                {
+                    return Err(format!(
+                        "{}: Silinecek aday degisti; kayit korundu.",
+                        step.relative
+                    ));
+                }
                 fs::remove_file(&step.target).map_err(|e| format!("{}: {e}", step.relative))?;
             }
             "already_original" | "already_absent" => {}
@@ -1478,6 +1507,61 @@ mod tests {
         restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
         assert!(!project.0.join("src/new.rs").exists());
         assert!(!project.0.join(".fiko_backups").join(MARKER).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "isolated child process only"]
+    fn created_recovery_symlink_swap_child() {
+        let Some(root) = std::env::var_os("FIKO_TEST_RECOVERY_CREATE_SYMLINK_RACE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let plan = workspace_patch::prepare(
+            &root,
+            &[FileChange::Create {
+                path: "src/new.rs".into(),
+                content: "new\n".into(),
+            }],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&root, &plan).unwrap();
+        let fingerprint = approved_fingerprint(&root);
+        assert!(restore_after_explicit_approval(&root, &fingerprint).is_err());
+        assert!(
+            fs::symlink_metadata(root.join("src/new.rs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(root.join("external_created_recovery.rs")).unwrap(),
+            b"new\n"
+        );
+        assert!(root.join(".fiko_backups").join(MARKER).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_file_recovery_rejects_same_content_symlink_at_final_delete_gate() {
+        use std::process::Command;
+
+        let project = Fixture::new("recovery_created_symlink_race");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_recovery::tests::created_recovery_symlink_swap_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_RECOVERY_CREATE_SYMLINK_RACE", &project.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated recovery test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
