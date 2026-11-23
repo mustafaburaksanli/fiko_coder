@@ -101,17 +101,29 @@ fn real_cargo_project_compiles_before_after_multifile_apply_and_after_rollback()
     assert_eq!(plan.files.len(), 2);
     let record = workspace_patch::apply(root, &plan).unwrap();
 
-    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), UPDATED);
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        UPDATED
+    );
     assert_eq!(fs::read_to_string(root.join("src/math.rs")).unwrap(), MATH);
-    assert_eq!(fs::read(root.join("protected.txt")).unwrap(), protected_before);
+    assert_eq!(
+        fs::read(root.join("protected.txt")).unwrap(),
+        protected_before
+    );
     let pending = root.join(".fiko_backups/workspace.pending.json");
     assert!(pending.is_file());
     assert_cargo_tests_pass(root);
 
     workspace_patch::rollback(root, &record).unwrap();
-    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), ORIGINAL);
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
     assert!(!root.join("src/math.rs").exists());
-    assert_eq!(fs::read(root.join("protected.txt")).unwrap(), protected_before);
+    assert_eq!(
+        fs::read(root.join("protected.txt")).unwrap(),
+        protected_before
+    );
     assert!(!pending.exists());
     assert_cargo_tests_pass(root);
 }
