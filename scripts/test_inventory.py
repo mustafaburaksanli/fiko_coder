@@ -15,6 +15,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "ci" / "ignored-regressions.txt"
+HISTORICAL = ROOT / "ci" / "historical-acceptance-tests.txt"
 
 
 def discover(*cargo_args: str, ignored: bool = False) -> list[str]:
@@ -33,15 +34,15 @@ def discover(*cargo_args: str, ignored: bool = False) -> list[str]:
     )
 
 
-def crash_manifest() -> list[str]:
-    if not MANIFEST.is_file():
-        raise RuntimeError(f"Missing crash-test manifest: {MANIFEST}")
+def read_manifest(path: Path) -> list[str]:
+    if not path.is_file():
+        raise RuntimeError(f"Missing test manifest: {path}")
     names = [
-        line.strip() for line in MANIFEST.read_text(encoding="utf-8").splitlines()
+        line.strip() for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
     if not names or len(names) != len(set(names)):
-        raise RuntimeError("Crash-test manifest is empty or has duplicate names")
+        raise RuntimeError(f"Test manifest is empty or has duplicate names: {path}")
     return names
 
 
@@ -53,7 +54,12 @@ def main() -> int:
     all_tests = discover()
     ignored_tests = discover(ignored=True)
     ignored_lib_tests = discover("--lib", ignored=True)
-    manifest = crash_manifest()
+    manifest = read_manifest(MANIFEST)
+    historical = read_manifest(HISTORICAL)
+
+    missing_historical = sorted(set(historical) - set(all_tests))
+    if missing_historical:
+        raise RuntimeError(f"Historical acceptance tests absent from discovered test list: {missing_historical}")
 
     missing = sorted(set(manifest) - set(ignored_lib_tests))
     if missing:
@@ -69,6 +75,7 @@ def main() -> int:
         "ignored_discovered_tests": ignored_tests,
         "ignored_library_tests": ignored_lib_tests,
         "crash_manifest_tests": sorted(manifest),
+        "historical_acceptance_tests": sorted(historical),
         "other_ignored_library_tests_for_review": other_ignored_lib,
         "counts": {
             "all_test_list_entries": len(all_tests),
@@ -76,6 +83,7 @@ def main() -> int:
             "ignored_list_entries": len(ignored_tests),
             "ignored_library_unique_identifiers": len(set(ignored_lib_tests)),
             "dedicated_crash_manifest": len(manifest),
+            "historical_acceptance_manifest": len(historical),
             "other_ignored_library_for_review": len(other_ignored_lib),
         },
     }
