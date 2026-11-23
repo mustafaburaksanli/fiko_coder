@@ -82,3 +82,9 @@ The following identifiers were extracted from added test functions in the corres
 | #34 | `workspace_agent_failing_unit_test_then_corrected_candidate_passes` (`src/agent.rs`) |
 
 This establishes seven historical test introductions with source provenance, **not** proof that the named tests survived unchanged or passed on every platform. The `ci/historical-acceptance-tests.txt` manifest now pins these seven exact libtest identifiers, and `scripts/test_inventory.py` fails if one is missing from the discovered test list. The inventory also lists ignored library tests for manual classification and runs in the four-runner Rust CI matrix. This establishes automated *presence* of these seven cases, not their independent historical execution at every old commit. Full parity still requires reconciling all other PR diffs and manually classified opt-in cases.
+
+## Expanded historical regression guard (current PR work)
+
+Beyond the 7 Cargo/controlled-agent tests and 11 isolated crash parent regressions, `ci/historical-acceptance-tests.txt` now also tracks **30** normal file-integrity and recovery test identifiers introduced across PR #4–#27, giving **37 protected historical normal test identifiers** in total. These 30 were checked against Rust function definitions on the current branch. Five are explicitly `#[cfg(unix)]` tests (listed in `ci/unix-only-historical-tests.txt`): Linux and macOS must expose them, while Windows is exempt. `scripts/test_inventory.py` detects their absence where required. This *presence guarantee* is distinct from evidence of test execution and from exhaustive PR #1–#36 provenance.
+
+The current CI run after these changes has not yet been signed off. Previous runs are not sufficient evidence for this commit.
