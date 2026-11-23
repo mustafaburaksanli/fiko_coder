@@ -47,6 +47,22 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
       - name: Workspace rollback post-rename interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_rollback_rename_keeps_original_and_recoverable_marker -- --ignored --exact
+      - name: Live-Qwen acceptance script offline smoke (no model or approvals)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = Join-Path $env:RUNNER_TEMP ('fiko_live_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+          & ./scripts/live_qwen_acceptance.ps1 -Mode prepare -FixtureDir $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance fixture setup failed' }
+          $math = Join-Path $fixture 'src/math.rs'
+          $newline = [Environment]::NewLine
+          $add = $newline + 'pub fn quintuple(n: i32) -> i32 { n * 5 }' + $newline
+          $add += '#[test] fn test_quintuple() { assert_eq!(quintuple(3), 15); }' + $newline
+          [System.IO.File]::AppendAllText($math, $add)
+          & ./scripts/live_qwen_acceptance.ps1 -Mode evaluate -FixtureDir $fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance measurement positive fixture failed' }
+          $result = Get-Content -LiteralPath ($fixture + '.result.json') -Raw | ConvertFrom-Json
+          if ($result.pass -ne $true) { throw 'Acceptance result must be successful' }
       - name: Stabilization stress (20 parallel + 20 serial runs)
         shell: pwsh
         run: |
