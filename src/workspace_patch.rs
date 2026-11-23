@@ -914,8 +914,7 @@ fn restore_existing_staged_rollback(
     if file.relative == "src/a.rs"
         && std::env::var_os("FIKO_TEST_ROLLBACK_STAGE_TAMPER_PROJECT").is_some()
     {
-        fs::write(&stage_path, vec![b'x'; verified_backup.len()])
-            .map_err(|e| e.to_string())?;
+        fs::write(&stage_path, vec![b'x'; verified_backup.len()]).map_err(|e| e.to_string())?;
     }
     check_staged()?;
     fs::rename(&stage_path, &target)
@@ -2241,7 +2240,10 @@ mod tests {
         let root = PathBuf::from(root).canonicalize().unwrap();
         let record = apply(&root, &prepare(&root, &[edit_a()]).unwrap()).unwrap();
         let error = rollback(&root, &record).unwrap_err();
-        assert!(error.contains("Staged rollback backup is untrusted"), "{error}");
+        assert!(
+            error.contains("Staged rollback backup is untrusted"),
+            "{error}"
+        );
         assert_eq!(
             fs::read_to_string(root.join("src/a.rs")).unwrap(),
             "pub fn a() -> u8 { 3 }\n"
