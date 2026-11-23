@@ -114,7 +114,17 @@ An existing source file edited by a multi-file workspace plan is no longer immed
 
 On a hard process kill **during partial stage writing**, the source remains untouched; the hidden partial staged file can be left behind for manual inspection, and the pending marker blocks subsequent writes until user-approved recovery. Windows and Linux CI explicitly terminate a child process halfway through staging to verify this boundary. Orphaned `.fiko_apply_stage_*.tmp` files are not trusted recovery backups.
 
-**Important scope:** Newly created targets still use a direct `create_new` write, and ordinary workspace rollback still uses an in-place rewrite for existing targets. Those remain separate crash windows requiring further work. The staged edit improvement is neither a whole-workspace transaction, a power-loss guarantee, nor protection against noncooperating writers that race filesystem paths.
+**Important scope (updated in the next section):** Newly created targets are now staged before publication; ordinary workspace rollback still uses an in-place rewrite for existing targets and requires further hardening. The staged edit improvement is neither a whole-workspace transaction, a power-loss guarantee, nor protection against noncooperating writers that race filesystem paths.
+
+## Staged new-file publication (v1.3 experimental)
+
+Workspace `Create` operations stage the complete new content in a hidden sibling `.fiko_create_stage_*.tmp` file and sync and verify the bytes before publishing. FIKO uses a same-filesystem **hard link** to publish the verified staged file to the final destination. Unlike a rename, hard-link creation fails rather than replacing a target that another process created at the destination. Unsupported hard-link filesystems fail closed; there is no fallback to an unsafe direct write.
+
+CI kills a real process midway through staging and after final-file publication but before stage cleanup. Before publication, the requested target remains absent and the pending marker remains. After publication, the final file is complete and the pending marker remains. A freshly approved recovery resumes by keeping the target absent or removing the candidate as appropriate. Orphan stage paths are retained as evidence, not trusted recovery input.
+
+A separate subprocess regression inserts a conflicting external file immediately before publication and verifies the candidate is not clobbered. The pending marker stays unresolved for manual review rather than treating the external file as a FIKO-created candidate.
+
+**Scope/limitations:** This is cooperative-workspace safety, not a multi-file atomic transaction or guarantee against a power outage, unsynced directory entries, or hostile filesystem races. Normal rollback of previously edited files still writes back in place, and remains a separate hardening task.
 
 ## Limitations
 
