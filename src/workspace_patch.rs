@@ -290,7 +290,9 @@ fn require_create_target_absent(
 ) -> Result<(), String> {
     match metadata {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("{relative}: Yeni dosya hedefi denetlenemedi: {error}")),
+        Err(error) => Err(format!(
+            "{relative}: Yeni dosya hedefi denetlenemedi: {error}"
+        )),
         Ok(_) => Err(format!("{relative}: Yeni dosya hedefi zaten mevcut.")),
     }
 }
