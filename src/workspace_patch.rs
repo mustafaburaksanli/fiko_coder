@@ -993,9 +993,7 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
                 return Err("Yeni dosya yolu geri alma oncesinde degisti.".into());
             }
             let latest_meta = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
-            if !latest_meta.is_file()
-                || is_link(&latest_meta)
-                || read_bytes(&target)? != *expected
+            if !latest_meta.is_file() || is_link(&latest_meta) || read_bytes(&target)? != *expected
             {
                 return Err("Yeni dosya silinmeden once degisti; kayit korundu.".into());
             }
@@ -1619,13 +1617,9 @@ mod tests {
         let record = apply(&root, &plan).unwrap();
         assert!(rollback(&root, &record).is_err());
         assert!(root.join("src/c.rs").is_dir());
-        assert!(
-            root.join(".fiko_backups/workspace.pending.json")
-                .is_file()
-        );
+        assert!(root.join(".fiko_backups/workspace.pending.json").is_file());
         let preview: serde_json::Value =
-            serde_json::from_str(&workspace_recovery::restoration_preview(&root).unwrap())
-                .unwrap();
+            serde_json::from_str(&workspace_recovery::restoration_preview(&root).unwrap()).unwrap();
         assert_eq!(preview["eligible_for_review"], false);
         assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
     }
