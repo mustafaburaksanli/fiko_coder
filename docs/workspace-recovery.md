@@ -108,6 +108,14 @@ The OS releases the lock handle when the owning process terminates, including a 
 
 The lock coordinates **cooperating FIKO callers only**. External editors, malware, filesystem path substitution and all other programs that ignore the lock can still race source reads and writes. It is not a sandbox, an exclusive OS-wide project lock, or an atomic multi-file transaction. Standalone single-file rollback now also acquires the cooperative lock, but independent post-write verification is not yet covered by a continuous lock lifetime.
 
+## Staged workspace edit apply (v1.3 experimental)
+
+An existing source file edited by a multi-file workspace plan is no longer immediately truncated. FIKO creates a new hidden sibling `.fiko_apply_stage_*.tmp` file, writes and syncs the updated bytes, preserves original source permissions, verifies the staged bytes, rechecks the original source, then attempts filesystem rename over that existing source. The durable workspace pending marker exists before staging begins. The in-memory record tracks the replaced target immediately after rename so ordinary subsequent failures can trigger guarded rollback.
+
+On a hard process kill **during partial stage writing**, the source remains untouched; the hidden partial staged file can be left behind for manual inspection, and the pending marker blocks subsequent writes until user-approved recovery. Windows and Linux CI explicitly terminate a child process halfway through staging to verify this boundary. Orphaned `.fiko_apply_stage_*.tmp` files are not trusted recovery backups.
+
+**Important scope:** Newly created targets still use a direct `create_new` write, and ordinary workspace rollback still uses an in-place rewrite for existing targets. Those remain separate crash windows requiring further work. The staged edit improvement is neither a whole-workspace transaction, a power-loss guarantee, nor protection against noncooperating writers that race filesystem paths.
+
 ## Limitations
 
 - A missing marker does not establish earlier crash-atomicity or successful verification.

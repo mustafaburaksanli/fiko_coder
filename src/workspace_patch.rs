@@ -436,7 +436,7 @@ fn apply_with(
     for index in 0..record.files.len() {
         let result = before_write(index, &record.files[index].file)
             .and_then(|_| revalidate_file(&root, &record.files[index].file))
-            .and_then(|_| write_file(&mut record.files[index]));
+            .and_then(|_| write_file(&root, &mut record.files[index]));
         if let Err(error) = result {
             // The apply path already owns the OS lock; do not lock recursively.
             let recovery = rollback_without_operation_lock(&root, &record);
@@ -457,7 +457,132 @@ fn apply_with(
     Ok(record)
 }
 
-fn write_file(record: &mut RecordedFile) -> Result<(), String> {
+/// For EXISTING files, stage the updated content on the same filesystem
+/// before replacing the approved source. A hard kill during the staged write
+/// cannot truncate the existing source. New-file creation remains a separate
+/// (currently non-atomic) path.
+fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let file = &record.file;
+    if file.original.is_none() {
+        return Err("Staged edit requires an existing source.".into());
+    }
+    revalidate_file(root, file)?;
+    let current_metadata = fs::symlink_metadata(&file.path).map_err(|e| e.to_string())?;
+    if !current_metadata.is_file() || is_link(&current_metadata) {
+        return Err(format!("{}: Source is not a normal file.", file.relative));
+    }
+
+    let parent = file
+        .path
+        .parent()
+        .ok_or("Source parent directory is missing.")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mut created = None;
+    for attempt in 0..16 {
+        let stage_path = parent.join(format!(
+            ".fiko_apply_stage_{}_{}_{}.tmp",
+            std::process::id(),
+            stamp,
+            attempt
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+        {
+            Ok(stage_file) => {
+                created = Some((stage_file, stage_path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: Staging failed: {e}", file.relative)),
+        }
+    }
+    let (stage_handle, stage_path) = created.ok_or("No available staged edit filename.")?;
+    // Guard must be declared before staged handle to allow Windows cleanup.
+    struct StageCleanup(Option<PathBuf>);
+    impl Drop for StageCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = StageCleanup(Some(stage_path.clone()));
+    let mut staged = stage_handle;
+    let bytes = file.updated.as_bytes();
+
+    // Test-only child waits while an incomplete staged file exists. This
+    // branch is absent from production builds.
+    #[cfg(test)]
+    if file.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_APPLY_PARTIAL_STAGE_PROJECT").is_some()
+    {
+        let partial_len = (bytes.len() / 2).max(1);
+        staged
+            .write_all(&bytes[..partial_len])
+            .map_err(|e| e.to_string())?;
+        staged.sync_all().map_err(|e| e.to_string())?;
+        let signal = root.join(".fiko_test_apply_partial_stage_ready");
+        let mut ready = File::create(signal).map_err(|e| e.to_string())?;
+        ready.write_all(b"ready").map_err(|e| e.to_string())?;
+        ready.sync_all().map_err(|e| e.to_string())?;
+        drop(ready);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Partial-stage apply child should have been killed.".into());
+    }
+
+    staged.write_all(bytes).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    fs::set_permissions(&stage_path, current_metadata.permissions()).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    drop(staged);
+
+    let stage_metadata = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+    if !stage_metadata.is_file()
+        || is_link(&stage_metadata)
+        || stage_metadata.len() != bytes.len() as u64
+    {
+        return Err(format!("{}: Staged file metadata changed.", file.relative));
+    }
+    if read_bytes(&stage_path)? != bytes {
+        return Err(format!(
+            "{}: Staged file contents do not match.",
+            file.relative
+        ));
+    }
+    revalidate_file(root, file)?;
+    // Recheck the staged copy as late as possible before replacement.
+    if read_bytes(&stage_path)? != bytes {
+        return Err(format!(
+            "{}: Staged file changed before replacement.",
+            file.relative
+        ));
+    }
+    fs::rename(&stage_path, &file.path)
+        .map_err(|e| format!("{}: Could not replace source: {e}", file.relative))?;
+    cleanup.0 = None;
+    // Important: record the mutation before post-write checks so failure can
+    // safely enter rollback. A killed process still leaves a pending marker.
+    record.written = Some(bytes.to_vec());
+    if read_bytes(&file.path)? != bytes {
+        return Err(format!(
+            "{}: Source did not match staged contents.",
+            file.relative
+        ));
+    }
+    Ok(())
+}
+
+fn write_file(root: &Path, record: &mut RecordedFile) -> Result<(), String> {
+    if record.file.original.is_some() {
+        return write_existing_staged(root, record);
+    }
     let file = &record.file;
     let mut options = OpenOptions::new();
     options.write(true);
@@ -1369,6 +1494,148 @@ mod tests {
         assert!(blocked.restored);
         assert!(blocked.message.contains("belirsiz"), "{blocked}");
         assert!(!project.0.join("src/later.rs").exists());
+    }
+
+    #[test]
+    #[ignore = "invoked only by the real process-kill parent test"]
+    fn staged_apply_child_waits_halfway_through_write() {
+        let Some(root) = std::env::var_os("FIKO_TEST_APPLY_PARTIAL_STAGE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let plan = prepare(
+            &root,
+            &[edit(
+                "src/a.rs",
+                "pub fn a() -> u8 { 1 }",
+                "pub fn a() -> u8 { 3 }",
+            )],
+        )
+        .unwrap();
+        let result = apply(&root, &plan);
+        panic!("staged apply child escaped forced termination: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "explicitly executed in Windows/Linux CI"]
+    fn process_kill_during_partial_staged_apply_preserves_original_source() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let project = Project::new();
+        let original = fs::read(project.0.join("src/a.rs")).unwrap();
+        let ready = project.0.join(".fiko_test_apply_partial_stage_ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::staged_apply_child_waits_halfway_through_write",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_APPLY_PARTIAL_STAGE_PROJECT", &project.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to launch staged apply child");
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut signaled = false;
+        while Instant::now() < deadline {
+            if fs::read(&ready).ok().as_deref() == Some(&b"ready"[..]) {
+                signaled = true;
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "staged apply child finished early ({status}): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !signaled {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "staged apply child did not reach halfway signal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child
+            .kill()
+            .expect("unable to terminate staged apply child");
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+
+        assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), original);
+        let marker = project.0.join(".fiko_backups/workspace.pending.json");
+        assert!(
+            marker.is_file(),
+            "interrupted apply must retain pending marker"
+        );
+        let orphan_stages: Vec<_> = fs::read_dir(project.0.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_apply_stage_")
+            })
+            .collect();
+        assert_eq!(orphan_stages.len(), 1);
+        let staged_bytes = fs::read(orphan_stages[0].path()).unwrap();
+        let updated = b"pub fn a() -> u8 { 3 }\n";
+        assert_eq!(
+            staged_bytes.as_slice(),
+            &updated[..(updated.len() / 2).max(1)]
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(&project.0).unwrap())
+                .unwrap();
+        assert_eq!(report["eligible_for_review"], true);
+        assert_eq!(report["files"][0]["proposed_action"], "already_original");
+        let fingerprint = report["marker_fingerprint_sha256"].as_str().unwrap();
+        workspace_recovery::restore_after_explicit_approval(&project.0, fingerprint).unwrap();
+        assert_eq!(fs::read(project.0.join("src/a.rs")).unwrap(), original);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_apply_preserves_original_permissions_and_external_hardlink_content() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let project = Project::new();
+        let source = project.0.join("src/a.rs");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let outside = project.0.parent().unwrap().join(format!(
+            "fiko_staged_apply_hardlink_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::hard_link(&source, &outside).unwrap();
+        let original = fs::read(&outside).unwrap();
+        let plan = prepare(&project.0, &[edit_a()]).unwrap();
+        let record = apply(&project.0, &plan).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "pub fn a() -> u8 { 3 }\n"
+        );
+        rollback(&project.0, &record).unwrap();
+        let _ = fs::remove_file(&outside);
+        assert_eq!(fs::read(&source).unwrap(), original);
     }
 
     #[test]
