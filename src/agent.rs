@@ -3448,7 +3448,11 @@ fn fail_after_removing_own_backup() {
             .collect();
         assert_eq!(results.len(), 3);
         assert!(results[0].starts_with("VERIFY_FAILED"), "{}", results[0]);
-        assert!(results[0].contains("cargo test"), "{}", results[0]);
+        assert!(
+            results[0].contains("test arithmetic ... FAILED"),
+            "{}",
+            results[0]
+        );
         assert!(results[1].starts_with("VERIFY_OK"), "{}", results[1]);
         assert!(results[2].starts_with("PATCH_VERIFIED"), "{}", results[2]);
         assert_ne!(fs::read(root.join("src/main.rs")).unwrap(), original);
