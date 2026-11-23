@@ -114,7 +114,7 @@ An existing source file edited by a multi-file workspace plan is no longer immed
 
 On a hard process kill **during partial stage writing**, the source remains untouched; the hidden partial staged file can be left behind for manual inspection, and the pending marker blocks subsequent writes until user-approved recovery. Windows and Linux CI explicitly terminate a child process halfway through staging to verify this boundary. Orphaned `.fiko_apply_stage_*.tmp` files are not trusted recovery backups.
 
-**Important scope (updated in the next section):** Newly created targets are now staged before publication; ordinary workspace rollback still uses an in-place rewrite for existing targets and requires further hardening. The staged edit improvement is neither a whole-workspace transaction, a power-loss guarantee, nor protection against noncooperating writers that race filesystem paths.
+**Important scope (updated in later sections):** Newly created targets are staged before publication and ordinary rollback of existing targets now also stages verified original bytes. They are separate operations and are not one atomic transaction. The staged edit improvement is neither a whole-workspace transaction, a power-loss guarantee, nor protection against noncooperating writers that race filesystem paths.
 
 ## Staged new-file publication (v1.3 experimental)
 
@@ -124,7 +124,17 @@ CI kills a real process midway through staging and after final-file publication 
 
 A separate subprocess regression inserts a conflicting external file immediately before publication and verifies the candidate is not clobbered. The pending marker stays unresolved for manual review rather than treating the external file as a FIKO-created candidate.
 
-**Scope/limitations:** This is cooperative-workspace safety, not a multi-file atomic transaction or guarantee against a power outage, unsynced directory entries, or hostile filesystem races. Normal rollback of previously edited files still writes back in place, and remains a separate hardening task.
+**Scope/limitations:** This is cooperative-workspace safety, not a multi-file atomic transaction or guarantee against a power outage, unsynced directory entries, or hostile filesystem races. Normal rollback of existing files is staged separately as described below.
+
+## Staged normal workspace rollback (v1.3 experimental)
+
+When an already-edited file must be rolled back, FIKO now validates the recorded backup and existing candidate before creating a new same-directory `.fiko_rollback_stage_*.tmp` with `create_new`. It fully writes, syncs, preserves current source permissions and re-reads the backup contents before rechecking the candidate's path, file type and expected current bytes. Only after these checks does it replace the target via `rename`, retaining the existing pending marker until all rollback steps are verified.
+
+Windows/Linux CI kills a real rollback child process **during partial staged writing** (the updated candidate must stay intact) and **after replacement before the marker is cleared** (the original file is present but the marker still requires explicit recovery). Both paths are reviewed using the read-only recovery preview and then a fresh explicit fingerprint-approved restoration. Partial orphan staged files are never trusted as backups; they may remain after an abrupt kill.
+
+A separate isolated test modifies the candidate between staging and replacement: the operation must refuse to clobber external changes and retain the marker for manual review. On Unix, tests check permission preservation and that an outside hardlink of the updated candidate is not modified by rollback.
+
+This remains a *per-file staged replace*, not an all-or-nothing workspace transaction or power-loss durability claim. An external writer can still race the final verification, and filesystem rename behavior varies between platforms. Newly-created-file rollback removes its candidate only after checking bytes, and has its own remove/crash semantics.
 
 ## Limitations
 
