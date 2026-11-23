@@ -2094,6 +2094,191 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "child process only: caller must terminate it"]
+    fn rollback_child_waits_mid_stage() {
+        let Some(root) = std::env::var_os("FIKO_TEST_ROLLBACK_PARTIAL_STAGE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let record = apply(&root, &prepare(&root, &[edit_a()]).unwrap()).unwrap();
+        let result = rollback(&root, &record);
+        panic!("rollback child should have been killed halfway: {result:?}");
+    }
+
+    #[test]
+    #[ignore = "child process only: caller must terminate it"]
+    fn rollback_child_waits_after_replacement() {
+        let Some(root) = std::env::var_os("FIKO_TEST_ROLLBACK_AFTER_REPLACE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let record = apply(&root, &prepare(&root, &[edit_a()]).unwrap()).unwrap();
+        let result = rollback(&root, &record);
+        panic!("rollback child should have been killed after rename: {result:?}");
+    }
+
+    fn rollback_stage_orphans(root: &Path) -> Vec<PathBuf> {
+        fs::read_dir(root.join("src"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fiko_rollback_stage_")
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "explicit real-process-kill test in Windows/Linux CI"]
+    fn process_kill_mid_rollback_stage_preserves_updated_target_and_marker() {
+        let project = Project::new();
+        let root = &project.0;
+        kill_create_child_after_signal(
+            root,
+            "workspace_patch::tests::rollback_child_waits_mid_stage",
+            "FIKO_TEST_ROLLBACK_PARTIAL_STAGE_PROJECT",
+            ".fiko_test_rollback_partial_ready",
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() -> u8 { 3 }\n"
+        );
+        let marker = root.join(".fiko_backups/workspace.pending.json");
+        assert!(marker.is_file());
+        let stages = rollback_stage_orphans(root);
+        assert_eq!(stages.len(), 1);
+        let original = b"pub fn a() -> u8 { 1 }\n";
+        let partial = fs::read(&stages[0]).unwrap();
+        assert_eq!(partial.as_slice(), &original[..(original.len() / 2).max(1)]);
+        let preview: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(root).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(
+            preview["files"][0]["proposed_action"],
+            "restore_original_from_backup"
+        );
+        workspace_recovery::restore_after_explicit_approval(
+            root,
+            preview["marker_fingerprint_sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("src/a.rs")).unwrap(), original);
+        assert!(!marker.exists());
+        assert!(stages[0].exists());
+    }
+
+    #[test]
+    #[ignore = "explicit real-process-kill test in Windows/Linux CI"]
+    fn process_kill_after_rollback_rename_keeps_original_and_recoverable_marker() {
+        let project = Project::new();
+        let root = &project.0;
+        kill_create_child_after_signal(
+            root,
+            "workspace_patch::tests::rollback_child_waits_after_replacement",
+            "FIKO_TEST_ROLLBACK_AFTER_REPLACE_PROJECT",
+            ".fiko_test_rollback_replaced_ready",
+        );
+        let original = b"pub fn a() -> u8 { 1 }\n";
+        assert_eq!(fs::read(root.join("src/a.rs")).unwrap(), original);
+        let marker = root.join(".fiko_backups/workspace.pending.json");
+        assert!(marker.is_file());
+        assert!(rollback_stage_orphans(root).is_empty());
+        let preview: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(root).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_original");
+        workspace_recovery::restore_after_explicit_approval(
+            root,
+            preview["marker_fingerprint_sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!marker.exists());
+        assert_eq!(fs::read(root.join("src/a.rs")).unwrap(), original);
+    }
+
+    #[test]
+    #[ignore = "isolated child process only"]
+    fn rollback_child_rejects_external_writer_before_rename() {
+        let Some(root) = std::env::var_os("FIKO_TEST_ROLLBACK_EXTERNAL_RACE_PROJECT") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let record = apply(&root, &prepare(&root, &[edit_a()]).unwrap()).unwrap();
+        let err = rollback(&root, &record).unwrap_err();
+        assert!(err.contains("External target change"), "{err}");
+        assert_eq!(
+            fs::read(root.join("src/a.rs")).unwrap(),
+            b"external writer after staging"
+        );
+        assert!(root.join(".fiko_backups/workspace.pending.json").exists());
+        assert!(rollback_stage_orphans(&root).is_empty());
+    }
+
+    #[test]
+    fn staged_rollback_detects_external_target_replacement_without_overwriting() {
+        use std::process::Command;
+        let project = Project::new();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::rollback_child_rejects_external_writer_before_rename",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_ROLLBACK_EXTERNAL_RACE_PROJECT", &project.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "external race child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(project.0.join("src/a.rs")).unwrap(),
+            b"external writer after staging"
+        );
+        let preview: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(&project.0).unwrap())
+                .unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_rollback_preserves_mode_and_does_not_mutate_external_hardlink() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let project = Project::new();
+        let root = &project.0;
+        let source = root.join("src/a.rs");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let record = apply(root, &prepare(root, &[edit_a()]).unwrap()).unwrap();
+        let external = root.parent().unwrap().join(format!(
+            "fiko_rollback_hardlink_{}_{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::hard_link(&source, &external).unwrap();
+        let updated = fs::read(&source).unwrap();
+        rollback(root, &record).unwrap();
+        assert_eq!(fs::read(&external).unwrap(), updated);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "pub fn a() -> u8 { 1 }\n"
+        );
+        fs::remove_file(&external).unwrap();
+    }
+
+    #[test]
     fn bos_yeni_dosyanin_diffi_ve_yokluk_geri_almasi_acik_olmali() {
         let project = Project::new();
         let plan = prepare(&project.0, &[create("src/empty.rs", "")]).unwrap();
