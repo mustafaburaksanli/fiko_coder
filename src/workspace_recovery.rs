@@ -120,6 +120,14 @@ pub struct WorkspaceOperationGuard {
     _locked_file: File,
 }
 
+// Explicitly release a completed operation's advisory lock before the handle
+// closes. A hard process kill still relies on the OS closing its handles.
+impl Drop for WorkspaceOperationGuard {
+    fn drop(&mut self) {
+        let _ = self._locked_file.unlock();
+    }
+}
+
 /// Non-blocking exclusive lock. A killed process releases its OS handle; a
 /// pending marker remains separately responsible for crash recovery.
 ///
@@ -939,6 +947,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn operation_lock_can_be_reacquired_immediately_after_drop() {
+        let project = Fixture::new("lock_fast_reopen");
+        for _ in 0..64 {
+            let lock = try_lock_operation(&project.0).unwrap();
+            assert!(try_lock_operation(&project.0).is_err());
+            drop(lock);
+        }
+        try_lock_operation(&project.0).unwrap();
     }
 
     #[test]
