@@ -3184,7 +3184,7 @@ fn fail_after_removing_own_backup() {
         // Actual post-apply cargo test must fail, and host rollback must run.
         let changes = json!([
             {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": MINI_GOOD},
-            {"operation": "create", "path": "src/lib.rs", "content": "#[test]\\nfn intentional_failure() { assert_eq!(2 + 2, 5); }\\n"}
+            {"operation": "create", "path": "src/lib.rs", "content": "#[test]\nfn intentional_failure() { assert_eq!(2 + 2, 5); }\n"}
         ]);
         let (url, server) = mock_ollama(vec![
             json!({"message": {"role": "assistant", "tool_calls": [{"function": {
