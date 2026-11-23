@@ -9,6 +9,7 @@ No LLM, secret database, or unapproved workspace operation is involved.
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -32,13 +33,11 @@ def ignored_tests() -> list[str]:
     ]
     if not entries or len(entries) != len(set(entries)):
         raise RuntimeError("Regression manifest is empty or contains duplicate entries")
-    if any(" " in name or not name.endswith(("preserves_original_source", "keeps_recovery_evidence",
-        "allows_reapproved_restore", "keeps_target_and_marker_for_reapproval",
-        "preserves_target_absence_and_pending_marker", "resumes_with_explicit_approval",
-        "requires_new_approval", "requires_fresh_approval",
-        "preserves_updated_target_and_marker", "keeps_original_and_recoverable_marker",
-        "kills_child_and_resumes")) for name in entries):
-        raise RuntimeError("Unexpected or invalid ignored regression identifier")
+    if any(
+        re.fullmatch(r"(?:[a-z0-9_]+::)+[a-z0-9_]+", name) is None
+        for name in entries
+    ):
+        raise RuntimeError("Invalid Rust test identifier in crash regression manifest")
     return entries
 
 
