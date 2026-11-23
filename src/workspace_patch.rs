@@ -972,9 +972,7 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
                     // A created-file rollback may delete only the regular file
                     // that FIKO published, not a substituted link or directory.
                     if !metadata.is_file() || is_link(&metadata) {
-                        return Err(
-                            "Yeni dosyanin turu degismis; guvensiz hedef silinmedi.".into()
-                        );
+                        return Err("Yeni dosyanin turu degismis; guvensiz hedef silinmedi.".into());
                     }
                 }
             }
@@ -1536,7 +1534,12 @@ mod tests {
 
         assert!(rollback(&project.0, &record).is_err());
         assert!(target.is_dir());
-        assert!(project.0.join(".fiko_backups/workspace.pending.json").is_file());
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
     }
 
     #[cfg(unix)]
@@ -1555,9 +1558,19 @@ mod tests {
         symlink(&external, &target).unwrap();
 
         assert!(rollback(&project.0, &record).is_err());
-        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_to_string(&external).unwrap(), expected);
-        assert!(project.0.join(".fiko_backups/workspace.pending.json").is_file());
+        assert!(
+            project
+                .0
+                .join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
     }
 
     #[test]
