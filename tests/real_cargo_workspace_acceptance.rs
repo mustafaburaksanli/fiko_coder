@@ -72,6 +72,18 @@ fn cargo_tests(root: &Path) -> std::process::Output {
         .expect("Cargo executable must be available in Rust CI")
 }
 
+fn cargo_check(root: &Path) -> std::process::Output {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    Command::new(cargo)
+        .args(["check", "--offline"])
+        .arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(root.join("t"))
+        .output()
+        .expect("Cargo executable must be available in Rust CI")
+}
+
 fn assert_cargo_tests_pass(root: &Path) {
     let output = cargo_tests(root);
     assert!(
@@ -181,6 +193,60 @@ fn real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state() {
 
     // The public rollback API preserves the original code and protected data.
     // This test does not claim the model/agent automatically invoked rollback.
+    workspace_patch::rollback(root, &record).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
+    assert!(!root.join("src/math.rs").exists());
+    assert_eq!(
+        fs::read(root.join("protected.txt")).unwrap(),
+        protected_before
+    );
+    assert!(!pending.exists());
+    assert_cargo_tests_pass(root);
+}
+
+#[test]
+fn real_cargo_compiler_failure_rollback_restores_a_compilable_project() {
+    let project = Fixture::new();
+    let root = &project.0;
+    let protected_before = fs::read(root.join("protected.txt")).unwrap();
+    assert_cargo_tests_pass(root);
+
+    // The edited lib calls math::calculate, but the new module omits it.
+    // Cargo check must report an actual Rust compiler error.
+    let invalid_math = "pub fn unrelated(a: i32, b: i32) -> i32 { a + b }\n";
+    let plan = workspace_patch::prepare(
+        root,
+        &[
+            FileChange::Edit {
+                path: "src/lib.rs".into(),
+                old_text: ORIGINAL.into(),
+                new_text: UPDATED.into(),
+            },
+            FileChange::Create {
+                path: "src/math.rs".into(),
+                content: invalid_math.into(),
+            },
+        ],
+    )
+    .unwrap();
+    let record = workspace_patch::apply(root, &plan).unwrap();
+    let pending = root.join(".fiko_backups/workspace.pending.json");
+    assert!(pending.is_file());
+
+    let failed = cargo_check(root);
+    assert!(
+        !failed.status.success(),
+        "Invalid Rust source passed cargo check"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("cannot find function") && stderr.contains("calculate"),
+        "Expected missing function compiler diagnostic, got: {stderr}"
+    );
+
     workspace_patch::rollback(root, &record).unwrap();
     assert_eq!(
         fs::read_to_string(root.join("src/lib.rs")).unwrap(),
