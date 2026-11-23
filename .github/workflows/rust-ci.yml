@@ -35,6 +35,10 @@ jobs:
         run: cargo test --locked --lib workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval -- --ignored --exact
       - name: Workspace edit partial-stage interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_during_partial_staged_apply_preserves_original_source -- --ignored --exact
+      - name: Workspace new-file partial-stage interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker -- --ignored --exact
+      - name: Workspace new-file post-publication interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
       - name: Stabilization stress (20 parallel + 20 serial runs)
         shell: pwsh
         run: |
@@ -80,3 +84,7 @@ jobs:
         run: cargo test --locked --lib workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval -- --ignored --exact
       - name: Workspace edit partial-stage interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_during_partial_staged_apply_preserves_original_source -- --ignored --exact
+      - name: Workspace new-file partial-stage interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker -- --ignored --exact
+      - name: Workspace new-file post-publication interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
