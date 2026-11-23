@@ -3181,13 +3181,12 @@ fn fail_after_removing_own_backup() {
         let root = mini_crate("agent_workspace_failed_test");
         // Cargo.lock must exist before the verification fingerprint is captured.
         // Otherwise Cargo's first run creates a new project file after apply.
-        let lock = std::process::Command::new(
-            std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
-        )
-        .args(["generate-lockfile", "--offline"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
+        let lock =
+            std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
         assert!(
             lock.status.success(),
             "Could not generate isolated Cargo.lock: {}",
@@ -3248,7 +3247,10 @@ fn fail_after_removing_own_backup() {
         assert_eq!(fs::read(root.join("src/main.rs")).unwrap(), original);
         assert!(!root.join("src/lib.rs").exists());
         assert!(!root.join(".fiko_backups/workspace.pending.json").exists());
-        assert_eq!(crate::verification::project_fingerprint(&root).unwrap(), baseline);
+        assert_eq!(
+            crate::verification::project_fingerprint(&root).unwrap(),
+            baseline
+        );
         remove(&root);
     }
 
