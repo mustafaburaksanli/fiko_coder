@@ -988,6 +988,16 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
                 fs::remove_file(&target).map_err(|e| e.to_string())?;
                 fs::create_dir(&target).map_err(|e| e.to_string())?;
             }
+            #[cfg(all(test, unix))]
+            if file.relative == "src/c.rs"
+                && std::env::var_os("FIKO_TEST_CREATE_ROLLBACK_LATE_SYMLINK_SWAP").is_some()
+            {
+                use std::os::unix::fs::symlink;
+                let external = root.join("external_created_rollback.rs");
+                fs::write(&external, expected).map_err(|e| e.to_string())?;
+                fs::remove_file(&target).map_err(|e| e.to_string())?;
+                symlink(&external, &target).map_err(|e| e.to_string())?;
+            }
             let latest = discovery::resolve_target(root, &file.relative)?;
             if latest != target {
                 return Err("Yeni dosya yolu geri alma oncesinde degisti.".into());
@@ -1642,6 +1652,59 @@ mod tests {
         assert!(
             output.status.success(),
             "created rollback late-swap regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "isolated child for late symlink replacement test"]
+    fn created_file_rollback_late_symlink_swap_child() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CREATE_ROLLBACK_LATE_SYMLINK_SWAP") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let expected = "new\n";
+        let record = apply(&root, &prepare(&root, &[create("src/c.rs", expected)]).unwrap())
+            .unwrap();
+        assert!(rollback(&root, &record).is_err());
+        let target = root.join("src/c.rs");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(root.join("external_created_rollback.rs")).unwrap(),
+            expected.as_bytes()
+        );
+        assert!(root.join(".fiko_backups/workspace.pending.json").is_file());
+        let preview: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(&root).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_file_rollback_refuses_late_same_content_symlink_swap() {
+        use std::process::Command;
+
+        let project = Project::new();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::created_file_rollback_late_symlink_swap_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_CREATE_ROLLBACK_LATE_SYMLINK_SWAP", &project.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "created rollback late-symlink regression failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
