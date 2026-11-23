@@ -592,7 +592,10 @@ fn create_new_staged(root: &Path, record: &mut RecordedFile) -> Result<(), Strin
         return Err("Staged create requires a previously absent target.".into());
     }
     revalidate_file(root, file)?;
-    let parent = file.path.parent().ok_or("New file parent directory is missing.")?;
+    let parent = file
+        .path
+        .parent()
+        .ok_or("New file parent directory is missing.")?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -655,16 +658,24 @@ fn create_new_staged(root: &Path, record: &mut RecordedFile) -> Result<(), Strin
         return Err(format!("{}: Unsafe staged file metadata.", file.relative));
     }
     if read_bytes(&stage_path)? != bytes {
-        return Err(format!("{}: Staged file verification failed.", file.relative));
+        return Err(format!(
+            "{}: Staged file verification failed.",
+            file.relative
+        ));
     }
     revalidate_file(root, file)?;
     // Repeat the stage verification before publishing. These checks are not
     // an exclusive guard against non-cooperating filesystem writers.
     let stage_meta = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
-    if !stage_meta.is_file() || is_link(&stage_meta) || stage_meta.len() != bytes.len() as u64
+    if !stage_meta.is_file()
+        || is_link(&stage_meta)
+        || stage_meta.len() != bytes.len() as u64
         || read_bytes(&stage_path)? != bytes
     {
-        return Err(format!("{}: Stage changed before publication.", file.relative));
+        return Err(format!(
+            "{}: Stage changed before publication.",
+            file.relative
+        ));
     }
     // An existing destination MUST NOT be replaced. In particular, rename()
     // is unsuitable because it overwrites on some filesystems.
@@ -696,7 +707,10 @@ fn create_new_staged(root: &Path, record: &mut RecordedFile) -> Result<(), Strin
     }
 
     if read_bytes(&file.path)? != bytes {
-        return Err(format!("{}: Published file verification failed.", file.relative));
+        return Err(format!(
+            "{}: Published file verification failed.",
+            file.relative
+        ));
     }
     // If removing the staging link fails, ordinary apply rollback may run;
     // process death leaves the pending marker and can be reviewed separately.
@@ -1800,7 +1814,9 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        child.kill().expect("failed to terminate staged create child");
+        child
+            .kill()
+            .expect("failed to terminate staged create child");
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success(), "child must terminate by force");
     }
@@ -1830,7 +1846,10 @@ mod tests {
             "FIKO_TEST_CREATE_PARTIAL_STAGE_PROJECT",
             ".fiko_test_create_partial_stage_ready",
         );
-        assert!(!root.join("src/c.rs").exists(), "target must not exist halfway");
+        assert!(
+            !root.join("src/c.rs").exists(),
+            "target must not exist halfway"
+        );
         let marker = root.join(".fiko_backups/workspace.pending.json");
         assert!(marker.is_file());
         let stages = staged_create_orphans(root);
@@ -1871,7 +1890,10 @@ mod tests {
         let report: serde_json::Value =
             serde_json::from_str(&workspace_recovery::restoration_preview(root).unwrap()).unwrap();
         assert_eq!(report["eligible_for_review"], true);
-        assert_eq!(report["files"][0]["proposed_action"], "remove_created_candidate");
+        assert_eq!(
+            report["files"][0]["proposed_action"],
+            "remove_created_candidate"
+        );
         let fingerprint = report["marker_fingerprint_sha256"].as_str().unwrap();
         workspace_recovery::restore_after_explicit_approval(root, fingerprint).unwrap();
         assert!(!marker.exists());
@@ -1887,7 +1909,10 @@ mod tests {
         };
         let root = PathBuf::from(root).canonicalize().unwrap();
         let error = apply(&root, &isolated_create_plan(&root)).unwrap_err();
-        assert!(!error.restored, "unexpected target must leave unresolved marker");
+        assert!(
+            !error.restored,
+            "unexpected target must leave unresolved marker"
+        );
         assert_eq!(
             fs::read(root.join("src/c.rs")).unwrap(),
             b"external writer content"
@@ -1920,10 +1945,9 @@ mod tests {
             fs::read(project.0.join("src/c.rs")).unwrap(),
             b"external writer content"
         );
-        let report: serde_json::Value = serde_json::from_str(
-            &workspace_recovery::restoration_preview(&project.0).unwrap(),
-        )
-        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(&project.0).unwrap())
+                .unwrap();
         assert_eq!(report["eligible_for_review"], false);
         assert_eq!(report["files"][0]["proposed_action"], "manual_review");
     }
