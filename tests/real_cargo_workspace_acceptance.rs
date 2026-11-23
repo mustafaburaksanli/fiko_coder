@@ -20,7 +20,7 @@ struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "fiko_cargo_workspace_acceptance_{}_{}_{}",
+            "fca_{}_{}_{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -31,7 +31,7 @@ impl Fixture {
         fs::create_dir_all(path.join("src")).unwrap();
         fs::write(
             path.join("Cargo.toml"),
-            "[package]\nname = \"fiko_workspace_acceptance_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            "[package]\nname = \"fca_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )
         .unwrap();
         fs::write(path.join("src/lib.rs"), ORIGINAL).unwrap();
@@ -50,7 +50,7 @@ impl Drop for Fixture {
                 .0
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("fiko_cargo_workspace_acceptance_"))
+                .is_some_and(|name| name.starts_with("fca_"))
         {
             return;
         }
@@ -67,7 +67,7 @@ fn assert_cargo_tests_pass(root: &Path) {
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .arg("--target-dir")
-        .arg(root.join("target-acceptance"))
+        .arg(root.join("t"))
         .output()
         .expect("Cargo executable must be available in Rust CI");
     assert!(
