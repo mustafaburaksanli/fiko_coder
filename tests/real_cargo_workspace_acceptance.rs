@@ -237,7 +237,10 @@ fn real_cargo_compiler_failure_rollback_restores_a_compilable_project() {
     assert!(pending.is_file());
 
     let failed = cargo_check(root);
-    assert!(!failed.status.success(), "Invalid Rust source passed cargo check");
+    assert!(
+        !failed.status.success(),
+        "Invalid Rust source passed cargo check"
+    );
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(
         stderr.contains("cannot find function") && stderr.contains("calculate"),
