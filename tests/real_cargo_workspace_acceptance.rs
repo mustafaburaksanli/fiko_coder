@@ -160,7 +160,10 @@ fn real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state() {
     let record = workspace_patch::apply(root, &plan).unwrap();
     let pending = root.join(".fiko_backups/workspace.pending.json");
     assert!(pending.is_file());
-    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), failing);
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        failing
+    );
     assert_eq!(fs::read_to_string(root.join("src/math.rs")).unwrap(), MATH);
 
     let failed = cargo_tests(root);
@@ -179,9 +182,15 @@ fn real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state() {
     // The public rollback API preserves the original code and protected data.
     // This test does not claim the model/agent automatically invoked rollback.
     workspace_patch::rollback(root, &record).unwrap();
-    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), ORIGINAL);
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
     assert!(!root.join("src/math.rs").exists());
-    assert_eq!(fs::read(root.join("protected.txt")).unwrap(), protected_before);
+    assert_eq!(
+        fs::read(root.join("protected.txt")).unwrap(),
+        protected_before
+    );
     assert!(!pending.exists());
     assert_cargo_tests_pass(root);
 }
