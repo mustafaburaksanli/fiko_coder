@@ -1665,8 +1665,11 @@ mod tests {
         };
         let root = PathBuf::from(root).canonicalize().unwrap();
         let expected = "new\n";
-        let record = apply(&root, &prepare(&root, &[create("src/c.rs", expected)]).unwrap())
-            .unwrap();
+        let record = apply(
+            &root,
+            &prepare(&root, &[create("src/c.rs", expected)]).unwrap(),
+        )
+        .unwrap();
         assert!(rollback(&root, &record).is_err());
         let target = root.join("src/c.rs");
         assert!(
