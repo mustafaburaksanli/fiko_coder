@@ -3176,6 +3176,84 @@ fn fail_after_removing_own_backup() {
         );
     }
 
+    #[tokio::test]
+    async fn workspace_agent_failed_real_cargo_test_rolls_back_all_files() {
+        let root = mini_crate("agent_workspace_failed_test");
+        // Cargo.lock must exist before the verification fingerprint is captured.
+        // Otherwise Cargo's first run creates a new project file after apply.
+        let lock =
+            std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+        assert!(
+            lock.status.success(),
+            "Could not generate isolated Cargo.lock: {}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        let baseline = crate::verification::project_fingerprint(&root).unwrap();
+        let original = fs::read(root.join("src/main.rs")).unwrap();
+        // Check mode compiles both files without executing the new failing test.
+        // Actual post-apply cargo test must fail, and host rollback must run.
+        let changes = json!([
+            {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": MINI_GOOD},
+            {"operation": "create", "path": "src/lib.rs", "content": "#[test]\nfn intentional_failure() { assert_eq!(2 + 2, 5); }\n"}
+        ]);
+        let (url, server) = mock_ollama(vec![
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "verify_workspace", "arguments": {"changes": changes, "mode": "check"}
+            }}]}}),
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "apply_workspace", "arguments": {"changes": changes}
+            }}]}}),
+        ])
+        .await;
+        let mut session = Session::new(root.clone());
+        let mut prompter = ScriptedPrompter::with(&[true, true]);
+        let mut messages = conversation("Update src/main.rs and create src/lib.rs.");
+        let task = run_task_at(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            "controlled-model",
+            &mut session,
+            &mut messages,
+            &mut prompter,
+            &url,
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(prompter.asked.len(), 2);
+        assert_eq!(task.intent(), TaskIntent::Modify);
+        assert_eq!(task.phase(), TaskPhase::Failed);
+        assert!(!task.applied());
+        assert_eq!(task.stats().dispatched, 2);
+        assert_eq!(task.repair.verify_attempts(), 1);
+        assert_eq!(task.repair.approved_attempts(), 1);
+        assert!(task.status_report().contains("GERI ALINDI"));
+        let finish = task.memory_finish();
+        assert_eq!(finish.outcome, "rolled_back");
+        assert_eq!(finish.applied, Some(true));
+        assert_eq!(finish.rolled_back, Some(true));
+        assert!(
+            finish
+                .commands
+                .iter()
+                .any(|command| command.command == "cargo test"
+                    && command.status == "failed"
+                    && command.exit_code.is_some_and(|code| code != 0))
+        );
+        assert_eq!(fs::read(root.join("src/main.rs")).unwrap(), original);
+        assert!(!root.join("src/lib.rs").exists());
+        assert!(!root.join(".fiko_backups/workspace.pending.json").exists());
+        assert_eq!(
+            crate::verification::project_fingerprint(&root).unwrap(),
+            baseline
+        );
+        remove(&root);
+    }
+
     fn postgres_agent_test_url() -> String {
         let url = std::env::var("FIKO_TEST_DATABASE_URL")
             .expect("Ignored agent testi icin ayri FIKO_TEST_DATABASE_URL gerekli.");
