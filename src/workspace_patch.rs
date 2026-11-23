@@ -805,7 +805,10 @@ fn restore_existing_staged_rollback(
     }
     let metadata = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
     if !metadata.is_file() || is_link(&metadata) || read_bytes(&target)? != expected_current {
-        return Err(format!("{}: Rollback source changed before staging.", file.relative));
+        return Err(format!(
+            "{}: Rollback source changed before staging.",
+            file.relative
+        ));
     }
 
     let parent = target.parent().ok_or("Rollback source parent missing.")?;
@@ -847,7 +850,9 @@ fn restore_existing_staged_rollback(
     if file.relative == "src/a.rs"
         && std::env::var_os("FIKO_TEST_ROLLBACK_PARTIAL_STAGE_PROJECT").is_some()
     {
-        let partial = (verified_backup.len() / 2).max(1).min(verified_backup.len());
+        let partial = (verified_backup.len() / 2)
+            .max(1)
+            .min(verified_backup.len());
         staged
             .write_all(&verified_backup[..partial])
             .map_err(|e| e.to_string())?;
@@ -861,7 +866,9 @@ fn restore_existing_staged_rollback(
         return Err("Rollback staging child was expected to be killed.".into());
     }
 
-    staged.write_all(verified_backup).map_err(|e| e.to_string())?;
+    staged
+        .write_all(verified_backup)
+        .map_err(|e| e.to_string())?;
     staged.sync_all().map_err(|e| e.to_string())?;
     fs::set_permissions(&stage_path, metadata.permissions()).map_err(|e| e.to_string())?;
     staged.sync_all().map_err(|e| e.to_string())?;
@@ -874,7 +881,10 @@ fn restore_existing_staged_rollback(
             || stage_meta.len() != verified_backup.len() as u64
             || read_bytes(&stage_path)? != verified_backup
         {
-            return Err(format!("{}: Staged rollback backup is untrusted.", file.relative));
+            return Err(format!(
+                "{}: Staged rollback backup is untrusted.",
+                file.relative
+            ));
         }
         Ok(())
     };
@@ -893,10 +903,7 @@ fn restore_existing_staged_rollback(
         return Err(format!("{}: Rollback target path changed.", file.relative));
     }
     let target_meta = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
-    if !target_meta.is_file()
-        || is_link(&target_meta)
-        || read_bytes(&target)? != expected_current
-    {
+    if !target_meta.is_file() || is_link(&target_meta) || read_bytes(&target)? != expected_current {
         return Err(format!(
             "{}: External target change detected before rollback replacement.",
             file.relative
@@ -2261,7 +2268,10 @@ mod tests {
         let external = root.parent().unwrap().join(format!(
             "fiko_rollback_hardlink_{}_{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::hard_link(&source, &external).unwrap();
         let updated = fs::read(&source).unwrap();
