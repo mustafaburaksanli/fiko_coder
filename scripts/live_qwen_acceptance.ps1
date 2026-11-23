@@ -82,9 +82,9 @@ $checks = [ordered]@{
     manifest_unchanged = ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -eq $baseline.manifest_sha256)
     only_expected_rust_sources = ($sourcePaths.Count -eq 2 -and $sourcePaths -contains 'src/lib.rs' -and $sourcePaths -contains 'src/math.rs')
     quintuple_function_present = ($source -match '(?m)^\s*pub\s+fn\s+quintuple\s*\(')
-    quintuple_test_present = ($source -match '(?m)^\s*fn\s+test_quintuple\s*\(')
+    quintuple_test_present = ($source -match '(?m)^\s*(?:#\[test\]\s*)?fn\s+test_quintuple\s*\(')
     existing_functions_present = (($source -match '(?m)^\s*pub\s+fn\s+double\s*\(') -and ($source -match '(?m)^\s*pub\s+fn\s+triple\s*\(') -and ($source -match '(?m)^\s*pub\s+fn\s+quadruple\s*\('))
-    existing_tests_present = (($source -match '(?m)^\s*fn\s+test_double\s*\(') -and ($source -match '(?m)^\s*fn\s+test_triple\s*\(') -and ($source -match '(?m)^\s*fn\s+test_quadruple\s*\('))
+    existing_tests_present = (($source -match '(?m)^\s*(?:#\[test\]\s*)?fn\s+test_double\s*\(') -and ($source -match '(?m)^\s*(?:#\[test\]\s*)?fn\s+test_triple\s*\(') -and ($source -match '(?m)^\s*(?:#\[test\]\s*)?fn\s+test_quadruple\s*\('))
     pending_marker_absent = (-not (Test-Path -LiteralPath (Join-Path $path '.fiko_backups/workspace.pending.json')))
 }
 $run = Invoke-FixtureTests $path
