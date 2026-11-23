@@ -19,6 +19,7 @@ MANIFEST = ROOT / "ci" / "ignored-regressions.txt"
 HISTORICAL = ROOT / "ci" / "historical-acceptance-tests.txt"
 HELPERS = ROOT / "ci" / "ignored-subprocess-helpers.txt"
 POSTGRES = ROOT / "ci" / "ignored-postgres-tests.txt"
+UNIX_HISTORICAL = ROOT / "ci" / "unix-only-historical-tests.txt"
 # These two child fixtures are guarded by #[cfg(unix)] in Rust source.
 UNIX_ONLY_IGNORED = {
     "workspace_patch::tests::created_file_rollback_late_symlink_swap_child",
@@ -64,6 +65,9 @@ def main() -> int:
     ignored_lib_tests = discover("--lib", ignored=True)
     manifest = read_manifest(MANIFEST)
     historical = read_manifest(HISTORICAL)
+    unix_historical = read_manifest(UNIX_HISTORICAL)
+    if not set(unix_historical) <= set(historical):
+        raise RuntimeError("Unix-only historical tests must be included in historical manifest")
     helpers = read_manifest(HELPERS)
     postgres = read_manifest(POSTGRES)
 
@@ -100,7 +104,10 @@ def main() -> int:
             f"missing={sorted(expected_ignored_lib - set(ignored_lib_tests))}"
         )
 
-    missing_historical = sorted(set(historical) - set(all_tests))
+    expected_historical = set(historical)
+    if os.name == "nt":
+        expected_historical -= set(unix_historical)
+    missing_historical = sorted(expected_historical - set(all_tests))
     if missing_historical:
         raise RuntimeError(f"Historical acceptance tests absent from discovered test list: {missing_historical}")
 
@@ -128,6 +135,7 @@ def main() -> int:
             "ignored_library_unique_identifiers": len(set(ignored_lib_tests)),
             "dedicated_crash_manifest": len(manifest),
             "historical_acceptance_manifest": len(historical),
+            "unix_only_historical": len(unix_historical),
             "subprocess_helpers": len(helpers),
             "postgres_opt_in": len(postgres),
             "unclassified_ignored": len(unclassified_ignored),
