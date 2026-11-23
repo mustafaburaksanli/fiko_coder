@@ -579,45 +579,131 @@ fn write_existing_staged(root: &Path, record: &mut RecordedFile) -> Result<(), S
     Ok(())
 }
 
+/// Publish a new workspace file only after its full contents have been staged
+/// and synced. A same-filesystem hard link publishes without overwriting an
+/// existing destination, unlike a plain rename on some platforms.
+///
+/// Hard-link support is required; an unsupported filesystem fails closed.
+fn create_new_staged(root: &Path, record: &mut RecordedFile) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let file = &record.file;
+    if file.original.is_some() {
+        return Err("Staged create requires a previously absent target.".into());
+    }
+    revalidate_file(root, file)?;
+    let parent = file.path.parent().ok_or("New file parent directory is missing.")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mut created = None;
+    for attempt in 0..16 {
+        let path = parent.join(format!(
+            ".fiko_create_stage_{}_{}_{}.tmp",
+            std::process::id(),
+            stamp,
+            attempt
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(handle) => {
+                created = Some((handle, path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: Could not stage new file: {e}", file.relative)),
+        }
+    }
+    let (stage_handle, stage_path) = created.ok_or("Staged file name collision.")?;
+    struct StageCleanup(Option<PathBuf>);
+    impl Drop for StageCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = StageCleanup(Some(stage_path.clone()));
+    let mut staged = stage_handle;
+    let bytes = file.updated.as_bytes();
+
+    // This forced-process interruption is test-only, not available in release
+    // binaries. During staging the final target must not exist.
+    #[cfg(test)]
+    if file.relative == "src/c.rs"
+        && std::env::var_os("FIKO_TEST_CREATE_PARTIAL_STAGE_PROJECT").is_some()
+    {
+        let length = (bytes.len() / 2).max(1).min(bytes.len());
+        staged
+            .write_all(&bytes[..length])
+            .map_err(|e| e.to_string())?;
+        staged.sync_all().map_err(|e| e.to_string())?;
+        let signal = root.join(".fiko_test_create_partial_stage_ready");
+        let mut ready = File::create(signal).map_err(|e| e.to_string())?;
+        ready.write_all(b"ready").map_err(|e| e.to_string())?;
+        ready.sync_all().map_err(|e| e.to_string())?;
+        drop(ready);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Staged create child was expected to be terminated.".into());
+    }
+
+    staged.write_all(bytes).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    drop(staged);
+    let stage_meta = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+    if !stage_meta.is_file() || is_link(&stage_meta) || stage_meta.len() != bytes.len() as u64 {
+        return Err(format!("{}: Unsafe staged file metadata.", file.relative));
+    }
+    if read_bytes(&stage_path)? != bytes {
+        return Err(format!("{}: Staged file verification failed.", file.relative));
+    }
+    revalidate_file(root, file)?;
+    // Repeat the stage verification before publishing. These checks are not
+    // an exclusive guard against non-cooperating filesystem writers.
+    let stage_meta = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+    if !stage_meta.is_file() || is_link(&stage_meta) || stage_meta.len() != bytes.len() as u64
+        || read_bytes(&stage_path)? != bytes
+    {
+        return Err(format!("{}: Stage changed before publication.", file.relative));
+    }
+    // An existing destination MUST NOT be replaced. In particular, rename()
+    // is unsuitable because it overwrites on some filesystems.
+    fs::hard_link(&stage_path, &file.path)
+        .map_err(|e| format!("{}: Cannot publish new file: {e}", file.relative))?;
+    // A hard kill after publication leaves a fully written new target and an
+    // orphan staging hard link. The pending marker remains authoritative.
+    record.written = Some(bytes.to_vec());
+
+    #[cfg(test)]
+    if file.relative == "src/c.rs"
+        && std::env::var_os("FIKO_TEST_CREATE_AFTER_PUBLISH_PROJECT").is_some()
+    {
+        let signal = root.join(".fiko_test_create_published_ready");
+        let mut ready = File::create(signal).map_err(|e| e.to_string())?;
+        ready.write_all(b"ready").map_err(|e| e.to_string())?;
+        ready.sync_all().map_err(|e| e.to_string())?;
+        drop(ready);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Published create child was expected to be terminated.".into());
+    }
+
+    if read_bytes(&file.path)? != bytes {
+        return Err(format!("{}: Published file verification failed.", file.relative));
+    }
+    // If removing the staging link fails, ordinary apply rollback may run;
+    // process death leaves the pending marker and can be reviewed separately.
+    fs::remove_file(&stage_path)
+        .map_err(|e| format!("{}: Could not remove staged link: {e}", file.relative))?;
+    cleanup.0 = None;
+    Ok(())
+}
+
 fn write_file(root: &Path, record: &mut RecordedFile) -> Result<(), String> {
     if record.file.original.is_some() {
         return write_existing_staged(root, record);
     }
-    let file = &record.file;
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if file.original.is_none() {
-        options.create_new(true);
-    }
-    let mut handle = options
-        .open(&file.path)
-        .map_err(|e| format!("{} yazmak icin acilamadi: {e}", file.relative))?;
-    // truncate, kismi write ve sync hatalari da kurtarma kaydina dahildir.
-    record.written = Some(file.original.as_deref().unwrap_or("").as_bytes().to_vec());
-    handle
-        .set_len(0)
-        .map_err(|e| format!("{} kisaltilamadi: {e}", file.relative))?;
-    let expected = record.written.as_mut().unwrap();
-    expected.clear();
-    let bytes = file.updated.as_bytes();
-    while expected.len() < bytes.len() {
-        let count = handle
-            .write(&bytes[expected.len()..])
-            .map_err(|e| format!("{} yazilamadi: {e}", file.relative))?;
-        if count == 0 {
-            return Err(format!("{} yazimi ilerlemedi.", file.relative));
-        }
-        expected.extend_from_slice(&bytes[expected.len()..expected.len() + count]);
-    }
-    handle
-        .sync_all()
-        .map_err(|e| format!("{} kaydedilemedi: {e}", file.relative))?;
-    if read_bytes(&file.path)? != bytes {
-        return Err(format!("{} yazilan icerik dogrulanamadi.", file.relative));
-    }
-    Ok(())
+    create_new_staged(root, record)
 }
-
 fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     File::open(path)
