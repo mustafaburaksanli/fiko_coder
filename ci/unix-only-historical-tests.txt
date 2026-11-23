@@ -1,0 +1,7 @@
+# Normal historical regression tests gated by #[cfg(unix)] in Rust source.
+# Not expected on Windows; must remain present on Linux and both Macs.
+workspace_recovery::tests::staged_copy_integrity_rejects_symlink
+workspace_recovery::tests::symlink_operation_lock_is_never_accepted
+workspace_patch::tests::created_file_rollback_refuses_same_content_symlink_substitution
+workspace_recovery::tests::created_file_recovery_rejects_same_content_symlink_at_final_delete_gate
+workspace_patch::tests::created_file_rollback_refuses_late_same_content_symlink_swap
