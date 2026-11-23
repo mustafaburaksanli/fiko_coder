@@ -50,6 +50,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit and offline integration tests
         run: cargo test --locked
+      - name: Discover and audit normal plus opt-in Rust tests
+        run: ${{ matrix.python }} scripts/test_inventory.py --output test-inventory.json
       - name: All shared process-interruption recovery regressions
         run: ${{ matrix.python }} scripts/ci_regressions.py ignored
       - name: Live-Qwen acceptance script offline smoke (no model or approvals)
