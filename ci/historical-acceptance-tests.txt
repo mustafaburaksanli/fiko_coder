@@ -1,0 +1,10 @@
+# Historically introduced real Cargo and controlled-model agent acceptance tests.
+# Each entry is a full libtest identifier discovered with cargo test -- --list.
+# Keep these as stable regression contracts; if renamed, review provenance.
+real_cargo_project_compiles_before_after_multifile_apply_and_after_rollback
+real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state
+real_cargo_compiler_failure_rollback_restores_a_compilable_project
+agent::tests::workspace_agent_failed_real_cargo_test_rolls_back_all_files
+agent::tests::workspace_agent_denied_apply_consent_preserves_all_project_files
+agent::tests::workspace_agent_failed_candidate_then_corrected_candidate_is_verified
+agent::tests::workspace_agent_failing_unit_test_then_corrected_candidate_passes
