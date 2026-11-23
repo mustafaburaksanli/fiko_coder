@@ -3307,6 +3307,78 @@ fn fail_after_removing_own_backup() {
         remove(&root);
     }
 
+    #[tokio::test]
+    async fn workspace_agent_failed_candidate_then_corrected_candidate_is_verified() {
+        let root = mini_crate("workspace_retry_corrected");
+        let original = fs::read(root.join("src/main.rs")).unwrap();
+        let bad_changes = json!([
+            {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": MINI_BAD},
+            {"operation": "create", "path": "src/helper.rs", "content": "pub fn helper() {}\n"}
+        ]);
+        let good_changes = json!([
+            {"operation": "edit", "path": "src/main.rs", "old_text": MINI_OLD, "new_text": MINI_GOOD},
+            {"operation": "create", "path": "src/helper.rs", "content": "pub fn helper() {}\n"}
+        ]);
+        let (url, server) = mock_ollama(vec![
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "verify_workspace", "arguments": {"changes": bad_changes, "mode": "check"}
+            }}]}}),
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "verify_workspace", "arguments": {"changes": good_changes, "mode": "check"}
+            }}]}}),
+            json!({"message": {"role": "assistant", "tool_calls": [{"function": {
+                "name": "apply_workspace", "arguments": {"changes": good_changes}
+            }}]}}),
+        ])
+        .await;
+        let mut session = Session::new(root.clone());
+        let mut prompter = ScriptedPrompter::with(&[true, true]);
+        let mut messages = conversation("Update src/main.rs and create src/helper.rs.");
+        let task = run_task_at(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            "controlled-model",
+            &mut session,
+            &mut messages,
+            &mut prompter,
+            &url,
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(task.intent(), TaskIntent::Modify);
+        assert_eq!(task.phase(), TaskPhase::Completed);
+        assert!(task.applied());
+        assert_eq!(task.repair.verify_attempts(), 2);
+        assert_eq!(task.repair.approved_attempts(), 1);
+        assert_eq!(task.stats().dispatched, 3);
+        assert_eq!(prompter.asked.len(), 2);
+        assert!(prompter.asked[0].contains("cargo check"));
+        assert!(prompter.asked[1].contains("Tum workspace"));
+        let tool_results: Vec<_> = messages.iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert_eq!(tool_results.len(), 3);
+        assert!(tool_results[0].starts_with("VERIFY_FAILED"), "{}", tool_results[0]);
+        assert!(tool_results[1].starts_with("VERIFY_OK"), "{}", tool_results[1]);
+        assert!(tool_results[2].starts_with("PATCH_VERIFIED"), "{}", tool_results[2]);
+        let modified = fs::read_to_string(root.join("src/main.rs")).unwrap();
+        assert_ne!(modified.as_bytes(), original);
+        assert!(modified.contains(MINI_GOOD));
+        assert!(!modified.contains(MINI_BAD));
+        assert_eq!(
+            fs::read_to_string(root.join("src/helper.rs")).unwrap(),
+            "pub fn helper() {}\n"
+        );
+        assert!(!root.join(".fiko_backups/workspace.pending.json").exists());
+        let finish = task.memory_finish();
+        assert_eq!(finish.outcome, "verified");
+        assert_eq!(finish.applied, Some(true));
+        assert_eq!(finish.rolled_back, Some(false));
+        remove(&root);
+    }
+
     fn postgres_agent_test_url() -> String {
         let url = std::env::var("FIKO_TEST_DATABASE_URL")
             .expect("Ignored agent testi icin ayri FIKO_TEST_DATABASE_URL gerekli.");
