@@ -39,6 +39,10 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker -- --ignored --exact
       - name: Workspace new-file post-publication interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
+      - name: Workspace rollback partial-stage interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
+      - name: Workspace rollback post-rename interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_rollback_rename_keeps_original_and_recoverable_marker -- --ignored --exact
       - name: Stabilization stress (20 parallel + 20 serial runs)
         shell: pwsh
         run: |
@@ -88,3 +92,7 @@ jobs:
         run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker -- --ignored --exact
       - name: Workspace new-file post-publication interruption regression
         run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
+      - name: Workspace rollback partial-stage interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
+      - name: Workspace rollback post-rename interruption regression
+        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_rollback_rename_keeps_original_and_recoverable_marker -- --ignored --exact
