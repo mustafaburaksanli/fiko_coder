@@ -1406,6 +1406,51 @@ mod tests {
     }
 
     #[test]
+    fn missing_created_target_requires_fresh_approval_before_marker_cleanup() {
+        let project = Fixture::new("created_absent_resume");
+        let target = project.0.join("src/new.rs");
+        let plan = workspace_patch::prepare(
+            &project.0,
+            &[FileChange::Create {
+                path: "src/new.rs".into(),
+                content: "new\\n".into(),
+            }],
+        )
+        .unwrap();
+        let _record = workspace_patch::apply(&project.0, &plan).unwrap();
+
+        // Simulate a process interruption after deleting the created file but
+        // before finishing the pending workspace record.
+        fs::remove_file(&target).unwrap();
+        let pending = project.0.join(".fiko_backups").join(MARKER);
+        assert!(pending.is_file());
+
+        let preview: Value =
+            serde_json::from_str(&restoration_preview(&project.0).unwrap()).unwrap();
+        assert_eq!(preview["eligible_for_review"], true);
+        assert_eq!(preview["requires_explicit_user_approval"], true);
+        assert_eq!(preview["files"][0]["proposed_action"], "already_absent");
+        assert!(!target.exists());
+        assert!(pending.is_file());
+
+        let next = workspace_patch::prepare(
+            &project.0,
+            &[FileChange::Create {
+                path: "src/later.rs".into(),
+                content: "blocked".into(),
+            }],
+        )
+        .unwrap();
+        assert!(workspace_patch::apply(&project.0, &next).is_err());
+        assert!(!project.0.join("src/later.rs").exists());
+
+        let fingerprint = approved_fingerprint(&project.0);
+        restore_after_explicit_approval(&project.0, &fingerprint).unwrap();
+        assert!(!target.exists());
+        assert!(!pending.exists());
+    }
+
+    #[test]
     fn partially_restored_targets_can_resume_after_new_explicit_approval() {
         let project = Fixture::new("restore_resume");
         let plan = workspace_patch::prepare(
