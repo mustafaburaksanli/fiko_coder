@@ -979,6 +979,26 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
             if read_bytes(&target)? != *expected {
                 return Err("Yeni dosya islem sonrasinda degismis; dosya silinmedi.".into());
             }
+            // Test-only external mutation between the first readback and the
+            // last pre-delete check. Never enabled in production builds.
+            #[cfg(test)]
+            if file.relative == "src/c.rs"
+                && std::env::var_os("FIKO_TEST_CREATE_ROLLBACK_DIRECTORY_SWAP").is_some()
+            {
+                fs::remove_file(&target).map_err(|e| e.to_string())?;
+                fs::create_dir(&target).map_err(|e| e.to_string())?;
+            }
+            let latest = discovery::resolve_target(root, &file.relative)?;
+            if latest != target {
+                return Err("Yeni dosya yolu geri alma oncesinde degisti.".into());
+            }
+            let latest_meta = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
+            if !latest_meta.is_file()
+                || is_link(&latest_meta)
+                || read_bytes(&target)? != *expected
+            {
+                return Err("Yeni dosya silinmeden once degisti; kayit korundu.".into());
+            }
             fs::remove_file(&target).map_err(|e| e.to_string())?;
             // CI-only interruption point: the target is absent, but the
             // workspace pending marker must still require user approval.
@@ -1585,6 +1605,50 @@ mod tests {
                 .0
                 .join(".fiko_backups/workspace.pending.json")
                 .is_file()
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated child for created-file replacement test"]
+    fn created_file_rollback_directory_swap_child() {
+        let Some(root) = std::env::var_os("FIKO_TEST_CREATE_ROLLBACK_DIRECTORY_SWAP") else {
+            return;
+        };
+        let root = PathBuf::from(root).canonicalize().unwrap();
+        let plan = prepare(&root, &[create("src/c.rs", "new\n")]).unwrap();
+        let record = apply(&root, &plan).unwrap();
+        assert!(rollback(&root, &record).is_err());
+        assert!(root.join("src/c.rs").is_dir());
+        assert!(
+            root.join(".fiko_backups/workspace.pending.json")
+                .is_file()
+        );
+        let preview: serde_json::Value =
+            serde_json::from_str(&workspace_recovery::restoration_preview(&root).unwrap())
+                .unwrap();
+        assert_eq!(preview["eligible_for_review"], false);
+        assert_eq!(preview["files"][0]["proposed_action"], "manual_review");
+    }
+
+    #[test]
+    fn created_file_rollback_refuses_late_directory_swap() {
+        use std::process::Command;
+
+        let project = Project::new();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_patch::tests::created_file_rollback_directory_swap_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FIKO_TEST_CREATE_ROLLBACK_DIRECTORY_SWAP", &project.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "created rollback late-swap regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
