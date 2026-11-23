@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +19,11 @@ MANIFEST = ROOT / "ci" / "ignored-regressions.txt"
 HISTORICAL = ROOT / "ci" / "historical-acceptance-tests.txt"
 HELPERS = ROOT / "ci" / "ignored-subprocess-helpers.txt"
 POSTGRES = ROOT / "ci" / "ignored-postgres-tests.txt"
+# These two child fixtures are guarded by #[cfg(unix)] in Rust source.
+UNIX_ONLY_IGNORED = {
+    "workspace_patch::tests::created_file_rollback_late_symlink_swap_child",
+    "workspace_recovery::tests::created_recovery_symlink_swap_child",
+}
 
 
 def discover(*cargo_args: str, ignored: bool = False) -> list[str]:
@@ -69,8 +75,13 @@ def main() -> int:
     if len(set().union(*categories.values())) != sum(len(v) for v in categories.values()):
         raise RuntimeError("Ignored-test category manifests overlap")
 
-    unclassified_ignored = sorted(set(ignored_tests) - set().union(*categories.values()))
-    missing_classified = sorted(set().union(*categories.values()) - set(ignored_tests))
+    if not UNIX_ONLY_IGNORED <= categories["subprocess_helpers"]:
+        raise RuntimeError("Unix-only fixture classification is missing from helpers manifest")
+    expected_ignored = set().union(*categories.values())
+    if os.name == "nt":
+        expected_ignored -= UNIX_ONLY_IGNORED
+    unclassified_ignored = sorted(set(ignored_tests) - expected_ignored)
+    missing_classified = sorted(expected_ignored - set(ignored_tests))
     if unclassified_ignored or missing_classified:
         raise RuntimeError(
             f"Ignored-test classification drift: unclassified={unclassified_ignored}, "
@@ -80,6 +91,8 @@ def main() -> int:
     expected_ignored_lib = categories["crash"] | categories["subprocess_helpers"] | {
         name for name in postgres if name.startswith("agent::tests::")
     }
+    if os.name == "nt":
+        expected_ignored_lib -= UNIX_ONLY_IGNORED
     if set(ignored_lib_tests) != expected_ignored_lib:
         raise RuntimeError(
             f"Ignored library classification drift: "
