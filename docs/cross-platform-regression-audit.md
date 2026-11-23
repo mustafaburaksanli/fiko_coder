@@ -44,10 +44,25 @@ The shared runner checks that each manifest entry exactly matches a library test
 | #35 | Local real-Qwen acceptance measurement | Cross-platform PowerShell offline smoke; separate manual real-model execution | Script smoke present; live Qwen still unmeasured |
 | #36–#37 | Native macOS and unified cross-platform regressions | Four-runner Rust matrix + macOS PostgreSQL | CI configured; final SHA checks and ongoing regression policy must be verified |
 
+
+## Complete current opt-in test classification (four-platform inventory)
+
+The Linux CI inventory for commit `35c6e79` discovered **441 distinct test identifiers**, including **44 ignored/opt-in** entries (32 ignored library tests). These are *test identifiers*, not a count of GitHub Actions jobs or independently executed tests.
+
+We identified all 44 opt-in entries and added explicit classifications:
+
+| Classification | Count | Manifest | Execution policy |
+|---|---:|---|---|
+| Real OS process interruption/regression parents | 11 | `ci/ignored-regressions.txt` | Independently run by `scripts/ci_regressions.py ignored` on all four Rust runners |
+| Child-only subprocess fixtures | 20 | `ci/ignored-subprocess-helpers.txt` | Never run as independent ignored tests; invoked and controlled by parent tests |
+| PostgreSQL integration and controlled-model agent tests | 13 | `ci/ignored-postgres-tests.txt` | Only the isolated PostgreSQL CI workflow on Linux and both macOS architectures; Windows is not tested |
+
+`scripts/test_inventory.py` now checks **exact set equality** between discovered ignored tests and the disjoint union of the three manifest sets, and verifies the library-test subset separately. Any newly added or missing ignored test fails CI on the four Rust platforms until classified. A child helper is a test-harness entrypoint, **not an additional independently validated regression**. These classifications were inferred from test names and historical source comments; exact parent-child invocation traceability still warrants a separate audit. None of this implies real-Qwen model evaluation.
+
 ## Remaining blockers before claiming full historical parity
 
 1. Enumerate **every** added/modified test from PR #1–#36, including conditional, ignored, CLI, real-Cargo and agent tests. Compare exact test identifiers with current source and runner discovery. Check for deleted/renamed tests and document functional replacements, not just matching titles.
-2. Detect any current ignored library/integration tests omitted from the explicit crash manifest or the database acceptance workflows; classify intentionally manual tests separately.
+2. **Current 44 ignored entries classified**, with 11 crash regression parents, 20 child-only fixtures and 13 PostgreSQL opt-ins. Confirm each child-only fixture is exercised through a parent, each database test is selected by the PostgreSQL workflow, and monitor future inventory changes.
 3. Record each platform's **actual run result on one immutable head SHA**. If audit changes trigger new CI runs, prior green runs are not evidence for the new SHA.
 4. Decide and document platform exclusions with a rationale, especially Windows PostgreSQL and live hardware-bound Qwen tests; do not label excluded work as passed.
 5. Keep PR #37 open/draft until the above evidence is complete and all required CI checks pass. No merge is authorized by this document alone.
