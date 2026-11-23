@@ -788,6 +788,147 @@ fn backup_content(root: &Path, record: &RecordedFile) -> Result<Vec<u8>, String>
     Ok(content)
 }
 
+/// Restage verified backup bytes into a sibling file before restoring an
+/// existing source. Do not truncate the only currently visible source while
+/// assembling the rollback. The pending marker remains authoritative.
+fn restore_existing_staged_rollback(
+    root: &Path,
+    file: &PlannedFile,
+    verified_backup: &[u8],
+    expected_current: &[u8],
+) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let target = discovery::resolve_existing(root, &file.relative)?;
+    if target != file.path {
+        return Err("Rollback target path changed.".into());
+    }
+    let metadata = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || is_link(&metadata) || read_bytes(&target)? != expected_current {
+        return Err(format!("{}: Rollback source changed before staging.", file.relative));
+    }
+
+    let parent = target.parent().ok_or("Rollback source parent missing.")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let mut opened = None;
+    for attempt in 0..16 {
+        let path = parent.join(format!(
+            ".fiko_rollback_stage_{}_{}_{}.tmp",
+            std::process::id(),
+            stamp,
+            attempt
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(handle) => {
+                opened = Some((handle, path));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: Rollback staging failed: {e}", file.relative)),
+        }
+    }
+    let (handle, stage_path) = opened.ok_or("No safe rollback staging path available.")?;
+    // Declared before the stage writer so its handle closes first on errors.
+    struct StageCleanup(Option<PathBuf>);
+    impl Drop for StageCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = StageCleanup(Some(stage_path.clone()));
+    let mut staged = handle;
+
+    #[cfg(test)]
+    if file.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_ROLLBACK_PARTIAL_STAGE_PROJECT").is_some()
+    {
+        let partial = (verified_backup.len() / 2).max(1).min(verified_backup.len());
+        staged
+            .write_all(&verified_backup[..partial])
+            .map_err(|e| e.to_string())?;
+        staged.sync_all().map_err(|e| e.to_string())?;
+        let mut signal = File::create(root.join(".fiko_test_rollback_partial_ready"))
+            .map_err(|e| e.to_string())?;
+        signal.write_all(b"ready").map_err(|e| e.to_string())?;
+        signal.sync_all().map_err(|e| e.to_string())?;
+        drop(signal);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Rollback staging child was expected to be killed.".into());
+    }
+
+    staged.write_all(verified_backup).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    fs::set_permissions(&stage_path, metadata.permissions()).map_err(|e| e.to_string())?;
+    staged.sync_all().map_err(|e| e.to_string())?;
+    drop(staged);
+
+    let check_staged = || -> Result<(), String> {
+        let stage_meta = fs::symlink_metadata(&stage_path).map_err(|e| e.to_string())?;
+        if !stage_meta.is_file()
+            || is_link(&stage_meta)
+            || stage_meta.len() != verified_backup.len() as u64
+            || read_bytes(&stage_path)? != verified_backup
+        {
+            return Err(format!("{}: Staged rollback backup is untrusted.", file.relative));
+        }
+        Ok(())
+    };
+    check_staged()?;
+
+    #[cfg(test)]
+    if file.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_ROLLBACK_EXTERNAL_RACE_PROJECT").is_some()
+    {
+        fs::write(&target, b"external writer after staging").map_err(|e| e.to_string())?;
+    }
+
+    // This also refuses a changed symlink, target path, content, or size.
+    let refreshed = discovery::resolve_existing(root, &file.relative)?;
+    if refreshed != target {
+        return Err(format!("{}: Rollback target path changed.", file.relative));
+    }
+    let target_meta = fs::symlink_metadata(&target).map_err(|e| e.to_string())?;
+    if !target_meta.is_file()
+        || is_link(&target_meta)
+        || read_bytes(&target)? != expected_current
+    {
+        return Err(format!(
+            "{}: External target change detected before rollback replacement.",
+            file.relative
+        ));
+    }
+    check_staged()?;
+    fs::rename(&stage_path, &target)
+        .map_err(|e| format!("{}: Rollback rename failed: {e}", file.relative))?;
+    cleanup.0 = None;
+
+    #[cfg(test)]
+    if file.relative == "src/a.rs"
+        && std::env::var_os("FIKO_TEST_ROLLBACK_AFTER_REPLACE_PROJECT").is_some()
+    {
+        let mut signal = File::create(root.join(".fiko_test_rollback_replaced_ready"))
+            .map_err(|e| e.to_string())?;
+        signal.write_all(b"ready").map_err(|e| e.to_string())?;
+        signal.sync_all().map_err(|e| e.to_string())?;
+        drop(signal);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Err("Rollback child should have been killed after rename.".into());
+    }
+
+    if read_bytes(&target)? != verified_backup {
+        return Err(format!(
+            "{}: Replaced rollback source failed final verification.",
+            file.relative
+        ));
+    }
+    Ok(())
+}
+
 fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
     let Some(expected) = &record.written else {
         return Ok(());
@@ -807,17 +948,7 @@ fn rollback_file(root: &Path, record: &RecordedFile) -> Result<(), String> {
             if current != *expected {
                 return Err("Dosya islem sonrasinda degismis; dis degisiklik ezilmedi.".into());
             }
-            let mut handle = OpenOptions::new()
-                .write(true)
-                .open(&target)
-                .map_err(|e| e.to_string())?;
-            handle.set_len(0).map_err(|e| e.to_string())?;
-            handle.write_all(&backup).map_err(|e| e.to_string())?;
-            handle.sync_all().map_err(|e| e.to_string())?;
-            if read_bytes(&target)? != original.as_bytes() {
-                return Err("Geri alinan dosya dogrulanamadi.".into());
-            }
-            Ok(())
+            restore_existing_staged_rollback(root, file, &backup, expected)
         }
         None => {
             match fs::symlink_metadata(&target) {
