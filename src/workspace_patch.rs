@@ -668,6 +668,14 @@ fn create_new_staged(root: &Path, record: &mut RecordedFile) -> Result<(), Strin
     }
     // An existing destination MUST NOT be replaced. In particular, rename()
     // is unsuitable because it overwrites on some filesystems.
+    #[cfg(test)]
+    if file.relative == "src/c.rs"
+        && std::env::var_os("FIKO_TEST_CREATE_EXTERNAL_RACE_PROJECT").is_some()
+    {
+        // Simulate a noncooperating writer who creates the target exactly
+        // after our last revalidation. Publication must fail without clobber.
+        fs::write(&file.path, b"external writer content").map_err(|e| e.to_string())?;
+    }
     fs::hard_link(&stage_path, &file.path)
         .map_err(|e| format!("{}: Cannot publish new file: {e}", file.relative))?;
     // A hard kill after publication leaves a fully written new target and an
