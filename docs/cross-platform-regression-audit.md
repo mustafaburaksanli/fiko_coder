@@ -1,0 +1,115 @@
+# Historical regression parity audit (PR #37)
+
+This is a traceability record, **not** a claim that every historical acceptance scenario has independently been replayed.
+
+## Scope and guardrails
+
+- Target branch: `ci/macos-full-regression-parity-v1.3`, PR #37.
+- GitHub PR search yielded PR #1, #2 and #4–#37 (36 entries); PR #3 did not appear in the result. Do not infer a test from the missing number.
+- Current four-runner Rust matrix: Windows, Linux, native macOS Intel x86_64 and native macOS Apple Silicon arm64.
+- `cargo test --locked` runs ordinary unit/integration tests. `scripts/ci_regressions.py ignored` runs the explicitly listed destructive process-interruption tests; `stress --repeats 20` runs 20 parallel and 20 serial `stabilization_flow` passes on each Rust runner.
+- PostgreSQL 17 opt-in memory/migration tests and controlled-HTTP agent acceptance run on Linux and both Mac architectures; **not Windows**. This is an explicit coverage exception, not a Windows pass.
+- `scripts/live_qwen_acceptance.ps1` is tested with an offline fixture in CI. Actual model responses, latency, hardware memory use and real-Qwen coding success **are not** tested in this matrix.
+- Safety: a green CI run does not prove sandboxing of Cargo build scripts, procedural macros or tests.
+
+## Verified historical dedicated ignored process-interruption regressions
+
+The table maps dedicated `cargo test --locked --lib ... -- --ignored` invocations introduced by historical PR diffs to entries in `ci/ignored-regressions.txt`. Every row below was present in the manifest inspected for PR #37.
+
+| Introduced in | Exact test identifier |
+|---|---|
+| #7 | `workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence` |
+| #10 | `workspace_recovery::tests::restore_parent_kills_child_and_resumes` |
+| #11 | `workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore` |
+| #12 | `workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval` |
+| #15 | `workspace_patch::tests::process_kill_during_partial_staged_apply_preserves_original_source` |
+| #16 | `workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker` |
+| #16 | `workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval` |
+| #17 | `workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker` |
+| #17 | `workspace_patch::tests::process_kill_after_rollback_rename_keeps_original_and_recoverable_marker` |
+| #20 | `workspace_patch::tests::process_kill_after_created_file_rollback_delete_requires_new_approval` |
+| #23 | `workspace_recovery::tests::approved_created_file_recovery_kill_after_delete_requires_fresh_approval` |
+
+The shared runner checks that each manifest entry exactly matches a library test before running it, preventing silently successful zero-match filters. This audit proves correspondence for the **11 explicitly enumerated** process-kill tests, not for every normal or ignored test that ever existed.
+
+## Historical coverage categories to trace
+
+| Historical PRs | Feature/test families | CI route | Audit status |
+|---|---|---|---|
+| #1–#2 | Baseline Rust tests, stabilization stress, PostgreSQL acceptance | Four-runner normal/stress + three-runner PostgreSQL | Workflow coverage identified; historical test-by-test inventory pending |
+| #4–#6, #8–#9 | Journal, recovery, approvals, integrity, CLI tests | `cargo test --locked` | Normal-test route identified; exact names/provenance pending |
+| #7, #10–#12, #15–#17, #20, #23 | Dedicated process-interruption cases | Shared ignored manifest | **11 dedicated tests mapped** |
+| #13–#14, #18–#19, #21–#22, #24–#27 | Integrity, locking, adversarial symlink/directory swaps, final-delete checks | `cargo test --locked` (unless explicitly ignored) | Exact names/ignored markers and applicability pending |
+| #28–#34 | Real Cargo workspace integration and controlled-model agent repair/rollback/approval | `cargo test --locked` | CI route identified; exact names/provenance pending |
+| #35 | Local real-Qwen acceptance measurement | Cross-platform PowerShell offline smoke; separate manual real-model execution | Script smoke present; live Qwen still unmeasured |
+| #36–#37 | Native macOS and unified cross-platform regressions | Four-runner Rust matrix + macOS PostgreSQL | CI configured; final SHA checks and ongoing regression policy must be verified |
+
+
+## Complete current opt-in test classification (four-platform inventory)
+
+The Linux CI inventory for commit `35c6e79` discovered **441 distinct test identifiers**, including **44 ignored/opt-in** entries (32 ignored library tests). These are *test identifiers*, not a count of GitHub Actions jobs or independently executed tests.
+
+We identified all 44 opt-in entries on Unix and added explicit classifications. On Windows, **42** of these exist: the two symlink helper fixtures `workspace_patch::tests::created_file_rollback_late_symlink_swap_child` and `workspace_recovery::tests::created_recovery_symlink_swap_child` are `#[cfg(unix)]` and intentionally do not compile on Windows. The inventory applies this narrow architecture-aware exception, but treats all other missing entries as failures:
+
+| Classification | Count | Manifest | Execution policy |
+|---|---:|---|---|
+| Real OS process interruption/regression parents | 11 | `ci/ignored-regressions.txt` | Independently run by `scripts/ci_regressions.py ignored` on all four Rust runners |
+| Child-only subprocess fixtures | 20 | `ci/ignored-subprocess-helpers.txt` | Never run as independent ignored tests; invoked and controlled by parent tests |
+| PostgreSQL integration and controlled-model agent tests | 13 | `ci/ignored-postgres-tests.txt` | Only the isolated PostgreSQL CI workflow on Linux and both macOS architectures; Windows is not tested |
+
+`scripts/test_inventory.py` now checks **exact set equality** between discovered ignored tests and the disjoint union of the three manifest sets (minus only the two source-confirmed Unix-only helpers on Windows), and verifies the library-test subset separately. Any newly added or missing ignored test fails CI on the four Rust platforms until classified. A child helper is a test-harness entrypoint, **not an additional independently validated regression**. These classifications were inferred from test names and historical source comments; exact parent-child invocation traceability still warrants a separate audit. None of this implies real-Qwen model evaluation.
+
+## Remaining blockers before claiming full historical parity
+
+1. Enumerate **every** added/modified test from PR #1–#36, including conditional, ignored, CLI, real-Cargo and agent tests. Compare exact test identifiers with current source and runner discovery. Check for deleted/renamed tests and document functional replacements, not just matching titles.
+2. **Current 44 ignored entries classified**, with 11 crash regression parents, 20 child-only fixtures and 13 PostgreSQL opt-ins. Confirm each child-only fixture is exercised through a parent, each database test is selected by the PostgreSQL workflow, and monitor future inventory changes.
+3. Record each platform's **actual run result on one immutable head SHA**. If audit changes trigger new CI runs, prior green runs are not evidence for the new SHA.
+4. Decide and document platform exclusions with a rationale, especially Windows PostgreSQL and live hardware-bound Qwen tests; do not label excluded work as passed.
+5. Keep PR #37 open/draft until the above evidence is complete and all required CI checks pass. No merge is authorized by this document alone.
+
+## Verified #28–#34 real-Cargo and controlled-agent test introductions
+
+The following identifiers were extracted from added test functions in the corresponding PR patches (not inferred from their PR titles). They are expected to be discovered by the normal `cargo test --locked` command, subject to final exact-name inventory and platform run validation.
+
+| PR | Test identifier in its source file |
+|---|---|
+| #28 | `real_cargo_project_compiles_before_after_multifile_apply_and_after_rollback` (`tests/real_cargo_workspace_acceptance.rs`) |
+| #29 | `real_cargo_failed_multifile_change_can_be_rolled_back_to_passing_state` (same integration suite) |
+| #30 | `real_cargo_compiler_failure_rollback_restores_a_compilable_project` (same integration suite) |
+| #31 | `workspace_agent_failed_real_cargo_test_rolls_back_all_files` (`src/agent.rs`) |
+| #32 | `workspace_agent_denied_apply_consent_preserves_all_project_files` (`src/agent.rs`) |
+| #33 | `workspace_agent_failed_candidate_then_corrected_candidate_is_verified` (`src/agent.rs`) |
+| #34 | `workspace_agent_failing_unit_test_then_corrected_candidate_passes` (`src/agent.rs`) |
+
+This establishes seven historical test introductions with source provenance, **not** proof that the named tests survived unchanged or passed on every platform. The `ci/historical-acceptance-tests.txt` manifest now pins these seven exact libtest identifiers, and `scripts/test_inventory.py` fails if one is missing from the discovered test list. The inventory also lists ignored library tests for manual classification and runs in the four-runner Rust CI matrix. This establishes automated *presence* of these seven cases, not their independent historical execution at every old commit. Full parity still requires reconciling all other PR diffs and manually classified opt-in cases.
+
+## Expanded historical regression guard (current PR work)
+
+Beyond the 7 Cargo/controlled-agent tests and 11 isolated crash parent regressions, `ci/historical-acceptance-tests.txt` now also tracks **49** normal file-integrity and recovery test identifiers introduced across PR #4–#27, giving **57 protected historical normal test identifiers** in total. These 30 were checked against Rust function definitions on the current branch. Ten are explicitly `#[cfg(unix)]` tests (listed in `ci/unix-only-historical-tests.txt`): Linux and macOS must expose them, while Windows is exempt. `scripts/test_inventory.py` detects their absence where required. This *presence guarantee* is distinct from evidence of test execution and from exhaustive PR #1–#36 provenance.
+
+The current CI run after these changes has not yet been signed off. Previous runs are not sufficient evidence for this commit.
+
+## PostgreSQL exact-selector preflight
+
+`scripts/postgres_test_inventory.py` cross-checks all **12 ignored PostgreSQL integration tests** in `tests/postgres_memory.rs` against `ci/ignored-postgres-tests.txt`, plus the single `agent::tests::postgres_agent_uc_dosyali_onay_hafiza_ret_ve_rollback` ignored library acceptance test. Unlike a broad Cargo filter that can succeed with zero matches, this fails if names are absent, unexpected or ambiguous. The preflight runs on Linux, macOS Intel and Apple Silicon *before* the ephemeral PostgreSQL acceptance executions. It uses test discovery only: it never contacts a database or runs ignored child-process fixtures. Windows PostgreSQL remains an explicitly untested platform.
+
+CI results after this change must be verified at the new exact commit SHA before merge.
+
+## Subsequent historical coverage strengthening
+
+- The four-platform inventory now **fails** when any tracked *normal* historical test is marked ignored: discoverability alone is not enough, because a filtered opt-in test would be silently skipped by `cargo test --locked`.
+- A further **19** source-confirmed recovery, approval, permission, hardlink and rollback tests from historical PR #4–#17 were added to `ci/historical-acceptance-tests.txt`. This brings the tracked normal historical test baseline from **37 to 56**, then **57** after adding PR #9's recovery CLI safety regression.
+- Five of these additional 19 are explicitly guarded by `#[cfg(unix)]`, so `ci/unix-only-historical-tests.txt` now contains **10** such exclusions. Linux and both macOS runners must discover these; Windows is not expected to expose them.
+- This is a stronger future-regression guard, but is **not** a statement that every test introduced in PR #1–#36 was exhaustively compared, or that every historical feature is correct.
+
+## PR #4–#36 added-test patch scan (current pass)
+
+The current audit compared added `#[test]` and `#[tokio::test]` functions in accessible PR #4–#36 patches against the three test manifests, including non-ignored integration test identifiers and Rust library module-qualified names. The one untracked addition found was PR #9's `tests/recovery_approval_cli.rs::recovery_restore_refuses_non_interactive_input`, which is still present and default-enabled; it has now been pinned in the historical normal-test manifest. The manifest therefore protects **57** historical normal test names (subject to source-gated Unix exclusions), plus **11** standalone ignored process-interruption parent regressions. This establishes a **name-level mapping of added tests for PR #4–#36**, not complete per-commit behavioral equivalence or a proof that no tests were altered, renamed, moved or deleted in other ways.
+
+Remaining work: inspect PR #1's much larger baseline test inventory, PR #2 (no newly introduced `#[test]` functions detected by the patch scan), investigate unavailable PR #3 if any, reconcile modified/removed tests and helper-parent behavior, then repeat the seven-job CI at the resulting immutable HEAD. Live Qwen and Windows PostgreSQL remain outside the automatic acceptance claims.
+
+## PR #1 baseline trust-boundary sampling
+
+A further **10** high-priority baseline regression functions introduced in PR #1 were checked for current source presence (agent unauthorized-patch claims, trusted read evidence, PostgreSQL fallback, context path isolation, memory provenance/rollback, and symlink-safe retrieval). They have been added to the normal historical manifest, bringing the total to **67** tracked normal test identifiers. One PR #1 symlink test uses `#[cfg(unix)]` and has been added to the platform exclusion manifest (now **11** Unix-only normal test identifiers).
+
+This is a **risk-prioritized sample**, not the full PR #1 baseline parity inventory. Historical PR #2 yielded no newly introduced ordinary Rust `#[test]` functions in the patch scan. Exact changes/renames/deletions and semantic equivalence across all earlier PRs remain open.

@@ -1,4 +1,4 @@
-name: Rust CI
+name: Rust CI (Windows, Linux, macOS)
 
 on:
   push:
@@ -8,15 +8,40 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: fmt / clippy / test (Windows)
-    runs-on: windows-latest
-    timeout-minutes: 30
+  cross-platform:
+    name: Rust CI (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            python: python
+          - name: Linux
+            runner: ubuntu-latest
+            python: python3
+          - name: macOS Intel x86_64
+            runner: macos-15-intel
+            python: python3
+            target: x86_64-apple-darwin
+          - name: macOS Apple Silicon arm64
+            runner: macos-15
+            python: python3
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Verify native macOS architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
+          uname -a
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Build check
@@ -25,33 +50,15 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit and offline integration tests
         run: cargo test --locked
-      - name: Real subprocess interruption recovery regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
-      - name: Restore subprocess kill and approved resume regression
-        run: cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
-      - name: Staged restore interruption before replacement
-        run: cargo test --locked --lib workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore -- --ignored --exact
-      - name: Real partial-stage write interruption regression
-        run: cargo test --locked --lib workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval -- --ignored --exact
-      - name: Workspace edit partial-stage interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_during_partial_staged_apply_preserves_original_source -- --ignored --exact
-      - name: Workspace new-file partial-stage interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker -- --ignored --exact
-      - name: Workspace new-file post-publication interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
-      - name: Created-file rollback post-deletion process interruption
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_created_file_rollback_delete_requires_new_approval -- --ignored --exact
-      - name: Approved created-file recovery post-deletion process interruption
-        run: cargo test --locked --lib workspace_recovery::tests::approved_created_file_recovery_kill_after_delete_requires_fresh_approval -- --ignored --exact
-      - name: Workspace rollback partial-stage interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
-      - name: Workspace rollback post-rename interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_rollback_rename_keeps_original_and_recoverable_marker -- --ignored --exact
+      - name: Discover and audit normal plus opt-in Rust tests
+        run: ${{ matrix.python }} scripts/test_inventory.py --output test-inventory.json
+      - name: All shared process-interruption recovery regressions
+        run: ${{ matrix.python }} scripts/ci_regressions.py ignored
       - name: Live-Qwen acceptance script offline smoke (no model or approvals)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $fixture = Join-Path $env:RUNNER_TEMP ('fiko_live_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+          $fixture = Join-Path ([System.IO.Path]::GetTempPath()) ('fiko_live_' + [guid]::NewGuid().ToString('N').Substring(0,8))
           & ./scripts/live_qwen_acceptance.ps1 -Mode prepare -FixtureDir $fixture
           if ($LASTEXITCODE -ne 0) { throw 'Acceptance fixture setup failed' }
           $math = Join-Path $fixture 'src/math.rs'
@@ -64,59 +71,4 @@ jobs:
           $result = Get-Content -LiteralPath ($fixture + '.result.json') -Raw | ConvertFrom-Json
           if ($result.pass -ne $true) { throw 'Acceptance result must be successful' }
       - name: Stabilization stress (20 parallel + 20 serial runs)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($mode in @('parallel', 'serial')) {
-            for ($attempt = 1; $attempt -le 20; $attempt++) {
-              Write-Host ("[STRESS] {0}: {1}/20" -f $mode, $attempt)
-              if ($mode -eq 'parallel') {
-                cargo test --locked --test stabilization_flow -- --test-threads=4
-              } else {
-                cargo test --locked --test stabilization_flow -- --test-threads=1
-              }
-              if ($LASTEXITCODE -ne 0) {
-                throw ("stabilization_flow failed in {0} run {1}/20 (exit code: {2})" -f $mode, $attempt, $LASTEXITCODE)
-              }
-            }
-          }
-
-  linux-check:
-    name: fmt / clippy / test (Linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Formatting
-        run: cargo fmt --all -- --check
-      - name: Build check
-        run: cargo check --locked
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Unit and offline integration tests
-        run: cargo test --locked
-      - name: Real subprocess interruption recovery regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_during_workspace_apply_keeps_recovery_evidence -- --ignored --exact
-      - name: Restore subprocess kill and approved resume regression
-        run: cargo test --locked --lib workspace_recovery::tests::restore_parent_kills_child_and_resumes -- --ignored --exact
-      - name: Staged restore interruption before replacement
-        run: cargo test --locked --lib workspace_recovery::tests::process_kill_during_staging_preserves_candidate_and_allows_reapproved_restore -- --ignored --exact
-      - name: Real partial-stage write interruption regression
-        run: cargo test --locked --lib workspace_recovery::tests::process_kill_mid_stage_write_keeps_target_and_marker_for_reapproval -- --ignored --exact
-      - name: Workspace edit partial-stage interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_during_partial_staged_apply_preserves_original_source -- --ignored --exact
-      - name: Workspace new-file partial-stage interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_staged_create_preserves_target_absence_and_pending_marker -- --ignored --exact
-      - name: Workspace new-file post-publication interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_staged_create_publication_resumes_with_explicit_approval -- --ignored --exact
-      - name: Created-file rollback post-deletion process interruption
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_created_file_rollback_delete_requires_new_approval -- --ignored --exact
-      - name: Approved created-file recovery post-deletion process interruption
-        run: cargo test --locked --lib workspace_recovery::tests::approved_created_file_recovery_kill_after_delete_requires_fresh_approval -- --ignored --exact
-      - name: Workspace rollback partial-stage interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_mid_rollback_stage_preserves_updated_target_and_marker -- --ignored --exact
-      - name: Workspace rollback post-rename interruption regression
-        run: cargo test --locked --lib workspace_patch::tests::process_kill_after_rollback_rename_keeps_original_and_recoverable_marker -- --ignored --exact
+        run: ${{ matrix.python }} scripts/ci_regressions.py stress --repeats 20

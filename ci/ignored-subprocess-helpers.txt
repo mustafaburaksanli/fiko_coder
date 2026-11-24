@@ -1,0 +1,22 @@
+# Dedicated subprocess entry points: NOT safe to run as standalone --ignored tests.
+# Their parent tests launch and control their lifetime; manual execution may hang.
+workspace_patch::tests::crash_child_hold_before_third_workspace_write
+workspace_patch::tests::create_child_waits_after_publication
+workspace_patch::tests::create_child_waits_with_partial_staging
+workspace_patch::tests::create_rollback_child_waits_after_deletion
+workspace_patch::tests::created_file_rollback_directory_swap_child
+workspace_patch::tests::created_file_rollback_late_symlink_swap_child
+workspace_patch::tests::rollback_child_rejects_external_writer_before_rename
+workspace_patch::tests::rollback_child_rejects_same_length_stage_corruption
+workspace_patch::tests::rollback_child_waits_after_replacement
+workspace_patch::tests::rollback_child_waits_mid_stage
+workspace_patch::tests::staged_apply_child_waits_halfway_through_write
+workspace_patch::tests::staged_create_child_rejects_external_destination_without_clobber
+workspace_recovery::tests::approved_created_delete_child_waits_after_removal
+workspace_recovery::tests::created_recovery_directory_swap_child
+workspace_recovery::tests::created_recovery_symlink_swap_child
+workspace_recovery::tests::operation_lock_child_holds_until_killed
+workspace_recovery::tests::partial_stage_child_waits_during_write
+workspace_recovery::tests::restore_child_wait_after_first_file
+workspace_recovery::tests::staged_restore_child_waits_before_replace
+workspace_recovery::tests::staged_tamper_child_rejects_precommit_corruption

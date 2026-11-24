@@ -46,6 +46,9 @@ jobs:
           docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE DATABASE fiko_memory_test_upgrade OWNER fiko_test;'
 
+      - name: Verify exact opt-in PostgreSQL test selection
+        shell: bash
+        run: python3 scripts/postgres_test_inventory.py
       - name: Real PostgreSQL integration tests (opt-in)
         shell: bash
         env:
@@ -64,3 +67,60 @@ jobs:
           set -euo pipefail
           # Uses a local mock HTTP model; no live Ollama or external API.
           cargo test --locked --lib postgres_agent_uc_dosyali_onay_hafiza_ret_ve_rollback -- --ignored --test-threads=1
+
+  macos-postgres-acceptance:
+    name: PostgreSQL integration + agent acceptance (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel x86_64
+            runner: macos-15-intel
+          - name: macOS Apple Silicon arm64
+            runner: macos-15
+    env:
+      FIKO_TEST_DATABASE_URL: postgresql://fiko_test@127.0.0.1:55432/fiko_memory_test
+      FIKO_TEST_UPGRADE_DATABASE_URL: postgresql://fiko_test@127.0.0.1:55432/fiko_memory_test_upgrade
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install isolated PostgreSQL 17
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! brew list postgresql@17 >/dev/null 2>&1; then
+            brew install postgresql@17
+          fi
+          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+      - name: Initialize disposable localhost-only database
+        shell: bash
+        run: |
+          set -euo pipefail
+          DB_DIR="$RUNNER_TEMP/fiko_pg17"
+          initdb --pgdata="$DB_DIR" --username=postgres --auth=trust --no-instructions
+          echo "unix_socket_directories = '$RUNNER_TEMP'" >> "$DB_DIR/postgresql.conf"
+          pg_ctl -D "$DB_DIR" -o "-h 127.0.0.1 -p 55432" -l "$RUNNER_TEMP/fiko_pg17.log" -w start
+          psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE ROLE fiko_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;'
+          psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE fiko_memory_test OWNER fiko_test;'
+          psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE fiko_memory_test_upgrade OWNER fiko_test;'
+      - name: Verify exact opt-in PostgreSQL test selection
+        shell: bash
+        run: python3 scripts/postgres_test_inventory.py
+      - name: Real PostgreSQL integration tests (opt-in)
+        shell: bash
+        run: cargo test --locked --test postgres_memory -- --ignored --test-threads=1
+      - name: Real PostgreSQL + controlled HTTP agent acceptance (opt-in)
+        shell: bash
+        run: cargo test --locked --lib postgres_agent_uc_dosyali_onay_hafiza_ret_ve_rollback -- --ignored --test-threads=1
+      - name: Stop disposable PostgreSQL server
+        if: always()
+        shell: bash
+        run: |
+          if command -v pg_ctl >/dev/null 2>&1 && test -d "$RUNNER_TEMP/fiko_pg17"; then
+            pg_ctl -D "$RUNNER_TEMP/fiko_pg17" -m immediate stop || true
+          fi
