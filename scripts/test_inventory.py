@@ -111,6 +111,13 @@ def main() -> int:
     if missing_historical:
         raise RuntimeError(f"Historical acceptance tests absent from discovered test list: {missing_historical}")
 
+    unexpectedly_ignored_historical = sorted(expected_historical & set(ignored_tests))
+    if unexpectedly_ignored_historical:
+        raise RuntimeError(
+            "Historical normal acceptance tests have become opt-in and are no longer "
+            f"executed by default: {unexpectedly_ignored_historical}"
+        )
+
     missing = sorted(set(manifest) - set(ignored_lib_tests))
     if missing:
         raise RuntimeError(f"Dedicated crash tests absent from ignored library tests: {missing}")
@@ -125,6 +132,7 @@ def main() -> int:
         "ignored_library_tests": ignored_lib_tests,
         "crash_manifest_tests": sorted(manifest),
         "historical_acceptance_tests": sorted(historical),
+        "historical_default_executed_tests": sorted(expected_historical),
         "subprocess_helper_tests": sorted(helpers),
         "postgres_opt_in_tests": sorted(postgres),
         "unclassified_ignored_tests": unclassified_ignored,
@@ -136,6 +144,7 @@ def main() -> int:
             "dedicated_crash_manifest": len(manifest),
             "historical_acceptance_manifest": len(historical),
             "unix_only_historical": len(unix_historical),
+            "historical_default_enabled": len(expected_historical),
             "subprocess_helpers": len(helpers),
             "postgres_opt_in": len(postgres),
             "unclassified_ignored": len(unclassified_ignored),
