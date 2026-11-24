@@ -85,7 +85,7 @@ This establishes seven historical test introductions with source provenance, **n
 
 ## Expanded historical regression guard (current PR work)
 
-Beyond the 7 Cargo/controlled-agent tests and 11 isolated crash parent regressions, `ci/historical-acceptance-tests.txt` now also tracks **30** normal file-integrity and recovery test identifiers introduced across PR #4–#27, giving **37 protected historical normal test identifiers** in total. These 30 were checked against Rust function definitions on the current branch. Five are explicitly `#[cfg(unix)]` tests (listed in `ci/unix-only-historical-tests.txt`): Linux and macOS must expose them, while Windows is exempt. `scripts/test_inventory.py` detects their absence where required. This *presence guarantee* is distinct from evidence of test execution and from exhaustive PR #1–#36 provenance.
+Beyond the 7 Cargo/controlled-agent tests and 11 isolated crash parent regressions, `ci/historical-acceptance-tests.txt` now also tracks **49** normal file-integrity and recovery test identifiers introduced across PR #4–#27, giving **56 protected historical normal test identifiers** in total. These 30 were checked against Rust function definitions on the current branch. Ten are explicitly `#[cfg(unix)]` tests (listed in `ci/unix-only-historical-tests.txt`): Linux and macOS must expose them, while Windows is exempt. `scripts/test_inventory.py` detects their absence where required. This *presence guarantee* is distinct from evidence of test execution and from exhaustive PR #1–#36 provenance.
 
 The current CI run after these changes has not yet been signed off. Previous runs are not sufficient evidence for this commit.
 
@@ -94,3 +94,10 @@ The current CI run after these changes has not yet been signed off. Previous run
 `scripts/postgres_test_inventory.py` cross-checks all **12 ignored PostgreSQL integration tests** in `tests/postgres_memory.rs` against `ci/ignored-postgres-tests.txt`, plus the single `agent::tests::postgres_agent_uc_dosyali_onay_hafiza_ret_ve_rollback` ignored library acceptance test. Unlike a broad Cargo filter that can succeed with zero matches, this fails if names are absent, unexpected or ambiguous. The preflight runs on Linux, macOS Intel and Apple Silicon *before* the ephemeral PostgreSQL acceptance executions. It uses test discovery only: it never contacts a database or runs ignored child-process fixtures. Windows PostgreSQL remains an explicitly untested platform.
 
 CI results after this change must be verified at the new exact commit SHA before merge.
+
+## Subsequent historical coverage strengthening
+
+- The four-platform inventory now **fails** when any tracked *normal* historical test is marked ignored: discoverability alone is not enough, because a filtered opt-in test would be silently skipped by `cargo test --locked`.
+- A further **19** source-confirmed recovery, approval, permission, hardlink and rollback tests from historical PR #4–#17 were added to `ci/historical-acceptance-tests.txt`. This brings the tracked normal historical test baseline from **37 to 56**.
+- Five of these additional 19 are explicitly guarded by `#[cfg(unix)]`, so `ci/unix-only-historical-tests.txt` now contains **10** such exclusions. Linux and both macOS runners must discover these; Windows is not expected to expose them.
+- This is a stronger future-regression guard, but is **not** a statement that every test introduced in PR #1–#36 was exhaustively compared, or that every historical feature is correct.
