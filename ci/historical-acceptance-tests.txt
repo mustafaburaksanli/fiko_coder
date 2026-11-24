@@ -64,3 +64,15 @@ workspace_patch::tests::staged_rollback_preserves_mode_and_does_not_mutate_exter
 
 # PR #9: CLI must refuse non-interactive automated recovery approval.
 recovery_restore_refuses_non_interactive_input
+
+# PR #1 baseline: source-confirmed security and memory-trust regression tests.
+agent::tests::modelin_sahte_patch_basarisi_hafizada_uygulama_kaydi_uretememeli
+agent::tests::postgres_yokken_ayni_kontrollu_agent_akisi_calismaya_devam_etmeli
+agent::tests::analizde_triple_okuma_kaniti_modelin_yokluk_iddiasindan_ayrilmali
+context::tests::oneriler_hassas_ve_dis_kok_icerigini_aciga_cikarmamali
+context::tests::symlink_ve_junction_hedefleri_oneriye_girmemeli
+memory_store::tests::uncertain_or_rolled_back_is_never_verified_success
+memory_store::tests::modified_paths_are_not_inferred_from_declared_targets
+memory_retrieval::tests::ham_istek_ve_kimlik_bilgisi_ozete_girmez
+memory_retrieval::tests::rollback_ve_belirsiz_sonuc_basarili_patch_olarak_sunulmaz
+memory_retrieval::tests::symlink_uzerinden_hafiza_gozlemi_reddedilir
