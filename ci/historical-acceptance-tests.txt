@@ -61,3 +61,6 @@ workspace_patch::tests::staged_create_never_overwrites_a_target_created_at_publi
 workspace_patch::tests::staged_rollback_rejects_same_length_corrupted_stage_before_rename
 workspace_patch::tests::staged_rollback_detects_external_target_replacement_without_overwriting
 workspace_patch::tests::staged_rollback_preserves_mode_and_does_not_mutate_external_hardlink
+
+# PR #9: CLI must refuse non-interactive automated recovery approval.
+recovery_restore_refuses_non_interactive_input
