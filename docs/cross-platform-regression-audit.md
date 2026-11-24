@@ -85,7 +85,7 @@ This establishes seven historical test introductions with source provenance, **n
 
 ## Expanded historical regression guard (current PR work)
 
-Beyond the 7 Cargo/controlled-agent tests and 11 isolated crash parent regressions, `ci/historical-acceptance-tests.txt` now also tracks **49** normal file-integrity and recovery test identifiers introduced across PR #4–#27, giving **56 protected historical normal test identifiers** in total. These 30 were checked against Rust function definitions on the current branch. Ten are explicitly `#[cfg(unix)]` tests (listed in `ci/unix-only-historical-tests.txt`): Linux and macOS must expose them, while Windows is exempt. `scripts/test_inventory.py` detects their absence where required. This *presence guarantee* is distinct from evidence of test execution and from exhaustive PR #1–#36 provenance.
+Beyond the 7 Cargo/controlled-agent tests and 11 isolated crash parent regressions, `ci/historical-acceptance-tests.txt` now also tracks **49** normal file-integrity and recovery test identifiers introduced across PR #4–#27, giving **57 protected historical normal test identifiers** in total. These 30 were checked against Rust function definitions on the current branch. Ten are explicitly `#[cfg(unix)]` tests (listed in `ci/unix-only-historical-tests.txt`): Linux and macOS must expose them, while Windows is exempt. `scripts/test_inventory.py` detects their absence where required. This *presence guarantee* is distinct from evidence of test execution and from exhaustive PR #1–#36 provenance.
 
 The current CI run after these changes has not yet been signed off. Previous runs are not sufficient evidence for this commit.
 
@@ -98,6 +98,12 @@ CI results after this change must be verified at the new exact commit SHA before
 ## Subsequent historical coverage strengthening
 
 - The four-platform inventory now **fails** when any tracked *normal* historical test is marked ignored: discoverability alone is not enough, because a filtered opt-in test would be silently skipped by `cargo test --locked`.
-- A further **19** source-confirmed recovery, approval, permission, hardlink and rollback tests from historical PR #4–#17 were added to `ci/historical-acceptance-tests.txt`. This brings the tracked normal historical test baseline from **37 to 56**.
+- A further **19** source-confirmed recovery, approval, permission, hardlink and rollback tests from historical PR #4–#17 were added to `ci/historical-acceptance-tests.txt`. This brings the tracked normal historical test baseline from **37 to 56**, then **57** after adding PR #9's recovery CLI safety regression.
 - Five of these additional 19 are explicitly guarded by `#[cfg(unix)]`, so `ci/unix-only-historical-tests.txt` now contains **10** such exclusions. Linux and both macOS runners must discover these; Windows is not expected to expose them.
 - This is a stronger future-regression guard, but is **not** a statement that every test introduced in PR #1–#36 was exhaustively compared, or that every historical feature is correct.
+
+## PR #4–#36 added-test patch scan (current pass)
+
+The current audit compared added `#[test]` and `#[tokio::test]` functions in accessible PR #4–#36 patches against the three test manifests, including non-ignored integration test identifiers and Rust library module-qualified names. The one untracked addition found was PR #9's `tests/recovery_approval_cli.rs::recovery_restore_refuses_non_interactive_input`, which is still present and default-enabled; it has now been pinned in the historical normal-test manifest. The manifest therefore protects **57** historical normal test names (subject to source-gated Unix exclusions), plus **11** standalone ignored process-interruption parent regressions. This establishes a **name-level mapping of added tests for PR #4–#36**, not complete per-commit behavioral equivalence or a proof that no tests were altered, renamed, moved or deleted in other ways.
+
+Remaining work: inspect PR #1's much larger baseline test inventory, PR #2 (no newly introduced `#[test]` functions detected by the patch scan), investigate unavailable PR #3 if any, reconcile modified/removed tests and helper-parent behavior, then repeat the seven-job CI at the resulting immutable HEAD. Live Qwen and Windows PostgreSQL remain outside the automatic acceptance claims.
