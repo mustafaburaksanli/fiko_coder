@@ -46,6 +46,9 @@ jobs:
           docker exec "$PG_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE DATABASE fiko_memory_test_upgrade OWNER fiko_test;'
 
+      - name: Verify exact opt-in PostgreSQL test selection
+        shell: bash
+        run: python3 scripts/postgres_test_inventory.py
       - name: Real PostgreSQL integration tests (opt-in)
         shell: bash
         env:
@@ -105,6 +108,9 @@ jobs:
             -c 'CREATE DATABASE fiko_memory_test OWNER fiko_test;'
           psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE DATABASE fiko_memory_test_upgrade OWNER fiko_test;'
+      - name: Verify exact opt-in PostgreSQL test selection
+        shell: bash
+        run: python3 scripts/postgres_test_inventory.py
       - name: Real PostgreSQL integration tests (opt-in)
         shell: bash
         run: cargo test --locked --test postgres_memory -- --ignored --test-threads=1
